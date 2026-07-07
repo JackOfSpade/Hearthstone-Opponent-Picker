@@ -1,0 +1,35 @@
+# hop user config example.
+# Copy to ~/.config/hop/config.toml and edit. Only override what you change;
+# everything else falls back to hop/config.default.toml (which documents every
+# key and the humanization priors).
+
+[criteria]
+# Classes you WANT to face. Empty = any class acceptable.
+# Fewer classes + require_second = higher concede rate = more barcode-like.
+target_classes = ["MAGE", "WARLOCK"]
+require_second = false
+mode = "casual"                 # avoid tanking ranked MMR while hunting
+
+[device]
+adb_address = "192.168.1.50:5555"   # from Wireless debugging (host:port)
+touch_backend = "auto"              # auto | uhid | adb
+posture = "desk_mounted"            # handheld | desk_mounted
+
+[risk]
+profile = "cautious"                # cautious | balanced | aggressive
+
+[alerts]
+mac_sound = true
+mac_speak = false
+ntfy_topic = ""                     # set to a phone push topic (ntfy app) if desired
+
+# After running `hop calibrate` / `hop doctor`, paste your phone's real panel
+# identity here so the virtual digitizer matches it:
+# [uhid]
+# device_name = "your_panel_name"
+# vendor_id = 0x....
+# product_id = 0x....
+
+# And any measured motor values:
+# [motor]
+# report_rate_hz = 240

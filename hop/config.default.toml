@@ -1,0 +1,158 @@
+# hop - default configuration.
+#
+# This file ships the reference priors from §8 of the Humanization Standard.
+# Per the standard: "These are priors measured on one reference phone with one
+# human. They are starting points, not universal constants." Anything that MUST
+# be re-measured on your actual phone before trusting auto mode is tagged
+# LIVE-VERIFY in a comment. Run `hop calibrate` to derive real values (§10).
+#
+# User settings you'll actually edit live under [criteria], [risk], [device]
+# and [alerts]. The [motor], [timing], [contact], [scroll], [sensor], [caps]
+# and [vision] tables are the humanization priors - leave them unless you have
+# a measurement (provenance note required next to any change).
+
+# ─────────────────────────── USER SETTINGS ───────────────────────────
+
+[criteria]
+# Opponent classes you WANT to face. Empty list = any class is acceptable.
+target_classes = []
+# Classes to avoid (blocklist). Ignored if target_classes is non-empty.
+avoid_classes = []
+# Keep the game only when WE go second (mulligan deals us 4 cards, not 3).
+require_second = false
+# "casual" avoids cratering ranked MMR while hunting; "ranked" if you must.
+mode = "casual"
+
+[device]
+# Wireless-ADB address of the phone (host:port). `hop connect` can discover it.
+adb_address = ""
+# The opponent's class label sits under the BOTTOM-LEFT portrait; you are
+# bottom-right. Verified from real mobile mulligan screenshots.
+opponent_corner = "bottom_left"
+# Touch transport: auto prefers a persistent virtual HID digitizer (full
+# pressure/size/geometry) and falls back to `adb input` if unavailable.
+#   auto | uhid | adb
+touch_backend = "auto"
+# Test posture for sensorimotor coherence (§ Layer 4). A desk-mounted phone
+# driven over ADB cannot honestly claim handheld IMU realism; declare it.
+#   handheld | desk_mounted
+posture = "desk_mounted"
+
+[uhid]
+# Panel-matched input-device identity for the persistent virtual digitizer
+# (Layer 1). The standard: "A vendor_id/product_id of 0x0000 with a generic
+# name (uhid-touchscreen) is a giveaway; sane, panel-plausible identifiers are
+# the floor." LIVE-VERIFY: clone your real panel's InputDevice vid/pid/name
+# (see `hop doctor`, which reads `dumpsys input`). These defaults are plausible
+# but generic - replace them with your phone's true panel identifiers.
+device_name = "synaptics_dsx"     # LIVE-VERIFY: your panel's reported name
+vendor_id = 0x0596                 # LIVE-VERIFY
+product_id = 0x0501                # LIVE-VERIFY
+bus = "usb"                        # usb | bluetooth
+fifo_path = "/data/local/tmp/hop_hid"   # on-device named pipe for streaming
+min_report_interval_ms = 2         # floor between HID reports (avoid flooding)
+
+[alerts]
+mac_notification = true
+mac_sound = true
+mac_speak = false           # spoken "Mage found" via `say`
+sound_name = "Glass"        # a /System/Library/Sounds name, looped until ack
+ntfy_topic = ""             # optional phone push via ntfy.sh (loud, no account)
+ntfy_server = "https://ntfy.sh"
+
+[risk]
+# cautious | balanced | aggressive - selects a bundle of pacing multipliers
+# applied on top of [caps] and the concede journey grammar.
+profile = "cautious"
+
+# ─────────────────────── HUMANIZATION PRIORS (§8) ───────────────────────
+# Provenance for every value below: "reference phone, one human" per the
+# standard. Re-measure via `hop calibrate` (§10) and record device/date here.
+
+[timing]
+sigma = 0.22                       # log-normal spread for human_delay/cooldown
+between_action_anchor_s = 3.5      # typical inter-action pause; spread, don't burst
+read_consider_dwell_s = 1.1        # per-item consideration pause
+# Per-decision think time = shifted-lognormal(shift, mu, sigma), then modulated
+# by HumanState. A committing action is a faster reaction than a rejecting one.
+think_commit_shift = 1.2
+think_commit_mu = 0.65
+think_commit_sigma = 0.35          # -> ~3.2 s median
+think_reject_shift = 1.8
+think_reject_mu = 1.45
+think_reject_sigma = 0.42          # -> ~6.9 s median
+
+[motor]
+# FFitts (Bi & Zhai), not vanilla Fitts. a,b in seconds; precision term in mm.
+ffitts_a = 0.11
+ffitts_b = 0.17
+finger_precision_mm = 1.15         # absolute endpoint-ambiguity sigma_a (§8)
+default_target_w_px = 180          # LIVE-VERIFY: typical control width on your res
+velocity_peak_frac = 0.35          # tangential velocity peaks early
+velocity_sigma = 0.18
+submovement_min = 0               # corrective minimum-jerk submovements near target
+submovement_max = 3               # grows with target difficulty
+tremor_amplitude_mm = 0.14         # ~2.2 px @ ~400dpi -> mm; correlated OU texture
+tremor_theta = 40.0                # OU reversion rate
+report_rate_hz = 180               # LIVE-VERIFY: modern panels run 240/720/1200/2000
+tap_dwell_median_s = 0.13          # lognormal down->up
+tap_dwell_sigma = 0.25
+tap_dwell_min_s = 0.04
+tap_dwell_max_s = 0.35
+tap_micro_slip_px = 2.5            # finger-pad settle-and-slide on impact
+
+[contact]
+# Contact-patch evolution. RESPECT DEVICE PRESSURE SEMANTICS: if the panel
+# reports binary/1.0 pressure, a faithful flat signal beats a fake ramp.
+#   ramp | binary | amplitude  (LIVE-VERIFY against getevent ABS_MT_PRESSURE)
+pressure_semantics = "ramp"
+pressure_alpha = 1.25              # beta ramp u^a (1-u)^b
+pressure_beta = 0.85
+pressure_peak = 0.95
+pressure_floor = 0.22              # ~detection threshold; NEVER 0 while in contact
+contact_major_peak = 0.55          # normalized ABS_MT_TOUCH_MAJOR; co-evolves
+contact_minor_ratio = 0.82         # minor/major at peak
+orientation_bias_rad = 0.0         # grip/handedness bias; LIVE-VERIFY
+
+[scroll]
+# Android OverScroller fling physics. Not used by the core mulligan flow, but
+# implemented for any collection scrolling and for realism of idle behavior.
+fling_friction = 0.015             # OverScroller default-ish deceleration
+ppi_reference = 160.0
+reading_pause_s = 1.4              # content-dependent pause between flings
+
+[sensor]
+# Sensorimotor coherence priors (§ Layer 4). Used to GENERATE the predicted
+# inertial side effect and to VALIDATE coherence in Layer 6. On desk_mounted
+# posture we do not inject sensors; we assert flatness is expected and do not
+# claim handheld realism.
+tap_impulse_g = 0.3                # accel spike per tap; direction from location
+swipe_torque_dps = 1.4             # angular side effect per swipe
+poll_rate_hz = 100
+
+[caps]
+# Behavioral hygiene (§ Layer 5). Conservative starting caps; the risk profile
+# scales them. When a cap is hit the run STOPS (never substitutes an action).
+max_actions_per_run = 30
+max_actions_per_day = 50
+committing_action_cap = 15         # the key cap: holds the concede/commit ratio human
+max_games_per_session = 60
+max_session_minutes = 120
+mandatory_break_every_games = 12   # take a randomized break after N games
+break_min_minutes = 5
+break_max_minutes = 20
+non_repetition_threshold = 0.06    # reject trajectories that near-duplicate a prior run
+
+[vision]
+state_change_threshold = 9.0       # mean grayscale delta (0..255, 24x24) = "changed"
+dedupe_signature_size = 24         # NxN downsample for frame-advance detection
+ncc_match_threshold = 0.72         # normalized cross-correlation accept level
+ocr_max_edit_distance = 3          # snap-to-class fails closed beyond this
+weak_match_margin = 0.08           # match this-close to threshold => low confidence -> inspect
+
+[calibration]
+# Filled in by `hop calibrate`. device/date/tester provenance for the values
+# actually measured on your phone. Empty = running on unverified priors.
+device = ""
+date = ""
+tester = ""
