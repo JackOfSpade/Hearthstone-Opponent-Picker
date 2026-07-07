@@ -140,9 +140,16 @@ def cmd_doctor(args) -> int:
             check("/system/bin/hid present (UHID transport)", False)
         try:
             dump = adb.input_devices_dump()
-            hint = _extract_panel_identity(dump)
-            if hint:
-                print(f"        real panel identity (clone into [uhid]): {hint}")
+            ident = parse_touch_identity(dump)
+            if ident:
+                print(f"        real panel identity: name={ident['name']!r} "
+                      f"vendor=0x{ident['vendor']:04x} product=0x{ident['product']:04x} "
+                      f"(bus=0x{ident['bus']:04x})")
+                print(f"        -> clone into [uhid]: device_name = \"{ident['name']}\", "
+                      f"vendor_id = 0x{ident['vendor']:04x}, product_id = 0x{ident['product']:04x}")
+            else:
+                print("        (could not parse a touchscreen identity from `dumpsys input`; "
+                      "set [uhid] manually - see CALIBRATION.md §4)")
         except Exception:
             pass
 
@@ -369,10 +376,81 @@ def _device_model(adb) -> str:
         return "unknown"
 
 
-def _extract_panel_identity(dump: str) -> str:
-    """Pull a touchscreen's Vendor/Product from `dumpsys input` for uhid cloning."""
-    ln = [l for l in dump.splitlines() if "Vendor" in l and "Product" in l]
-    return ln[0].strip() if ln else ""
+def parse_touch_identity(dump: str) -> dict | None:
+    """Parse ``dumpsys input`` for the touchscreen's InputDevice identity.
+
+    Used to panel-match the virtual UHID digitizer (CALIBRATION.md §4). Modern
+    Android (11+) prints, under each device block::
+
+        2: goodix_ts0
+          Classes: KEYBOARD | TOUCH | TOUCH_MT
+          ...
+          Identifier: bus=0x0001, vendor=0x27c6, product=0x0100, version=0x0100, ...
+
+    so we walk blocks (headed by ``<n>: <name>``), remember the block's name and
+    Classes, and read the ``Identifier:`` line only for blocks whose Classes
+    include TOUCH. Among touch devices we prefer a real multitouch panel
+    (TOUCH_MT, non-zero vendor, not a fingerprint sensor). Returns a dict with
+    ``name`` and int ``vendor``/``product``/``version``/``bus`` (from the
+    ``0x``-prefixed fields), or ``None`` if no touchscreen identity is found.
+
+    Falls back to the legacy single-line ``Vendor: 0x.. Product: 0x..`` format
+    if present, so it keeps working on older Android too.
+    """
+    import re
+
+    header = re.compile(r"^\s+(\d+):\s+(\S.*)$")
+    candidates: list[dict] = []
+    name = None
+    classes = ""
+    for line in dump.splitlines():
+        m = header.match(line)
+        if m:
+            name, classes = m.group(2).strip(), ""
+            continue
+        stripped = line.strip()
+        if stripped.startswith("Classes:"):
+            classes = stripped
+        elif stripped.startswith("Identifier:") and "TOUCH" in classes:
+            fields: dict[str, int] = {}
+            for part in stripped[len("Identifier:"):].split(","):
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    v = v.strip()
+                    if v.startswith("0x"):
+                        try:
+                            fields[k.strip()] = int(v, 16)
+                        except ValueError:
+                            pass
+            if {"vendor", "product"} <= fields.keys():
+                candidates.append({
+                    "name": name or "touchscreen",
+                    "vendor": fields.get("vendor", 0),
+                    "product": fields.get("product", 0),
+                    "version": fields.get("version", 0),
+                    "bus": fields.get("bus", 0),
+                    "multitouch": "TOUCH_MT" in classes,
+                })
+
+    if not candidates:
+        # legacy fallback: `... Vendor: 0xNNNN Product: 0xNNNN ...` on one line
+        pat = re.compile(r"Vendor:\s*(0x[0-9a-fA-F]+).*Product:\s*(0x[0-9a-fA-F]+)")
+        for line in dump.splitlines():
+            m = pat.search(line)
+            if m:
+                return {"name": "touchscreen", "vendor": int(m.group(1), 16),
+                        "product": int(m.group(2), 16), "version": 0, "bus": 0,
+                        "multitouch": False}
+        return None
+
+    def rank(c: dict) -> tuple:
+        return (
+            c["multitouch"],
+            c["vendor"] != 0,
+            "fingerprint" not in c["name"].lower(),
+        )
+
+    return max(candidates, key=rank)
 
 
 # ── argparse ────────────────────────────────────────────────────────────────
