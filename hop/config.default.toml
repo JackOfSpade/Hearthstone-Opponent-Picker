@@ -49,8 +49,12 @@ device_name = "synaptics_dsx"     # LIVE-VERIFY: your panel's reported name
 vendor_id = 0x0596                 # LIVE-VERIFY
 product_id = 0x0501                # LIVE-VERIFY
 bus = "usb"                        # usb | bluetooth
-fifo_path = "/data/local/tmp/hop_hid"   # on-device named pipe for streaming
 min_report_interval_ms = 2         # floor between HID reports (avoid flooding)
+# The session's ONE `hid` process reads a stream of bare JSON objects on stdin
+# (no on-device FIFO: mkfifo is SELinux-denied for shell on modern Android).
+# After `register` we wait this long for the framework to enumerate the virtual
+# InputDevice before the first gesture, so early reports aren't dropped.
+register_settle_ms = 150           # LIVE-VERIFY: enumeration settle after register
 
 [alerts]
 mac_notification = true

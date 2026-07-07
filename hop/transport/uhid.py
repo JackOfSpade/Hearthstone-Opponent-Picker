@@ -6,18 +6,34 @@ teardown. Per-gesture register/destroy is a §9 anti-pattern - UHID destruction
 is a *disconnect* observable via ``InputManager.InputDeviceListener``, and a
 built-in panel never disconnects between taps.
 
-Streaming approach (the standard's "resident host-side writer, a named pipe held
-by an allowed context"): the AOSP ``hid`` tool reads a JSON *array* of commands
-from a file with a streaming pull-parser, so we point it at a named pipe (FIFO)
-on the device, open the array ``[`` with the ``register`` command at session
-start, append ``report``/``delay`` commands as gestures arrive, and close the
-array ``]`` at teardown. The device stays registered for exactly as long as the
-FIFO is held open - no add/remove churn.
+Streaming approach ("resident host-side writer"): the AOSP ``hid`` tool reads a
+stream of commands with a lazy JSON pull-parser and applies each as it arrives,
+blocking for more when the stream is quiet. We keep **one** ``hid`` process
+alive reading its **stdin** (fed by our long-lived ``adb shell`` pipe), send the
+``register`` command once at session start, append ``report``/``delay`` commands
+as gestures arrive, and close stdin at teardown (EOF -> ``hid`` exits -> device
+destroyed). The device stays registered for exactly as long as we hold stdin
+open - no add/remove churn.
 
-Caveats (marked because they can only be confirmed on-device):
-* SELinux may deny the shell domain a held-open FIFO; the standard says to solve
-  the plumbing rather than fall back to re-enumeration. If it can't be solved on
-  a given phone, use ``touch_backend = adb`` and accept degraded fidelity.
+On-device findings (Pixel 7a, Android 17 / SDK 37) that shaped this design:
+
+* **No FIFO.** The original plan held a named pipe open on the device, but
+  ``mkfifo``/``mknod`` in ``/data/local/tmp`` is SELinux-denied for the shell
+  domain (``avc: denied { create } ... tclass=fifo_file``). stdin comes from
+  ``adbd`` (an allowed context), so streaming to ``hid -`` sidesteps the denial
+  entirely. Shell *is* in the ``uhid`` group, so ``/dev/uhid`` itself is
+  reachable - the FIFO was the only blocker.
+* **Object stream, not a JSON array.** This ``hid`` reads a *sequence of bare
+  JSON objects* (``{...}\n{...}\n...``); handing it a ``[ ..., ... ]`` array
+  fails with ``Expected BEGIN_OBJECT but was BEGIN_ARRAY``. We therefore emit
+  one object per line with no enclosing brackets or commas.
+
+Confirmed working: the descriptor enumerates as a 1080x2400 ``TOUCHSCREEN``
+(``InputReader: Device added ... sources=TOUCHSCREEN``) and reports carry
+pressure + contact size through the real kernel pipeline (pointer-location
+overlay showed ``Prs``/``Size`` non-zero at the target coordinate).
+
+Caveat still marked because it can only be confirmed on-device:
 * Panel-matched identity (vid/pid/name) is generic by default - clone your real
   panel's values into ``[uhid]`` (``hop doctor`` prints them).
 """
@@ -25,6 +41,7 @@ Caveats (marked because they can only be confirmed on-device):
 from __future__ import annotations
 
 import json
+import time
 
 from ..config import UhidConfig
 from ..geometry import PanelGeometry
@@ -44,10 +61,8 @@ class UhidBackend(TouchBackend):
         self.adb = adb
         self.cfg = cfg
         self._panel: PanelGeometry | None = None
-        self._reader = None      # long-lived `hid <fifo>` process (holds device)
-        self._writer = None      # `cat > fifo` whose stdin we stream JSON into
+        self._proc = None        # long-lived `hid -` process; holds the device
         self._opened = False
-        self._first_cmd = True
 
     # ── availability probe ───────────────────────────────────────────────────
 
@@ -66,18 +81,12 @@ class UhidBackend(TouchBackend):
         if self._opened:
             return
         self._panel = panel
-        fifo = self.cfg.fifo_path
-        # (re)create the FIFO
-        self.adb.shell(f"rm -f {fifo}; ( mkfifo {fifo} || mknod {fifo} p )")
-        # reader: hid blocks reading the array from the FIFO for the whole session
-        self._reader = self.adb.popen_shell(f"hid {fifo}")
-        # writer: cat holds the FIFO open for writing; we feed it JSON
-        self._writer = self.adb.popen_shell(f"cat > {fifo}")
+        # One persistent reader of a bare-object stream on stdin (no FIFO: see
+        # module docstring for the SELinux rationale).
+        self._proc = self.adb.popen_shell("hid -")
         self._opened = True
-        self._first_cmd = True
 
         descriptor = hd.build_digitizer_descriptor(panel.width_px, panel.height_px)
-        self._raw_write("[\n")
         self._send({
             "id": 1,
             "command": "register",
@@ -87,6 +96,10 @@ class UhidBackend(TouchBackend):
             "bus": self.cfg.bus,
             "descriptor": descriptor,
         })
+        # Let the framework enumerate the new InputDevice before the first
+        # gesture, so early reports aren't dropped before dispatch is wired up.
+        if self.cfg.register_settle_ms > 0:
+            time.sleep(self.cfg.register_settle_ms / 1000.0)
 
     def emit(self, gesture: Gesture) -> None:
         if not self._opened:
@@ -117,23 +130,18 @@ class UhidBackend(TouchBackend):
         if not self._opened:
             return
         try:
-            self._raw_write("\n]\n")
-            if self._writer is not None and self._writer.stdin:
-                self._writer.stdin.flush()
-                self._writer.stdin.close()   # EOF -> cat exits -> hid exits -> device destroyed
+            if self._proc is not None and self._proc.stdin:
+                self._proc.stdin.flush()
+                self._proc.stdin.close()   # EOF -> hid exits -> device destroyed
         except Exception:
             pass
-        for proc in (self._writer, self._reader):
-            try:
-                if proc is not None:
-                    proc.terminate()
-            except Exception:
-                pass
         try:
-            self.adb.shell(f"rm -f {self.cfg.fifo_path}")
+            if self._proc is not None:
+                self._proc.terminate()
         except Exception:
             pass
         self._opened = False
+        self._proc = None
 
     # ── encoding ─────────────────────────────────────────────────────────────
 
@@ -150,17 +158,17 @@ class UhidBackend(TouchBackend):
             confidence=True,
         )
 
-    # ── raw JSON streaming to the FIFO writer ───────────────────────────────
+    # ── raw JSON streaming to the hid process stdin ─────────────────────────
 
     def _send(self, obj: dict) -> None:
-        prefix = "" if self._first_cmd else ",\n"
-        self._first_cmd = False
-        self._raw_write(prefix + json.dumps(obj))
+        """Write one bare JSON object followed by a newline (the modern ``hid``
+        tool reads a stream of objects, not a JSON array)."""
+        self._raw_write(json.dumps(obj) + "\n")
 
     def _raw_write(self, text: str) -> None:
-        w = self._writer
-        if w is None or w.stdin is None:
-            raise RuntimeError("UHID writer not open")
+        p = self._proc
+        if p is None or p.stdin is None:
+            raise RuntimeError("UHID hid process not open")
         # adb.popen_shell opens stdin in binary mode; stream UTF-8 bytes.
-        w.stdin.write(text.encode("utf-8"))
-        w.stdin.flush()
+        p.stdin.write(text.encode("utf-8"))
+        p.stdin.flush()

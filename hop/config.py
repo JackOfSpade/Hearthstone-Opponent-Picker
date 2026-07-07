@@ -86,8 +86,8 @@ class UhidConfig:
     vendor_id: int
     product_id: int
     bus: str
-    fifo_path: str
     min_report_interval_ms: int
+    register_settle_ms: int
 
 
 @dataclass(frozen=True)
@@ -256,8 +256,8 @@ def load_config(path: str | Path | None = None) -> Config:
             vendor_id=int(u["vendor_id"]),
             product_id=int(u["product_id"]),
             bus=str(u["bus"]),
-            fifo_path=str(u["fifo_path"]),
             min_report_interval_ms=int(u["min_report_interval_ms"]),
+            register_settle_ms=int(u["register_settle_ms"]),
         ),
         alerts=AlertConfig(
             mac_notification=bool(a["mac_notification"]),
