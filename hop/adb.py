@@ -130,10 +130,13 @@ class Adb:
 
 
 def _parse_size(text: str) -> tuple[int, int]:
-    for token in text.replace("Override size", "Physical size").split():
-        if "x" in token and token.replace("x", "").isdigit():
-            w, h = token.split("x")
-            return int(w), int(h)
+    for prefix in ("Override size", "Physical size"):
+        for line in text.splitlines():
+            if prefix in line:
+                for token in line.split():
+                    if "x" in token and token.replace("x", "").isdigit():
+                        w, h = token.split("x")
+                        return int(w), int(h)
     raise AdbError(f"could not parse `wm size`: {text!r}")
 
 

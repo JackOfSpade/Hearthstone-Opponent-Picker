@@ -102,3 +102,39 @@ def test_hid_report_layout_roundtrip():
 def test_hid_descriptor_bytes_valid():
     desc = hd.build_digitizer_descriptor(2400, 1080)
     assert len(desc) > 50 and all(0 <= b <= 255 for b in desc)
+
+
+def test_parse_size_prioritizes_override():
+    from hop.adb import _parse_size, AdbError
+    import pytest
+
+    # Standard output: override size present
+    txt = "Physical size: 1080x2400\nOverride size: 1080x2340\n"
+    w, h = _parse_size(txt)
+    assert (w, h) == (1080, 2340)
+
+    # Physical size only
+    txt2 = "Physical size: 1080x2400\n"
+    w2, h2 = _parse_size(txt2)
+    assert (w2, h2) == (1080, 2400)
+
+    # Invalid string
+    with pytest.raises(AdbError):
+        _parse_size("invalid string")
+
+
+def test_screen_classifier_custom_threshold():
+    from unittest.mock import patch
+    from hop.perception.screens import ScreenClassifier, ScreenState, Anchor
+    from hop.perception.templates import Match
+
+    anchor_tmpl = Template("mulligan", None, Region(0, 0, 1, 1), threshold=0.65)
+    anchor = Anchor(ScreenState.MULLIGAN, anchor_tmpl)
+    classifier = ScreenClassifier([anchor])
+
+    # Match score is 0.68 (greater than template's 0.65, but less than self.accept 0.72)
+    with patch("hop.perception.screens.best_match") as mock_best:
+        mock_best.return_value = Match("mulligan", 100, 100, 0.68)
+        classification = classifier.classify(None)
+        assert classification.state == ScreenState.MULLIGAN
+        assert classification.confidence == 0.68

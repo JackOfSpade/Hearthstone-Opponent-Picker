@@ -60,21 +60,21 @@ class Alerter:
         """Loop the alert sound in a background thread until :meth:`stop_alarm`."""
         if self._alarm_thread and self._alarm_thread.is_alive():
             return
-        self._alarm_stop = threading.Event()
+        stop_event = self._alarm_stop = threading.Event()
 
         def loop():
             path = f"/System/Library/Sounds/{self.cfg.sound_name}.aiff"
             afplay = shutil.which("afplay")
-            while self._alarm_stop and not self._alarm_stop.is_set():
+            while not stop_event.is_set():
                 if afplay:
                     try:
                         subprocess.run([afplay, path], timeout=10)
                     except Exception:
-                        self._alarm_stop.wait(1.0)
+                        stop_event.wait(1.0)
                 else:  # non-mac: terminal bell + wait
                     sys.stdout.write("\a")
                     sys.stdout.flush()
-                    self._alarm_stop.wait(1.5)
+                    stop_event.wait(1.5)
 
         self._alarm_thread = threading.Thread(target=loop, daemon=True)
         self._alarm_thread.start()
@@ -82,6 +82,7 @@ class Alerter:
     def stop_alarm(self) -> None:
         if self._alarm_stop:
             self._alarm_stop.set()
+            self._alarm_stop = None
         self._alarm_thread = None
 
     # ── platform helpers ─────────────────────────────────────────────────────

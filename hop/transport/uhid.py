@@ -101,7 +101,7 @@ class UhidBackend(TouchBackend):
             floor = self.cfg.min_report_interval_ms
             if dt_ms >= floor:
                 self._send({"id": 1, "command": "delay", "duration": dt_ms})
-            prev_t = s.t
+                prev_t = s.t
 
             rep = self._sample_to_report(s, panel)
             active[s.pointer_id] = rep

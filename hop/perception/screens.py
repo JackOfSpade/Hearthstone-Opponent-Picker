@@ -67,7 +67,7 @@ class ScreenClassifier:
             m = best_match(frame, anchor.template)
             if m and m.score > best_score:
                 best_score = m.score
-                if m.score >= self.accept:
+                if m.score >= anchor.template.threshold:
                     best_state = anchor.state
         return Classification(best_state, best_score)
 

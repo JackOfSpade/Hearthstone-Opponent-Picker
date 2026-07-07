@@ -163,6 +163,7 @@ def _plan_submovements(
     target: tuple[float, float],
     n_correct: int,
     state: HumanState,
+    mt: float,
 ) -> list[tuple[tuple[float, float], float, float]]:
     """Return [(displacement, t_start_frac, dur_frac), ...] whose displacements
     sum EXACTLY to (target - start).
@@ -180,9 +181,12 @@ def _plan_submovements(
     aim = (tx + ux * over, ty + uy * over)
 
     subs: list[tuple[tuple[float, float], float, float]] = []
-    subs.append((aim, 0.0, rng.uniform(0.62, 0.78)))
+    primary_dur_frac = rng.uniform(0.62, 0.78)
+    subs.append((aim, 0.0, primary_dur_frac))
     remaining = (tx - aim[0], ty - aim[1])
-    t_cursor = subs[0][2] * rng.uniform(0.75, 0.9)  # correctives overlap the primary tail
+    t_cursor = primary_dur_frac * rng.uniform(0.75, 0.9)  # correctives overlap the primary tail
+    
+    mt_safe = max(0.01, mt)
     for k in range(n_correct):
         last = k == n_correct - 1
         if last:
@@ -191,9 +195,10 @@ def _plan_submovements(
             frac = rng.uniform(0.45, 0.7)
             disp = (remaining[0] * frac, remaining[1] * frac)
             remaining = (remaining[0] - disp[0], remaining[1] - disp[1])
-        dur = rng.uniform(0.06, 0.13)
-        subs.append((disp, min(0.95, t_cursor), dur))
-        t_cursor = min(0.98, t_cursor + dur * rng.uniform(0.6, 0.9))
+        dur_seconds = rng.uniform(0.06, 0.13)
+        dur_frac = dur_seconds / mt_safe
+        subs.append((disp, min(0.95, t_cursor), dur_frac))
+        t_cursor = min(0.98, t_cursor + dur_frac * rng.uniform(0.6, 0.9))
     return subs
 
 
@@ -226,7 +231,7 @@ def synth_swipe(
         + fitts_index_of_difficulty(dist, width) * 0.15,
         cfg.submovement_min, cfg.submovement_max,
     )))
-    subs = _plan_submovements(rng, start, end, n_correct, state)
+    subs = _plan_submovements(rng, start, end, n_correct, state, mt)
 
     dt = 1.0 / cfg.report_rate_hz
     n = max(4, int(round(mt / dt)))
