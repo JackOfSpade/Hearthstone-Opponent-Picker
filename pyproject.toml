@@ -1,0 +1,41 @@
+[project]
+name = "hop"
+version = "2.0.0"
+description = "Hearthstone Opponent Picker - a wireless-ADB Android automation that filters queued opponents by class / going-second, built on the Android App Automation Humanization Standard (Rev 2)."
+requires-python = ">=3.11"
+# Core runtime deps are intentionally light. Everything in hop.humanize.* and
+# most of hop.perception.* runs on the Python standard library so the pure,
+# app-independent layers (L3/L4/L5) stay unit-testable with zero native deps.
+dependencies = []
+
+[project.optional-dependencies]
+# Vision/OCR. numpy accelerates template matching + card counting; without it
+# hop falls back to slower pure-Python paths. Pillow decodes screencap PNGs.
+# pytesseract is the OCR engine for the class label (snapped to 11 known words).
+vision = ["numpy>=1.24", "Pillow>=10.0", "pytesseract>=0.3.10"]
+# Local web dashboard.
+web = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0"]
+# Global hotkeys (start/stop/panic) from the Mac.
+hotkeys = ["pynput>=1.7.6"]
+dev = ["pytest>=7.4"]
+all = [
+    "numpy>=1.24", "Pillow>=10.0", "pytesseract>=0.3.10",
+    "fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0",
+    "pynput>=1.7.6", "pytest>=7.4",
+]
+
+[project.scripts]
+hop = "hop.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hop*"]
+
+[tool.setuptools.package-data]
+hop = ["config.default.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
