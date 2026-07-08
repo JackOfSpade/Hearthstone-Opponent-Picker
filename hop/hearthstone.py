@@ -52,11 +52,12 @@ class GameLayout:
     opponent_class_region: Region = Region(0.03, 0.90, 0.20, 0.07)
     # the whole mulligan card row: the band the keep-glow strips are counted in
     card_row: Region = Region(0.12, 0.24, 0.76, 0.45)
-    # Distance between adjacent keep-glow strips, as a fraction of screen width.
-    # LIVE-VERIFIED on four real 4-card hands (2400x1080): 400.5-402.5 px.
-    # Card size is independent of hand size, so this is the same for 3 and 4 cards
-    # and gives an independent cross-check on the strip count.
-    card_pitch_f: float = 0.1672
+    # Width of a card's interior - the span between its left and right keep-glow -
+    # as a fraction of screen width. LIVE-MEASURED on five real hands (one 3-card,
+    # four 4-card, 2400x1080): 344-382 px, i.e. 0.143-0.159 W. Card size does not
+    # depend on hand size. The background gap between two cards is 0.054 W, so the
+    # two are separated by a factor of ~2.7 in width (and ~3 in brightness).
+    card_inner_w_f: float = 0.147
 
     # action points (center + hit radius, screen fractions)
     # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the Play button lives on the
@@ -123,17 +124,22 @@ class MulliganRead:
         return self.opponent_class is not None and self.num_cards in (3, 4)
 
 
-def glow_strip_centers(frame: Frame, layout: GameLayout, vision) -> list[int] | None:
-    """x centres (px) of the mulligan keep-glow strips; ``None`` without colour.
+def glow_strip_runs(frame: Frame, layout: GameLayout, vision) -> list[tuple[int, int]] | None:
+    """``(start, end)`` columns of the keep-glow strips; ``None`` without colour.
 
-    Every mulligan card is outlined by a saturated green "keep" glow. Between two
-    adjacent cards the two glows form one bright vertical strip, and the outer
-    edges of the hand contribute one each - so **N cards produce N+1 strips**.
+    Every mulligan card is outlined by a saturated green "keep" glow. The glow is
+    UI chrome, not artwork, which is the entire point: no card picture can imitate
+    it. A strip is accepted only where the green mask covers most of the band's
+    *height*, because the glow runs a card's full height and a patch of green art
+    does not.
 
-    The glow is UI chrome, not artwork, which is the entire point: it cannot be
-    imitated by a card's picture. A strip is accepted only if the green mask
-    covers most of the band's *height*, because the glow runs the full height of a
-    card while a patch of green art does not.
+    Columns are relative to the card row's left edge, which is what
+    :func:`count_mulligan_cards` needs to slice the band.
+
+    Note that a strip is **not** the same thing as a card boundary. When cards sit
+    close together their glows merge into one wide strip; when the hand is spread
+    out each card contributes two separate strips. The strip *count* therefore does
+    not determine the card count - see :func:`count_mulligan_cards`.
     """
     rgb = getattr(frame, "rgb", None)
     if rgb is None:
@@ -157,7 +163,7 @@ def glow_strip_centers(frame: Frame, layout: GameLayout, vision) -> list[int] | 
     row_thresh = int(vision.glow_col_min_frac * rh)
     min_width = max(4, int(vision.glow_min_strip_frac * frame.width))
 
-    centers: list[int] = []
+    runs: list[tuple[int, int]] = []
     run = start = 0
     for i, v in enumerate(col):
         if v >= row_thresh:
@@ -166,54 +172,81 @@ def glow_strip_centers(frame: Frame, layout: GameLayout, vision) -> list[int] | 
             run += 1
         else:
             if run >= min_width:
-                centers.append(rx + start + run // 2)
+                runs.append((start, i))
             run = 0
     if run >= min_width:
-        centers.append(rx + start + run // 2)
-    return centers
+        runs.append((start, len(col)))
+    return runs
 
 
 def count_mulligan_cards(frame: Frame, layout: GameLayout, vision) -> int:
     """Number of mulligan cards, or ``0`` meaning *unreadable* (fail closed).
 
-    Counts the keep-glow strips (:func:`glow_strip_centers`): N cards -> N+1
-    strips. The strip count is then **cross-checked against the card pitch**, which
-    is a fixed fraction of the screen regardless of hand size; a spurious or
-    missing strip changes the implied pitch and is rejected. Disagreement returns
-    0, which makes :attr:`MulliganRead.usable` false and the engine fail closed.
+    Counts **card interiors**: the spans between consecutive keep-glow strips
+    (:func:`glow_strip_runs`) that are both as wide as a card and as bright as a
+    card. On five real hands the two kinds of span separate cleanly:
 
-    Two earlier methods are gone because both were wrong on real frames:
+    ============  ==================  ============
+    span          width               mean gray
+    ============  ==================  ============
+    card interior 0.143 - 0.159 W     96 - 118
+    gap between   0.054 W             33 - 35
+    ============  ==================  ============
 
+    The two tests are orthogonal - a wide dark span is not a card, nor is a narrow
+    bright one - and each has a margin of roughly 3x. An implausible total (not 3
+    or 4) returns 0, which makes :attr:`MulliganRead.usable` false so the engine
+    fails closed rather than guess at the signal that decides whether to concede.
+
+    Do **not** be tempted to count the strips instead: a strip is one card edge
+    when the hand is spread out and two merged edges when it is packed, so 3 cards
+    produce 6 strips and 4 cards produce 5. Counting strips gives the right answer
+    on 4-card hands and the wrong one on 3-card hands - which is exactly the half
+    of the signal that decides ``we_go_second``.
+
+    Three earlier methods are gone because each was wrong on real frames:
+
+    * **Strip counting** (N+1 strips), above.
     * **Mana-gem colour masking.** A gem's white digit punches a hole through the
       middle of it, splitting one gem into fragments, while blue *card art* forms
-      its own runs. Colour cannot even separate them - a real gem measured
-      ``b-g=22`` against a card's blue sky at ``b-g=21``. This reported 3 on a real
-      4-card hand, which silently inverts ``we_go_second``.
-    * **Brightness "humps".** A dark-art card sits entirely below the threshold and
-      is skipped.
+      runs of its own. Colour cannot even separate them - a real gem measured
+      ``b-g=22`` against a card's blue sky at ``b-g=21``.
+    * **Brightness "humps".** A dark-art card sits entirely below the threshold.
 
-    Both passed their unit tests, which drew *synthetic* gems and humps. Only real
-    frames caught them, so the tests for this function use real captures.
+    The last two each reported 3 on a real 4-card hand, and each had passing unit
+    tests built on *synthetic* frames. The tests for this function use real captures.
     """
-    centers = glow_strip_centers(frame, layout, vision)
-    if not centers or len(centers) < 3:
+    # A keep-glow strip is only ~1.2% of the screen wide. Below a few hundred pixels
+    # a strip drops under `glow_min_strip_frac` and vanishes, which merges two card
+    # interiors into one over-wide span and *undercounts* rather than failing. That
+    # is the one thing this function must never do, so refuse outright. (Measured:
+    # correct down to 400px; at 300px a 4-card hand reads 3. Real captures are 2400.)
+    if frame.width < vision.min_count_frame_width:
         return 0
 
-    n = len(centers) - 1
-    span = centers[-1] - centers[0]
-    if n <= 0 or span <= 0:
+    runs = glow_strip_runs(frame, layout, vision)
+    if not runs or len(runs) < 2:
         return 0
 
-    expected = layout.card_pitch_f * frame.width
-    tol = vision.card_pitch_tolerance
-    if abs(span / n - expected) > tol * expected:
-        return 0
-    # the strips must also be evenly spaced: an extra strip inside the hand would
-    # keep the mean pitch plausible while making one gap conspicuously short.
-    gaps = [b - a for a, b in zip(centers, centers[1:])]
-    if any(abs(gap - expected) > tol * expected for gap in gaps):
-        return 0
-    return n
+    rgb = frame.rgb
+    rx, ry, rw, rh = layout.card_row.to_px(frame)
+    band = rgb[ry:ry + rh, rx:rx + rw]
+
+    expected = layout.card_inner_w_f * frame.width
+    tol = vision.card_width_tolerance
+
+    cards = 0
+    for (_, end), (start, _) in zip(runs, runs[1:]):
+        width = start - end
+        if abs(width - expected) > tol * expected:
+            continue                       # a background gap, not a card
+        segment = band[:, end:start]
+        if segment.size == 0:
+            continue
+        if float(segment.mean()) < vision.card_min_gray:
+            continue                       # wide but dark: not a card
+        cards += 1
+    return cards if cards in (3, 4) else 0
 
 
 def read_mulligan(

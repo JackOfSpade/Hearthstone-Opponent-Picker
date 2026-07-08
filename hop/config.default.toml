@@ -167,20 +167,27 @@ reconnecting_wait_attempts = 12
 # ...and make at most this many Reconnect taps per run. A reconnect that keeps
 # failing means the network or the account needs a human, so fail closed.
 reconnect_attempt_cap = 3
-# Mulligan card counting. Every card is outlined by a saturated green "keep" glow;
-# adjacent cards share one strip and the hand's outer edges add one each, so N
-# cards produce N+1 strips. The glow is UI chrome, so - unlike the mana gems or a
-# brightness profile, both of which this replaced - card artwork cannot fake it.
-# A strip must span most of the band's HEIGHT: the glow runs a card's full height,
-# a patch of green art does not.
+# Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
+# The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
+# which this replaced - card artwork cannot fake it. A strip must span most of the
+# band's HEIGHT: the glow runs a card's full height, a patch of green art does not.
 glow_green_bias = 30               # green must exceed red AND blue by this much
 glow_min_green = 90                # ...and be at least this bright
 glow_col_min_frac = 0.50           # a column counts if >=this fraction of band rows glow
 glow_min_strip_frac = 0.0033       # ignore strips narrower than this (~8px @ 2400)
-# The strip count is cross-checked against `GameLayout.card_pitch_f`, which does
-# not depend on hand size. Disagreement -> unreadable -> the engine fails closed
+# We count CARD INTERIORS between the strips, not the strips themselves: glows merge
+# when cards sit close, so 3 cards make 6 strips while 4 cards make 5. An interior
+# is a span that is both card-WIDE and card-BRIGHT; the background gap between two
+# cards is ~2.7x narrower and ~3x darker, so the two tests are orthogonal with a
+# wide margin. A total that isn't 3 or 4 -> unreadable -> the engine fails closed
 # rather than guess, because a wrong count inverts `require_second`.
-card_pitch_tolerance = 0.12        # accept pitch within +/- this fraction
+card_width_tolerance = 0.15        # accept interiors within +/- this fraction of card_inner_w_f
+card_min_gray = 60.0               # mean gray of a card interior (gaps measure 33-35)
+# Below this frame width a keep-glow strip (~1.2% of the screen) drops under
+# `glow_min_strip_frac` and disappears, which merges two card interiors and
+# UNDERCOUNTS instead of failing. Refuse outright. Measured: correct down to
+# 400px; at 300px a 4-card hand reads 3. Real screencaps are 2400px wide.
+min_count_frame_width = 400
 
 [calibration]
 # Filled in by `hop calibrate`. device/date/tester provenance for the values

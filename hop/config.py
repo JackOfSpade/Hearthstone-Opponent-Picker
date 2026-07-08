@@ -186,7 +186,9 @@ class VisionConfig:
     glow_min_green: int
     glow_col_min_frac: float
     glow_min_strip_frac: float
-    card_pitch_tolerance: float
+    card_width_tolerance: float
+    card_min_gray: float
+    min_count_frame_width: int
 
 
 @dataclass(frozen=True)
