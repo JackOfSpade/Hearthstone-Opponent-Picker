@@ -55,6 +55,17 @@ min_report_interval_ms = 2         # floor between HID reports (avoid flooding)
 # After `register` we wait this long for the framework to enumerate the virtual
 # InputDevice before the first gesture, so early reports aren't dropped.
 register_settle_ms = 150           # LIVE-VERIFY: enumeration settle after register
+# Contact-channel logical maxima. 0 = clone them from the real panel at startup.
+# This is NOT optional polish: Android loads the panel's calibration by device
+# NAME and applies it to our reports, so cloning the name while declaring
+# different axis ranges makes the framework size our contact against the wrong
+# scale. Measured on a Pixel 7a (panel TOUCH_MAJOR max 2399): with the old 255
+# ceiling, Hearthstone silently ignored every tap on a mulligan card while still
+# honouring taps on buttons.
+touch_major_max = 0
+touch_minor_max = 0
+pressure_max = 0
+orientation_max = 0
 
 [alerts]
 mac_notification = true
@@ -112,10 +123,18 @@ tap_micro_slip_px = 2.5            # finger-pad settle-and-slide on impact
 pressure_semantics = "ramp"
 pressure_alpha = 1.25              # beta ramp u^a (1-u)^b
 pressure_beta = 0.85
-pressure_peak = 0.95
-pressure_floor = 0.22              # ~detection threshold; NEVER 0 while in contact
-contact_major_peak = 0.55          # normalized ABS_MT_TOUCH_MAJOR; co-evolves
-contact_minor_ratio = 0.82         # minor/major at peak
+# All four below are FRACTIONS OF THE PANEL'S OWN AXIS MAXIMA (see [uhid] axes),
+# so they transfer across devices. LIVE-VERIFIED against a human swipe captured
+# with `getevent -lt` on a Pixel 7a / goodix_ts0 (n=24 gestures):
+#   ABS_MT_PRESSURE     in-contact p10 0.52, median 0.80, peak 1.00 (of 255)
+#   ABS_MT_TOUCH_MAJOR  0.029 - 0.122 of 2399, median 0.090
+#   minor/major raw ratio 0.758
+# The old defaults (floor 0.22, major_peak 0.55) were less than half the real
+# touch-down pressure and ~6x the real contact size.
+pressure_peak = 0.98
+pressure_floor = 0.52              # ~detection threshold; NEVER 0 while in contact
+contact_major_peak = 0.12          # fraction of ABS_MT_TOUCH_MAJOR max
+contact_minor_ratio = 0.76         # minor/major, in raw panel units
 orientation_bias_rad = 0.0         # grip/handedness bias; LIVE-VERIFY
 
 [scroll]

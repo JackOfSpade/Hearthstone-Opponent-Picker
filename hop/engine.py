@@ -59,6 +59,10 @@ class RunStats:
     target_found: bool = False
     stop_reason: str = ""
     last_opponent: str = ""
+    #: mulligan replace-taps the game ignored. Non-fatal (we stay on the mulligan
+    #: and simply keep the card), but a rising count means the touch profile is
+    #: drifting from what Hearthstone accepts - worth surfacing, not swallowing.
+    ignored_card_taps: int = 0
 
 
 def evaluate_matchup(read: MulliganRead, cfg: Config) -> str:
@@ -140,6 +144,7 @@ class Engine:
         novelty: float = 0.0,
         allow_correction: bool = True,
         verify_region: Region | None = None,
+        what: str = "",
     ) -> None:
         """One humanized, verified tap. Raises Halt/CapReached/CleanStop upward.
 
@@ -166,6 +171,12 @@ class Engine:
                                   self.cfg.motor, self.contact, self.state)
         near_dup = self.limiter.is_near_duplicate(gesture)
 
+        if self.debug:
+            # Which control did we aim at? Without this the journal is a list of
+            # anonymous verify_ok lines and a failure can't be attributed.
+            self.debug.record("tap", what=what or "?", point=(round(tx), round(ty)),
+                              expected=expected_change or "any",
+                              scoped=verify_region is not None)
         self.backend.emit(gesture)
         self.limiter.register_action(committing)
         self.limiter.remember_trajectory(gesture)
@@ -276,7 +287,7 @@ class Engine:
             if self.debug:
                 self.debug.record("error_dialog_dismissed")
             self._tap(self.layout.error_ok, committing=False, decision_type="commit",
-                      expected_change="full_transition")
+                      expected_change="full_transition", what="error_ok")
         elif st == ScreenState.RECONNECT_DIALOG:
             self._reconnect()
         elif st == ScreenState.RECONNECTING:
@@ -286,11 +297,11 @@ class Engine:
         elif st == ScreenState.DECK_SELECT:
             # dropped back to the deck list (e.g. after an error); reopen the deck
             self._tap(self.layout.deck_slot, committing=False, decision_type="commit",
-                      expected_change="full_transition")
+                      expected_change="full_transition", what="deck_slot")
         elif st == ScreenState.PLAY_SCREEN:
             # the loop's home state: the deck's Play button queues a game
             self._tap(self.layout.play_button, committing=False, decision_type="commit",
-                      expected_change="full_transition", novelty=0.1)
+                      expected_change="full_transition", novelty=0.1, what="play")
         elif st == ScreenState.QUEUE:
             # searching for an opponent - tapping here CANCELS the queue, so wait
             self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
@@ -306,7 +317,7 @@ class Engine:
             self._clear_end_screens()
         elif st == ScreenState.CONCEDE_MENU:
             self._tap(self.layout.concede_button, committing=True, decision_type="reject",
-                      expected_change="full_transition")
+                      expected_change="full_transition", what="concede")
         elif st == ScreenState.IN_GAME:
             # Unexpected here means a reject-play beat; a plausible pass, then re-loop
             self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
@@ -343,7 +354,7 @@ class Engine:
             self.debug.record("reconnect_tapped", attempt=self._reconnect_attempts)
 
         self._tap(self.layout.reconnect_button, committing=False,
-                  decision_type="commit", expected_change=None, allow_correction=False)
+                  decision_type="commit", expected_change=None, allow_correction=False, what="reconnect")
 
         for _ in range(max(1, self.cfg.vision.reconnecting_wait_attempts)):
             cls, _frame = self._classify()
@@ -393,12 +404,25 @@ class Engine:
                 center = read.card_centers_f[d.slot]
                 # Marking a card for replacement redraws only that card, which is far
                 # below the whole-frame change threshold. Verify the card's own pixels.
-                self._tap(self.layout.card_point(center), committing=False,
-                          decision_type=d.decision_type, visual_complexity=0.5,
-                          verify_region=self.layout.card_region(center))
+                #
+                # A card that refuses to toggle is NOT an unknown state: we are still
+                # on the mulligan, we know exactly where we are, and a human who fails
+                # to flick a card simply keeps it. Halting the hunt over that would be
+                # fail-closed applied where nothing is closed. Record it and move on -
+                # the *committing* action (the concede) is still fully verified.
+                try:
+                    self._tap(self.layout.card_point(center), committing=False,
+                              decision_type=d.decision_type, visual_complexity=0.5,
+                              verify_region=self.layout.card_region(center),
+                              allow_correction=False, what=f"mulligan_card[{d.slot}]")
+                except Halt as e:
+                    if self.debug:
+                        self.debug.record("mulligan_card_tap_ignored",
+                                          slot=d.slot, reason=str(e))
+                    self.stats.ignored_card_taps += 1
         # confirm the mulligan
         self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
-                  expected_change="full_transition")
+                  expected_change="full_transition", what="mulligan_confirm")
 
         # play into the game to the chosen concede point (never insta-concede)
         if plan.concede_point in ("turn1", "turn2"):
@@ -438,7 +462,7 @@ class Engine:
             if self.rng.random() < 0.5:
                 try:
                     self._tap(self.layout.pass_turn_button, committing=False, decision_type="commit",
-                              expected_change="partial", allow_correction=False)
+                              expected_change="partial", allow_correction=False, what="pass_turn")
                 except Halt:
                     return  # board state moved on; fine, we're conceding anyway
 
@@ -447,7 +471,7 @@ class Engine:
         # The gear opens a menu that dims the whole board, so this is a
         # full_transition, not a bottom_sheet (measured: thirds 21.5/21.1/3.7).
         self._tap(self.layout.gear_button, committing=False, decision_type="commit",
-                  expected_change="full_transition")
+                  expected_change="full_transition", what="gear")
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                   expected_change="full_transition")
         # some clients show a confirm; tap it if a concede menu is still up.
@@ -455,7 +479,7 @@ class Engine:
         cls, _ = self._classify_settled()
         if cls.state == ScreenState.CONCEDE_MENU:
             self._tap(self.layout.concede_confirm, committing=False, decision_type="commit",
-                      expected_change="full_transition", allow_correction=False)
+                      expected_change="full_transition", allow_correction=False, what="concede_confirm")
 
     def _clear_end_screens(self, max_taps: int = 8) -> None:
         """Tap through victory/defeat/rewards/quest popups until back at play/queue.
@@ -479,7 +503,7 @@ class Engine:
                 self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
                 continue
             self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
-                      expected_change="full_transition", allow_correction=False)
+                      expected_change="full_transition", allow_correction=False, what="end_dismiss")
 
     # ── alerts ───────────────────────────────────────────────────────────────
 

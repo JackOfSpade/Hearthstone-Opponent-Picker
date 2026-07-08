@@ -88,6 +88,12 @@ class UhidConfig:
     bus: str
     min_report_interval_ms: int
     register_settle_ms: int
+    #: Contact-channel logical maxima; 0 = clone them from the real panel at open().
+    #: See :class:`hop.transport.hid_descriptor.PanelAxes` for why this matters.
+    touch_major_max: int = 0
+    touch_minor_max: int = 0
+    pressure_max: int = 0
+    orientation_max: int = 0
 
 
 @dataclass(frozen=True)
@@ -270,6 +276,10 @@ def load_config(path: str | Path | None = None) -> Config:
             bus=str(u["bus"]),
             min_report_interval_ms=int(u["min_report_interval_ms"]),
             register_settle_ms=int(u["register_settle_ms"]),
+            touch_major_max=int(u.get("touch_major_max", 0)),
+            touch_minor_max=int(u.get("touch_minor_max", 0)),
+            pressure_max=int(u.get("pressure_max", 0)),
+            orientation_max=int(u.get("orientation_max", 0)),
         ),
         alerts=AlertConfig(
             mac_notification=bool(a["mac_notification"]),

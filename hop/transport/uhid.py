@@ -64,6 +64,7 @@ class UhidBackend(TouchBackend):
         self._panel: PanelGeometry | None = None
         self._proc = None        # long-lived `hid -` process; holds the device
         self._opened = False
+        self._axes = hd.DEFAULT_AXES
 
     # ── availability probe ───────────────────────────────────────────────────
 
@@ -78,16 +79,42 @@ class UhidBackend(TouchBackend):
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
+    def _detect_axes(self) -> hd.PanelAxes:
+        """Clone the real panel's contact-channel ranges, not just its name.
+
+        Android loads the panel's calibration by device NAME and applies it to our
+        reports, so declaring different axis maxima makes the framework size our
+        contact against the wrong scale. Measured consequence on a Pixel 7a: with a
+        255-max TOUCH_MAJOR against the panel's real 2399, Hearthstone silently
+        ignored every tap on a mulligan card while still honouring taps on buttons.
+        """
+        try:
+            axes = hd.parse_panel_axes(self.adb.shell("getevent -pl 2>/dev/null"),
+                                       self.cfg.device_name)
+        except Exception:
+            axes = None
+        if axes is None:
+            return hd.DEFAULT_AXES
+        # explicit config overrides win; 0 means "take the panel's value"
+        return hd.PanelAxes(
+            touch_major_max=self.cfg.touch_major_max or axes.touch_major_max,
+            touch_minor_max=self.cfg.touch_minor_max or axes.touch_minor_max,
+            pressure_max=self.cfg.pressure_max or axes.pressure_max,
+            orientation_max=self.cfg.orientation_max or axes.orientation_max,
+        )
+
     def open(self, panel: PanelGeometry) -> None:
         if self._opened:
             return
         self._panel = panel
+        self._axes = self._detect_axes()
         # One persistent reader of a bare-object stream on stdin (no FIFO: see
         # module docstring for the SELinux rationale).
         self._proc = self.adb.popen_shell("hid -")
         self._opened = True
 
-        descriptor = hd.build_digitizer_descriptor(panel.width_px, panel.height_px)
+        descriptor = hd.build_digitizer_descriptor(panel.width_px, panel.height_px,
+                                                   hd.MAX_CONTACTS, self._axes)
         self._send({
             "id": 1,
             "command": "register",
@@ -126,7 +153,8 @@ class UhidBackend(TouchBackend):
             self._send({
                 "id": 1,
                 "command": "report",
-                "report": list(hd.encode_report(list(active.values()))),
+                "report": list(hd.encode_report(list(active.values()),
+                                               hd.MAX_CONTACTS, self._axes)),
             })
             if not s.tip:
                 active.pop(s.pointer_id, None)
@@ -161,14 +189,20 @@ class UhidBackend(TouchBackend):
     def _sample_to_report(self, s: TouchSample, panel: PanelGeometry,
                           rotation: int) -> hd.ContactReport:
         nx, ny = display_to_native(s.x, s.y, rotation, panel.width_px, panel.height_px)
+        axes = self._axes
+        # major/minor are fractions of the MAJOR axis: they are lengths in the same
+        # units, and the panel merely declares a smaller ceiling for the minor one.
+        major_raw = int(round(max(0.0, min(1.0, s.major)) * axes.touch_major_max))
+        minor_raw = int(round(max(0.0, min(1.0, s.minor)) * axes.touch_major_max))
         return hd.ContactReport(
             contact_id=s.pointer_id,
             x=max(0, min(panel.width_px - 1, int(round(nx)))),
             y=max(0, min(panel.height_px - 1, int(round(ny)))),
-            pressure=int(round(max(0.0, min(1.0, s.pressure)) * 255)),
-            major=int(round(max(0.0, min(1.0, s.major)) * 255)),
-            minor=int(round(max(0.0, min(1.0, s.minor)) * 255)),
-            orientation=int(round(max(-1.0, min(1.0, s.orientation / (3.141592653589793 / 2))) * 127)),
+            pressure=int(round(max(0.0, min(1.0, s.pressure)) * axes.pressure_max)),
+            major=min(axes.touch_major_max, major_raw),
+            minor=min(axes.touch_minor_max, minor_raw),
+            orientation=int(round(max(-1.0, min(1.0, s.orientation / (3.141592653589793 / 2)))
+                                  * axes.orientation_max)),
             tip=s.tip,
             confidence=True,
         )
