@@ -188,6 +188,8 @@ class VisionConfig:
     glow_min_strip_frac: float
     card_width_tolerance: float
     card_min_gray: float
+    card_max_separation_f: float
+    hand_center_tolerance_f: float
     min_count_frame_width: int
 
 

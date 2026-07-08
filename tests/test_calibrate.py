@@ -9,11 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from hop.calibrate import (
-    estimate_report_rate_hz,
-    parse_touch_event_node,
-    upsert_toml_scalar,
-)
+from hop.calibrate import estimate_report_rate_hz, parse_touch_event_node
+from hop.tomledit import upsert_toml_scalar
 
 DATA = Path(__file__).parent / "data"
 

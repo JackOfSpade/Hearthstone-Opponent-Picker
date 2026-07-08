@@ -58,6 +58,11 @@ class GameLayout:
     # depend on hand size. The background gap between two cards is 0.054 W, so the
     # two are separated by a factor of ~2.7 in width (and ~3 in brightness).
     card_inner_w_f: float = 0.147
+    # The hand is centred on the screen. LIVE-MEASURED: the mean of the card-interior
+    # centres is 0.497 +/- 0.001 across five real hands of both sizes. This is what
+    # catches a hand whose OUTERMOST card has been marked for replacement (see
+    # :func:`card_interiors`) - the survivors stay evenly spaced but shift off centre.
+    hand_center_xf: float = 0.4975
 
     # action points (center + hit radius, screen fractions)
     # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the Play button lives on the
@@ -92,20 +97,26 @@ class GameLayout:
     # subsequent tap silently does nothing - the worst possible failure mode.
     reconnect_button: Point = Point(0.4092, 0.8380, 0.0190)
 
-    def card_slot(self, slot: int, num_cards: int, panel: PanelGeometry) -> Point:
-        """Center of mulligan card ``slot`` given the layout has ``num_cards``.
+    def card_point(self, center_xf: float) -> Point:
+        """A tap target on the mulligan card whose interior is centred at ``center_xf``.
 
-        3-card and 4-card mulligans are centered differently; we lay slots out
-        evenly across the card row so a keep/replace tap lands on the right card
-        regardless of count.
+        Centres are **measured from the frame** (:func:`mulligan_card_centers_f`),
+        not laid out by formula. A formula got this wrong: evenly spacing slots
+        across 0.20..0.80 puts the outer cards at 0.20/0.80 when the real ones sit
+        at 0.241/0.752 (4-card) and 0.270/0.723 (3-card). That is ~100px off on a
+        345px-wide card, so the FFitts endpoint spread can push a tap off its edge -
+        and we already detect the exact interiors in order to count them.
+
+        The hit radius stays well inside the card's smaller half-dimension (172px),
+        per the rule that an over-large radius throws taps off their target.
         """
-        left, right = 0.20, 0.80
-        if num_cards <= 1:
-            xf = 0.5
-        else:
-            span = right - left
-            xf = left + span * (slot / (num_cards - 1))
-        return Point(xf, 0.45, 0.05)
+        return Point(center_xf, self.card_row.yf + self.card_row.hf / 2, 0.05)
+
+    def card_region(self, center_xf: float) -> Region:
+        """The card's own rectangle, for scoping a tap's verification to it."""
+        half = self.card_inner_w_f / 2
+        return Region(max(0.0, center_xf - half), self.card_row.yf,
+                      self.card_inner_w_f, self.card_row.hf)
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,8 @@ class MulliganRead:
     class_confidence: float
     class_raw: str
     method: str
+    #: measured x centres of the cards, for the reject journey's replace taps
+    card_centers_f: tuple[float, ...] = ()
 
     @property
     def usable(self) -> bool:
@@ -179,6 +192,84 @@ def glow_strip_runs(frame: Frame, layout: GameLayout, vision) -> list[tuple[int,
     return runs
 
 
+def card_interiors(frame: Frame, layout: GameLayout, vision) -> list[tuple[int, int]]:
+    """Absolute x spans of the mulligan cards' interiors, left to right.
+
+    A span between two keep-glow strips is a card when it is both card-WIDE and
+    card-BRIGHT. See :func:`count_mulligan_cards` for the measurements behind
+    those two tests, and for the three methods this replaced.
+    """
+    # A keep-glow strip is only ~1.2% of the screen wide. Below a few hundred pixels
+    # a strip drops under `glow_min_strip_frac` and vanishes, which merges two card
+    # interiors into one over-wide span and *undercounts* rather than failing. That
+    # is the one thing this must never do, so refuse outright. (Measured: correct
+    # down to 400px; at 300px a 4-card hand reads 3. Real captures are 2400.)
+    if frame.width < vision.min_count_frame_width:
+        return []
+
+    runs = glow_strip_runs(frame, layout, vision)
+    if not runs or len(runs) < 2:
+        return []
+
+    rgb = frame.rgb
+    rx, ry, rw, rh = layout.card_row.to_px(frame)
+    band = rgb[ry:ry + rh, rx:rx + rw]
+
+    expected = layout.card_inner_w_f * frame.width
+    tol = vision.card_width_tolerance
+
+    out: list[tuple[int, int]] = []
+    for (_, end), (start, _) in zip(runs, runs[1:]):
+        width = start - end
+        if abs(width - expected) > tol * expected:
+            continue                       # a background gap, not a card
+        segment = band[:, end:start]
+        if segment.size == 0:
+            continue
+        if float(segment.mean()) < vision.card_min_gray:
+            continue                       # wide but dark: not a card
+        out.append((rx + end, rx + start))
+
+    return out if hand_is_coherent(out, layout, vision, frame.width) else []
+
+
+def hand_is_coherent(interiors: list[tuple[int, int]], layout: GameLayout,
+                     vision, frame_width: int) -> bool:
+    """Do these card interiors look like a whole, untouched mulligan hand?
+
+    A card MARKED FOR REPLACEMENT loses its keep-glow, so its interior vanishes
+    from the detection. On a 4-card hand that leaves **three** interiors - a
+    perfectly plausible reading that silently inverts ``we_go_second`` and makes
+    the loop concede exactly the games it was told to keep. The count is therefore
+    only meaningful *before* any replace tap, and this is the guard that enforces
+    it rather than leaving it as an unwritten invariant.
+
+    Two structural facts about a real hand catch a missing card, and both are cheap:
+
+    1. **Contiguity.** Adjacent cards are separated only by their glow strips and a
+       thin background gap (measured 0.014-0.082 W). A missing *inner* card leaves a
+       hole a whole card wide (measured 0.197 W).
+    2. **Symmetry.** The hand is centred (measured mean interior centre 0.497 +/-
+       0.001 across five real hands of both sizes). A missing *outer* card keeps the
+       survivors evenly spaced -- contiguity sees nothing -- but drags their mean
+       centre off by ~0.085 W.
+    """
+    if len(interiors) < 2:
+        return True   # too few to be a hand at all; the count check rejects it
+
+    max_sep = vision.card_max_separation_f * frame_width
+    if any(b[0] - a[1] > max_sep for a, b in zip(interiors, interiors[1:])):
+        return False
+
+    mean_center = sum((a + b) / 2 for a, b in interiors) / len(interiors) / frame_width
+    return abs(mean_center - layout.hand_center_xf) <= vision.hand_center_tolerance_f
+
+
+def mulligan_card_centers_f(frame: Frame, layout: GameLayout, vision) -> tuple[float, ...]:
+    """Screen-fraction x centres of the mulligan cards, left to right."""
+    return tuple((a + b) / 2 / frame.width for a, b in card_interiors(frame, layout, vision))
+
+
 def count_mulligan_cards(frame: Frame, layout: GameLayout, vision) -> int:
     """Number of mulligan cards, or ``0`` meaning *unreadable* (fail closed).
 
@@ -216,36 +307,7 @@ def count_mulligan_cards(frame: Frame, layout: GameLayout, vision) -> int:
     The last two each reported 3 on a real 4-card hand, and each had passing unit
     tests built on *synthetic* frames. The tests for this function use real captures.
     """
-    # A keep-glow strip is only ~1.2% of the screen wide. Below a few hundred pixels
-    # a strip drops under `glow_min_strip_frac` and vanishes, which merges two card
-    # interiors into one over-wide span and *undercounts* rather than failing. That
-    # is the one thing this function must never do, so refuse outright. (Measured:
-    # correct down to 400px; at 300px a 4-card hand reads 3. Real captures are 2400.)
-    if frame.width < vision.min_count_frame_width:
-        return 0
-
-    runs = glow_strip_runs(frame, layout, vision)
-    if not runs or len(runs) < 2:
-        return 0
-
-    rgb = frame.rgb
-    rx, ry, rw, rh = layout.card_row.to_px(frame)
-    band = rgb[ry:ry + rh, rx:rx + rw]
-
-    expected = layout.card_inner_w_f * frame.width
-    tol = vision.card_width_tolerance
-
-    cards = 0
-    for (_, end), (start, _) in zip(runs, runs[1:]):
-        width = start - end
-        if abs(width - expected) > tol * expected:
-            continue                       # a background gap, not a card
-        segment = band[:, end:start]
-        if segment.size == 0:
-            continue
-        if float(segment.mean()) < vision.card_min_gray:
-            continue                       # wide but dark: not a card
-        cards += 1
+    cards = len(card_interiors(frame, layout, vision))
     return cards if cards in (3, 4) else 0
 
 
@@ -264,7 +326,8 @@ def read_mulligan(
     rx, ry, rw, rh = layout.opponent_class_region.to_px(frame)
     label = frame.crop(rx, ry, rw, rh)
     cr: ClassRead = reader.read(label)
-    num = count_mulligan_cards(frame, layout, vision)
+    centers = mulligan_card_centers_f(frame, layout, vision)
+    num = len(centers) if len(centers) in (3, 4) else 0
     return MulliganRead(
         opponent_class=cr.hero_class,
         we_go_second=(num >= 4),
@@ -272,4 +335,5 @@ def read_mulligan(
         class_confidence=cr.confidence,
         class_raw=cr.raw_text,
         method=cr.method,
+        card_centers_f=centers,
     )

@@ -160,3 +160,54 @@ def test_too_few_strips_is_unreadable(layout, cfg, monkeypatch):
 
     monkeypatch.setattr(hs, "glow_strip_runs", lambda *a, **k: [(10, 20)])
     assert hs.count_mulligan_cards(_frame("mulligan_4card_b"), layout, cfg.vision) == 0
+
+
+# --- a card marked for replacement loses its keep-glow -----------------------
+#
+# This is the sharpest trap in the whole signal. Tapping a mulligan card to
+# replace it turns its glow off, so its interior disappears from the detection.
+# On a 4-card hand that leaves THREE interiors: a perfectly plausible reading that
+# silently flips we_go_second and makes the loop concede exactly the games it was
+# told to keep. Real frame `mulligan_3card_marked` has card 0 marked.
+
+
+def test_a_hand_with_a_marked_card_is_unreadable(layout, cfg):
+    """Real frame: 3-card hand, card 0 already marked -> its glow is gone."""
+    assert count_mulligan_cards(_frame("mulligan_3card_marked"), layout, cfg.vision) == 0
+
+
+@pytest.mark.parametrize("name", ["mulligan_3card", "mulligan_4card_a", "mulligan_4card_b"])
+def test_a_whole_hand_is_coherent(name, layout, cfg):
+    """The guard must not reject any real, untouched hand."""
+    from hop.hearthstone import card_interiors, hand_is_coherent
+
+    frame = _frame(name)
+    interiors = card_interiors(frame, layout, cfg.vision)
+    assert hand_is_coherent(interiors, layout, cfg.vision, frame.width)
+
+
+@pytest.mark.parametrize("dropped,guard", [
+    (1, "contiguity"),   # inner card: leaves a card-wide hole
+    (2, "contiguity"),
+    (0, "symmetry"),     # outer card: survivors stay evenly spaced, hand shifts off centre
+    (3, "symmetry"),
+])
+def test_a_four_card_hand_missing_one_card_is_incoherent(dropped, guard, layout, cfg):
+    """The inversion this signal must never produce, from every direction.
+
+    Take a real 4-card hand's interiors and delete one, exactly as marking that card
+    for replacement would (its keep-glow switches off). Three evenly spaced
+    interiors are a plausible 3-card hand -- and reading it as one flips
+    we_go_second. The guard must refuse.
+    """
+    from hop.hearthstone import card_interiors, hand_is_coherent
+
+    frame = _frame("mulligan_4card_b")
+    real = card_interiors(frame, layout, cfg.vision)
+    assert len(real) == 4
+    survivors = [x for i, x in enumerate(real) if i != dropped]
+    assert len(survivors) == 3, "the trap is that this looks exactly like a 3-card hand"
+
+    assert not hand_is_coherent(survivors, layout, cfg.vision, frame.width), (
+        f"{guard} guard failed: 4-card hand with card {dropped} marked passed as a hand"
+    )

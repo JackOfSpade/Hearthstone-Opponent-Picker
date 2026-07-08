@@ -265,7 +265,7 @@ def cmd_capture(args) -> int:
 
 
 def cmd_calibrate(args) -> int:
-    from .calibrate import upsert_toml_scalar
+    from .tomledit import upsert_toml_scalar
 
     cfg = load_config(args.config)
     adb = Adb(cfg.device.adb_address)

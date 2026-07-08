@@ -47,6 +47,7 @@ from .perception.capture import CaptureError, Capturer, FrameDeduper
 from .perception.image import Frame
 from .perception.ocr import ClassReader
 from .perception.screens import Classification, ScreenClassifier, ScreenState
+from .perception.templates import Region
 from .touchstream import Gesture
 from .verify import CleanStop, Halt, Verifier
 
@@ -138,8 +139,17 @@ class Engine:
         visual_complexity: float = 0.2,
         novelty: float = 0.0,
         allow_correction: bool = True,
+        verify_region: Region | None = None,
     ) -> None:
-        """One humanized, verified tap. Raises Halt/CapReached/CleanStop upward."""
+        """One humanized, verified tap. Raises Halt/CapReached/CleanStop upward.
+
+        ``verify_region`` scopes the "did the screen change?" check to a sub-region.
+        Some taps are *supposed* to change only a small part of the screen - marking
+        one mulligan card for replacement redraws that card and nothing else, and a
+        whole-frame mean delta of that is below the noise threshold. Asking "did the
+        thing I touched change?" is both the honest question and a stricter one: a
+        tap that misses the card leaves the card unchanged, and still fails.
+        """
         # L4 think time (stateful), scaled by the risk profile's delay_scale
         think = timing.think_time(
             self.rng, decision_type, self.cfg.timing, self.state,
@@ -167,8 +177,9 @@ class Engine:
         self.sleep(settle)
         after = self._capture()
 
+        b_v, a_v = self._verify_frames(before, after, verify_region)
         try:
-            self.verifier.verify(before, after, expected_change=expected_change,
+            self.verifier.verify(b_v, a_v, expected_change=expected_change,
                                  gesture=gesture, near_duplicate=near_dup)
         except Halt:
             if allow_correction:
@@ -184,10 +195,19 @@ class Engine:
                 self.limiter.register_action(committing)
                 self.sleep(timing.human_delay(self.rng, 0.6, self.cfg.timing))
                 after2 = self._capture()
-                self.verifier.verify(before2, after2, expected_change=expected_change,
+                b2, a2 = self._verify_frames(before2, after2, verify_region)
+                self.verifier.verify(b2, a2, expected_change=expected_change,
                                      gesture=g2, near_duplicate=False)
             else:
                 raise
+
+    def _verify_frames(self, before: Frame, after: Frame,
+                       region: Region | None) -> tuple[Frame, Frame]:
+        """Crop both frames to ``region`` so verification asks about the right pixels."""
+        if region is None:
+            return before, after
+        rx, ry, rw, rh = region.to_px(before)
+        return before.crop(rx, ry, rw, rh), after.crop(rx, ry, rw, rh)
 
     # ── screen handling ──────────────────────────────────────────────────────
 
@@ -369,10 +389,13 @@ class Engine:
         plan = journey.plan_reject(self.rng, read.num_cards, self.min_play_turns)
         # perform a plausible mulligan: replace the chosen cards, deliberating each
         for d in plan.mulligan:
-            if d.replace:
-                pt = self.layout.card_slot(d.slot, read.num_cards, self.panel)
-                self._tap(pt, committing=False, decision_type=d.decision_type,
-                          expected_change="partial", visual_complexity=0.5)
+            if d.replace and d.slot < len(read.card_centers_f):
+                center = read.card_centers_f[d.slot]
+                # Marking a card for replacement redraws only that card, which is far
+                # below the whole-frame change threshold. Verify the card's own pixels.
+                self._tap(self.layout.card_point(center), committing=False,
+                          decision_type=d.decision_type, visual_complexity=0.5,
+                          verify_region=self.layout.card_region(center))
         # confirm the mulligan
         self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
                   expected_change="full_transition")
@@ -420,9 +443,11 @@ class Engine:
                     return  # board state moved on; fine, we're conceding anyway
 
     def _concede(self) -> None:
-        # gear -> concede -> confirm; the classifier verifies each transition
+        # gear -> concede -> confirm; the classifier verifies each transition.
+        # The gear opens a menu that dims the whole board, so this is a
+        # full_transition, not a bottom_sheet (measured: thirds 21.5/21.1/3.7).
         self._tap(self.layout.gear_button, committing=False, decision_type="commit",
-                  expected_change="bottom_sheet")
+                  expected_change="full_transition")
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                   expected_change="full_transition")
         # some clients show a confirm; tap it if a concede menu is still up.
@@ -447,6 +472,12 @@ class Engine:
                 return
             if cls.state == ScreenState.UNKNOWN:
                 raise Halt("unknown screen while clearing end screens")
+            if cls.state == ScreenState.IN_GAME:
+                # Just after a concede the board is still fading, so the End Turn
+                # housing that anchors IN_GAME is still drawn while the Defeat
+                # banner is not yet. Wait it out; do not tap the dissolving board.
+                self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
+                continue
             self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
                       expected_change="full_transition", allow_correction=False)
 

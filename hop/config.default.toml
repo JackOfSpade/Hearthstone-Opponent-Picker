@@ -183,6 +183,15 @@ glow_min_strip_frac = 0.0033       # ignore strips narrower than this (~8px @ 24
 # rather than guess, because a wrong count inverts `require_second`.
 card_width_tolerance = 0.15        # accept interiors within +/- this fraction of card_inner_w_f
 card_min_gray = 60.0               # mean gray of a card interior (gaps measure 33-35)
+# A card MARKED FOR REPLACEMENT loses its keep-glow, so its interior disappears. On
+# a 4-card hand that leaves 3 -- a plausible reading that silently inverts
+# `require_second`. Two structural facts about a real hand catch it:
+#   contiguity: adjacent cards are separated by 0.014-0.082 W; a missing INNER card
+#               leaves a hole a whole card wide (measured 0.197 W)
+#   symmetry:   the hand is centred; a missing OUTER card keeps the survivors evenly
+#               spaced but shifts their mean centre by ~0.085 W
+card_max_separation_f = 0.12       # max gap between adjacent card interiors
+hand_center_tolerance_f = 0.02     # mean interior centre must be this close to hand_center_xf
 # Below this frame width a keep-glow strip (~1.2% of the screen) drops under
 # `glow_min_strip_frac` and disappears, which merges two card interiors and
 # UNDERCOUNTS instead of failing. Refuse outright. Measured: correct down to
