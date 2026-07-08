@@ -50,18 +50,37 @@ Measure frame deltas for real transitions vs noise; set
 delta over a 24×24 signature) is a starting point.
 
 ## 6. Collect templates
+**Always pass `--glyph`.** `best_match()` slides the template inside its search
+region and gives up when the template is larger, so a full-screen template can
+never match. `--glyph xf,yf,wf,hf` crops the anchor out of the frame; the search
+region defaults to that box plus a margin.
+
 ```sh
-hop capture --state mulligan --region 0.30,0.02,0.40,0.12
-hop capture --state victory
-hop capture --state defeat
-hop capture --state menu
-hop capture --state concede_menu
-# ... one per screen the engine navigates
+hop capture --state play_screen  --glyph 0.6925,0.8167,0.0725,0.0611
+hop capture --state queue        --glyph 0.4375,0.0685,0.1525,0.0370
+hop capture --state mulligan     --glyph 0.4200,0.1000,0.1600,0.0560
+hop capture --state concede_menu --glyph 0.4475,0.0444,0.1075,0.0352
+hop capture --state defeat       --glyph 0.4450,0.6170,0.1825,0.0889
+hop capture --state rewards      --glyph 0.4500,0.7500,0.1025,0.0500
+hop capture --state deck_select  --glyph 0.4400,0.9333,0.1125,0.0426
+hop capture --state error_dialog --glyph 0.4350,0.3111,0.1250,0.0444 --priority 10
 ```
-Crop each saved PNG down to just the anchor glyph for a tight template (or leave
-it full-screen and rely on the region filter). Also verify the Hearthstone-
-specific coordinates in `hop.hearthstone.GameLayout` against your resolution —
-especially `opponent_class_region` (bottom-left) and the mulligan card row.
+(Those glyph boxes are measured on a 2400x1080 landscape frame.) Modal dialogs
+need a higher `--priority` because they don't hide the screen underneath, so both
+anchors match the same frame. `--from-file <png>` rebuilds an anchor offline from
+a saved `<state>_full.png`.
+
+Then verify the coordinates in `hop.hearthstone.GameLayout` against your
+resolution. Note that hit radii should come from each control's **smaller**
+half-dimension: the FFitts endpoint spread is isotropic and truncated to
+`0.9 * radius`, so an over-large radius throws taps off short, wide buttons.
+
+## 6b. Orientation (landscape vs the native panel)
+Hearthstone runs landscape while the panel is native portrait. Perception and the
+engine work in *display* space; the UHID digitizer reports *native panel* pixels,
+and the framework rotates them. `hop.orientation` inverts that using the live
+rotation from `adb.get_rotation()`, so no calibration is needed — but if taps land
+somewhere rotated/mirrored, that transform is the first place to look.
 
 ## 7. Validate against detectors, not intuition
 Run generated taps/swipes through a local multimodal check (touch + IMU
@@ -84,3 +103,33 @@ Anything marked `LIVE-VERIFY` in `config.default.toml` — notably
 `hop.hearthstone.GameLayout` fractions — should be confirmed on your device
 before auto mode. The pure motor/timing math is device-independent and needs no
 recalibration.
+
+### Shortcut: what you can read off the device without a finger
+
+Two of these don't need a human swipe. `getevent -i` and `dumpsys input` report
+the panel's own axes and calibration:
+
+```sh
+adb shell getevent -i | sed -n '/goodix/,/^  add/p'   # ABS ranges
+adb shell dumpsys input | grep -i 'touch\..*calibration'
+```
+
+* `ABS_MT_PRESSURE  min 0 max 255` + `touch.pressure.calibration: physical`
+  → the panel reports **graded** pressure, so `contact.pressure_semantics = "ramp"`.
+  A panel that only ever reports 0/1 would want `"binary"` — a faithful flat
+  signal beats a fake ramp.
+* `ABS_MT_TOUCH_MAJOR/MINOR` maxima and `touch.size.calibration` tell you what the
+  contact-size channel means.
+* `hop doctor` prints the panel's `name`/`vendor`/`product` ready to paste into
+  `[uhid]`.
+
+`motor.report_rate_hz` genuinely cannot be read this way — no sysfs node exposes
+it and only a real finger makes the panel emit reports. Measure it:
+
+```sh
+hop calibrate --report-rate     # then SWIPE on the phone during the sample window
+```
+
+Reference measurement (Pixel 7a, `goodix_ts0`, 2026-07-07): pressure `ramp`
+(0..255, physical), `TOUCH_MAJOR` max 2399, `TOUCH_MINOR` max 1079,
+`ORIENTATION` -4096..4096 (interpolated), 10 contact slots, size cal `GEOMETRIC`.

@@ -26,8 +26,8 @@ barcode account**.
 | Signal | How it's read | Why it's reliable |
 |---|---|---|
 | **Opponent class** | OCR the bottom-left class label at mulligan, snap to the 11 known class words by edit distance | The game prints the literal class word — immune to hero skins, multi-class skins, and golden-hero animation (those only change the portrait). Snapping to 11 fixed words makes OCR errors self-correcting. |
-| **Going second** | Count mulligan cards: **3 = first, 4 = second** | The Coin isn't in the mulligan hand and coin skins vary, so we never look for it. Card counting is pure pixel math (mana-gem count / brightness peak-count). |
-| **Which screen we're on** | Template-match anchor glyphs (the "Starting Hand" banner, victory/defeat marks, the gear menu) | Closed-loop navigation: an unrecognized screen **halts and alerts** instead of blind-tapping. |
+| **Going second** | Count mulligan cards: **3 = first, 4 = second** | The Coin isn't in the mulligan hand and coin skins vary, so we never look for it. Cards are counted by their **blue mana gems** — one per card, and gems never merge. A width filter rejects blue *card art*. (Brightness "humps" and gem *template* matching both fail: dark art hides a card, and each gem's digit differs.) |
+| **Which screen we're on** | Template-match anchor glyphs (the "Starting Hand" banner, victory/defeat marks, the gear menu) | Closed-loop navigation: an unrecognized screen **halts and alerts** instead of blind-tapping. Hearthstone animates between screens, so a frame that matches nothing is re-looked at (never tapped) a bounded number of times before failing closed. Modal dialogs carry a higher anchor `priority` so they beat the screen they occlude. |
 
 **No cloud API, no per-run cost, no ML training.** OCR runs locally
 (Tesseract); everything else is pixel math and ADB. The only Claude usage was
@@ -41,6 +41,7 @@ projection of a latent *HumanState* rather than independent randomness:
 
 - **Motor (L3):** FFitts target acquisition, minimum-jerk primary stroke + corrective submovements, correlated tremor, beta-ramp pressure with co-evolving contact size/orientation, and a lognormal tap dwell — delivered per-sample.
 - **Transport (L1):** a **persistent virtual HID digitizer** via `/system/bin/hid` over `/dev/uhid` (carries real pressure/size/geometry through the genuine kernel input pipeline; registered **once** per session, never per gesture). Falls back to `adb input` with an explicit fidelity-drop record.
+- **Orientation:** Hearthstone runs **landscape** while the phone's panel is native **portrait**, so perception and the engine work in *display* space while the digitizer reports *native panel* pixels. `hop.orientation` maps between them from the live rotation, handling **both** landscape orientations (a phone can sit either way up).
 - **Timing (L4):** stateful, per-decision think time (a committing action reacts faster than a rejecting one), modulated by fatigue/familiarity/urgency/confidence. No bare `sleep(constant)` on any game-facing action.
 - **Sensorimotor (L4):** predicts the coherent inertial side effect of each touch; a **desk-mounted** run declares its posture and does not claim handheld IMU realism (the honest option for a bench phone driven over ADB, per the standard).
 - **Behavioral caps (L5):** per-run/-session/-day volume caps, a dedicated cap on the **committing action** (the concede — the barcode signal), mandatory jittered breaks, and a non-repetition check so trajectories never replay.
@@ -101,6 +102,11 @@ See **[CALIBRATION.md](CALIBRATION.md)** for the full §10 protocol — this is 
 precondition for trusting auto mode.
 
 ### 5. Run
+Open Hearthstone, choose **Play**, and pick your deck so the big **Play** button
+is on screen. That deck-detail screen is the hunt loop's home state — it's what
+Hearthstone returns to after every game, so it's where `hop` queues and requeues
+from. (Starting from the main menu halts with guidance instead of blind-tapping.)
+
 ```sh
 hop run --classes mage warlock                 # headless; Ctrl-C / F12 to stop
 hop dashboard                                  # or drive it from the web UI
@@ -114,7 +120,7 @@ hop dashboard                                  # or drive it from the web UI
 |---|---|
 | `hop doctor` | Preflight: adb, screencap, UHID tool, panel identity, OCR, templates. |
 | `hop connect` | Connect wireless ADB, print device/panel info. |
-| `hop capture --state <screen>` | Save a labeled anchor into the template pack. |
+| `hop capture --state <s> --glyph <box>` | Save a labeled anchor into the template pack. **Always pass `--glyph`** — the template must be smaller than its search region or it can never match. `--priority` makes modal dialogs win; `--from-file` rebuilds an anchor offline. |
 | `hop calibrate` | Measure panel + report rate into your user config (§10). |
 | `hop test-click --at xf,yf` | Emit one humanized tap to verify the transport. |
 | `hop run` | Run the hunt loop headless. |
@@ -157,6 +163,7 @@ hop/
   perception/   L2: image, capture, templates, diffing, ocr, screens
   verify.py     L6: verification + coherence gates + fail-closed
   debuglog.py   L6: silent per-run journal + anomaly snapshots
+  orientation.py  display<->native panel rotation (HS is landscape, panel is portrait)
   hearthstone.py  HS screens, class-label region, mulligan card counting, coordinates
   engine.py     the hunt-loop state machine
   alerts.py     Mac notification/sound/say + ntfy push
