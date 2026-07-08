@@ -35,6 +35,16 @@ class ScreenState(str, Enum):
     # "There was an error starting your game." A transient server/network blip
     # that Hearthstone throws often; dismissing it and requeueing works.
     ERROR_DIALOG = "error_dialog"
+    # "You are currently offline / It's been a while since your last Hearthstone
+    # action and your connection was shut down." Hearthstone drops idle sessions,
+    # which the hunt loop can trigger while it waits. Tap Reconnect, not Cancel:
+    # Cancel leaves the client offline and every later tap is a no-op.
+    RECONNECT_DIALOG = "reconnect_dialog"
+    # The same dialog *mid-reconnect*: body reads "Reconnecting..." and both
+    # buttons are REMOVED (verified: zero gold-button pixels). Tapping here hits
+    # dead space, so this must be a distinct, wait-only state - and it must outrank
+    # RECONNECT_DIALOG, whose title-banner anchor still matches during it.
+    RECONNECTING = "reconnecting"
     VS_SPLASH = "vs_splash"       # the VS intro
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs

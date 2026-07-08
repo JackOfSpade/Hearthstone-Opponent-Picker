@@ -180,6 +180,8 @@ class VisionConfig:
     ocr_max_edit_distance: int
     weak_match_margin: float
     unknown_settle_attempts: int
+    reconnecting_wait_attempts: int
+    reconnect_attempt_cap: int
     gem_blue_bias: int
     gem_min_blue: int
     gem_col_min_frac: float

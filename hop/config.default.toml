@@ -158,6 +158,15 @@ weak_match_margin = 0.08           # match this-close to threshold => low confid
 # not that we are lost. Re-look this many times - never tapping - before failing
 # closed on UNKNOWN.
 unknown_settle_attempts = 4
+# Hearthstone shuts down idle connections ("You are currently offline"), which the
+# hunt loop's own anti-barcode pacing provokes. Tapping Reconnect starts an
+# ASYNCHRONOUS reconnect: the body becomes "Reconnecting..." and both buttons are
+# removed, so the loop must WAIT rather than re-tap. Poll this many times - never
+# tapping - for the attempt to resolve...
+reconnecting_wait_attempts = 12
+# ...and make at most this many Reconnect taps per run. A reconnect that keeps
+# failing means the network or the account needs a human, so fail closed.
+reconnect_attempt_cap = 3
 # Mulligan card counting: each card carries exactly one blue mana gem, and gems
 # never merge. We mask blue pixels in the gem row and keep column-runs whose
 # width matches a gem, which rejects blue *card art* (much wider) and slivers.

@@ -117,6 +117,7 @@ class Engine:
 
         self.stats = RunStats()
         self._stop = False
+        self._reconnect_attempts = 0
 
     # ── stop control (hotkeys/panic) ─────────────────────────────────────────
 
@@ -258,6 +259,12 @@ class Engine:
                 self.debug.record("error_dialog_dismissed")
             self._tap(self.layout.error_ok, committing=False, decision_type="commit",
                       expected_change="full_transition")
+        elif st == ScreenState.RECONNECT_DIALOG:
+            self._reconnect()
+        elif st == ScreenState.RECONNECTING:
+            # Mid-reconnect: the buttons are gone, so any tap hits dead space.
+            # Wait it out; _reconnect() owns the bounded polling.
+            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
         elif st == ScreenState.DECK_SELECT:
             # dropped back to the deck list (e.g. after an error); reopen the deck
             self._tap(self.layout.deck_slot, committing=False, decision_type="commit",
@@ -288,6 +295,49 @@ class Engine:
             if self.debug:
                 self.debug.anomaly("unknown screen", after=frame, confidence=round(cls.confidence, 3))
             raise Halt(f"unknown screen (best confidence {cls.confidence:.2f})")
+
+    def _reconnect(self) -> None:
+        """Tap Reconnect once, then wait out the asynchronous reconnect.
+
+        Hearthstone shuts down idle connections, and this loop's own anti-barcode
+        pacing is what makes us idle - so this is expected traffic, not an anomaly.
+
+        Three things make this different from every other tap:
+
+        * Tap **Reconnect**, never Cancel. Cancelling leaves the client offline,
+          after which every subsequent tap is a silent no-op - the worst failure
+          mode available, because the loop looks alive while doing nothing.
+        * The effect is **asynchronous**. The immediate result is not a screen
+          transition but an in-place body swap to "Reconnecting...", so we cannot
+          demand ``full_transition``; we only demand that *something* changed
+          (``expected_change=None``), which still catches a missed tap.
+        * **Never correct.** During "Reconnecting..." both buttons are removed, so
+          the standard single-correction retap would hit dead space, see no change,
+          and halt on a reconnect that was working fine.
+        """
+        cap = self.cfg.vision.reconnect_attempt_cap
+        if self._reconnect_attempts >= cap:
+            raise Halt(f"Hearthstone failed to reconnect after {cap} attempts; "
+                       "check the phone's network or sign in again")
+        self._reconnect_attempts += 1
+        if self.debug:
+            self.debug.record("reconnect_tapped", attempt=self._reconnect_attempts)
+
+        self._tap(self.layout.reconnect_button, committing=False,
+                  decision_type="commit", expected_change=None, allow_correction=False)
+
+        for _ in range(max(1, self.cfg.vision.reconnecting_wait_attempts)):
+            cls, _frame = self._classify()
+            if cls.state not in (ScreenState.RECONNECTING, ScreenState.RECONNECT_DIALOG):
+                if self.debug:
+                    self.debug.record("reconnect_resolved", state=cls.state.value)
+                return
+            if cls.state == ScreenState.RECONNECT_DIALOG:
+                # The attempt finished and failed: the buttons are back. Let the
+                # outer loop re-enter _reconnect(), which re-checks the cap.
+                return
+            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+        raise Halt("stuck on 'Reconnecting...'; Hearthstone never came back online")
 
     def _handle_mulligan(self, frame: Frame) -> None:
         read = self._read_mulligan(frame, self.layout, self.reader,

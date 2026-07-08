@@ -81,6 +81,12 @@ class GameLayout:
     # transient network blip - dismiss and requeue; no long backoff needed).
     deck_slot: Point = Point(0.286, 0.289, 0.02)
     error_ok: Point = Point(0.495, 0.667, 0.02)
+    # "You are currently offline" - Hearthstone shuts down an idle connection.
+    # LIVE-MEASURED from the gold-button mask on a real dialog: the Reconnect and
+    # Cancel buttons are each 300x92 px, centered at x=982 / x=1394 of 2400.
+    # Tap Reconnect (LEFT). Cancel leaves the client offline, and from there every
+    # subsequent tap silently does nothing - the worst possible failure mode.
+    reconnect_button: Point = Point(0.4092, 0.8380, 0.0190)
 
     def card_slot(self, slot: int, num_cards: int, panel: PanelGeometry) -> Point:
         """Center of mulligan card ``slot`` given the layout has ``num_cards``.
