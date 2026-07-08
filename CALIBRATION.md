@@ -253,6 +253,96 @@ not raycast on it while a draggable card does); Unity's drag threshold applied t
 report we never expose, which could make Android's input classifier treat our single
 contact as unconfirmed on hit-tests that consult it.
 
+---
+
+## What the post-game path taught us (Pixel 7a, 2026-07-08)
+
+Driven live from a real victory screen, with the real UHID transport and motor.
+
+The `victory` anchor is sound: **0.9301** against a 0.72 accept, sole anchor above
+threshold, runner-up `in_game` at 0.6293. A genuine cross-game match — the stored
+`victory_full.png` differs from the live frame by 61.9 mean-abs in the hero-portrait
+region. The template is the word "Victory!" on its plaque: no XP bar, no level number,
+no hero art. Same doctrine as the class label.
+
+Everything downstream of it was wrong.
+
+| Constant / assumption | Shipped | Measured / found | How it failed |
+|---|---|---|---|
+| `concede_confirm` | `(0.50, 0.56, 0.06)` | **it is the Quit button** | The Game Menu is Concede / Options / Quit. There is no confirm dialog. So the recovery for "the Concede tap was ignored" was *quit Hearthstone*. |
+| `end_dismiss` radius | `0.10` (= **240 px**) | `0.0125` (30 px) | `radius_f` is a fraction of the **width** (2400) applied on a screen 1080 tall. 13.1% of 3000 sampled endpoints fell off the panel; 39.8% into Android's bottom `mandatorySystemGestures` inset (`y >= 996`). |
+| `_clear_end_screens` terminal set | `PLAY_SCREEN/QUEUE/MENU` | **+ `DECK_SELECT`** | Hearthstone drops back to the deck *list* after a game. Without this the loop taps `end_dismiss` there — on "My Collection", and on a deck box (which would queue the **wrong deck**). |
+| `end_dismiss` tap sites | any state outside a 5-case whitelist | **only the 4 end screens** | At (1200, 972) the old 216 px disc is 27 px from the mulligan's Confirm and 205 px from the reconnect dialog's **Cancel** — the failure mode `_reconnect()` calls "the worst available". |
+| `_clear_end_screens` budget | one counter for taps *and* waits | two counters | A slow board fade exhausted it, whereupon the loop **returned normally** — indistinguishable from reaching home. `_execute_reject` then booked a completed game and requeued. |
+| non-repetition gate | checked *after* `backend.emit` | resample **before** emit | See below. A gate that runs after the action cannot prevent anything. |
+
+`end_dismiss` is now `(0.50, 0.87, 0.0125)`, within 6 px of the pixel measured to
+dismiss the victory screen first try. It still *overlaps the mulligan's Confirm button*
+(they are ~11 px apart) — both controls live at the bottom centre of their own screen
+and no coordinate can separate them. Only the whitelist does.
+
+### The live run that found it
+
+```
+victory (0.9280) --end_dismiss--> rewards (0.9528)   full_transition, verify OK
+rewards (0.7798) --end_dismiss--> UNKNOWN (0.0000)   -> Halt
+```
+
+That UNKNOWN was the **Collection behind a "Ban Notice" modal** — a screen no anchor
+covers. Fail-closed did its job. But the frame was *discarded* by the halt, so the
+anchor that would prevent the next one could never be built. `hop` now keeps every
+UNKNOWN frame, in colour, in `~/.config/hop/unknowns/` — a sibling of `runs/` that
+`keep_runs` never touches. **That folder is empty when the hunt is healthy**; its
+non-emptiness is the signal. It is the one exception to "delete captured media".
+
+Note also that the Ban Notice *masked* the deck-list bug: the loop halted before it
+ever tapped "My Collection".
+
+### The non-repetition gate saturates, and the blind retap was hiding it
+
+`trajectory_fingerprint` has ~3 effective degrees of freedom, not 6: `dur ==
+(n_samples - 1) / report_rate_hz` to **2.8e-17**. Over the real per-game tap sequence,
+300 seeded runs × `max_actions_per_run = 30`:
+
+| resamples | emitted duplicates | runs that would Halt |
+|---|---|---|
+| **1** (shipped) | **14.21%** | **293/300**, median tap #13 |
+| 2 | 2.40% | 150/300 |
+| 4 | 0.12% | 11/300 |
+| 6 | 0.01% | 1/300 |
+| 10 | 0.00% | 0/300 |
+
+The loop only survived because `_tap`'s correction retap re-emitted with
+`near_duplicate=False` hardcoded — so a bug (blind retry) was load-bearing for another
+bug (a post-hoc gate) not firing. Fixed together: resample before emit, 8 draws.
+
+**Do not "fix" the fingerprint.** Dropping the collinear `dur` feature *raises* the flag
+rate to 15.50%.
+
+### What measurement killed this round
+
+* **"`state_change_threshold = 9.0` is calibrated on a 24×24 signature but applied to
+  full-resolution thirds, so `verify()` fails open."** Two independent adversarial
+  reviews reached for this. It is **false**. Measured on the phone:
+
+  | | 24×24 signature | full-res thirds |
+  |---|---|---|
+  | noise (two captures, static screen) | 0.34–0.44 | 0.88–0.93 |
+  | four real transitions | 19.4–30.9 | 26.8–50.0 |
+
+  9.0 straddles both scales with ~44× and ~29× margins over noise. Downsampling
+  suppresses uncorrelated noise (~√N) far more than a structured whole-screen change,
+  which is why one constant serves both. Only the comment was wrong.
+
+* **"The second `end_dismiss` tap pressed 'My Collection' behind the rewards popup."**
+  Refuted by where we landed: `deck_select`, not the Collection. The tap behaved
+  correctly; the modal caused the halt. The collision is real but *latent*, reachable
+  through the missing `DECK_SELECT` terminal case.
+
+* **"Add a panel-bounds check to `motor._endpoint_inside`."** Unnecessary once
+  `end_dismiss`'s radius is sane: re-measured over 5000 draws, **0.00%** of endpoints
+  leave the panel for any control in `GameLayout`.
+
 Two hazards worth carrying to any future device:
 
 * **A card marked for replacement loses its keep-glow.** On a 4-card hand that
