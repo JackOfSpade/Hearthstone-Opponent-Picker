@@ -80,10 +80,25 @@ class GameLayout:
     # In the in-game "Game Menu" the order is Concede / Options / Quit. The old
     # y=0.42 landed between Options and Quit; Concede is the TOP entry at y~0.196.
     concede_button: Point = Point(0.5025, 0.196, 0.014)
-    # This client concedes immediately with no confirmation dialog; _concede() only
-    # taps this if a concede menu is still classified afterwards.
-    concede_confirm: Point = Point(0.50, 0.56, 0.06)
-    end_dismiss: Point = Point(0.50, 0.90, 0.10)
+    # NOTE: there is deliberately NO `concede_confirm` point. This client concedes
+    # immediately, and the Game Menu reads Concede / Options / Quit -- the old
+    # (0.50, 0.56, 0.06) "confirm" landed dead centre on **Quit** (its 0.9*144 px
+    # truncation disc lies almost entirely on the Quit plate; verified against the
+    # concede_menu capture). So the recovery path for "the Concede tap was ignored"
+    # was "quit Hearthstone". _concede() now waits for the menu to leave and fails
+    # closed instead. A client that really shows a confirm dialog would show a
+    # distinct screen, and distinct screens get anchors, not fixed points.
+    #
+    # Dismisses victory/defeat/rewards/quest. LIVE-VERIFIED on a victory screen
+    # (a tap at 1208,941 advanced to the rewards screen first try) and on the
+    # rewards screen. Radius is deliberately small: radius_f is a fraction of the
+    # screen's WIDTH (2400), so the old 0.10 meant a 240 px disc on a 1080 px tall
+    # screen centred 108 px from the bottom -- 13.1% of sampled endpoints fell OFF
+    # the panel and 39.8% into Android's bottom mandatorySystemGestures inset
+    # (y >= 996, read from `dumpsys window`). 0.0125*2400 = 30 px keeps the whole
+    # 0.9r disc inside y 913..967: on the panel, clear of the gesture inset, and
+    # clear of the deck list's "My Collection" plate at y >= 990.
+    end_dismiss: Point = Point(0.50, 0.87, 0.0125)
     pass_turn_button: Point = Point(0.80, 0.497, 0.012)
     # Recovery: the first deck on the deck-select list, and the OK button of
     # Hearthstone's "There was an error starting your game." dialog (a frequent,

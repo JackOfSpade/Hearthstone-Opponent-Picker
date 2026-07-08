@@ -48,6 +48,15 @@ def _runs_root() -> Path:
     return Path.home() / ".config" / "hop" / "runs"
 
 
+def _unknowns_dir() -> Path:
+    """Where frames of screens the classifier could not name are kept.
+
+    A *sibling* of ``runs/``, not a child, so ``keep_runs`` pruning can never retire
+    the one capture worth keeping. Empty when the hunt is healthy.
+    """
+    return Path.home() / ".config" / "hop" / "unknowns"
+
+
 def _default_run_dir(keep_runs: int | None = None) -> Path:
     """A fresh run dir, after retiring the oldest runs past ``keep_runs``.
 
@@ -89,7 +98,9 @@ def build_engine(cfg: Config, *, pack_dir: Path, debug_dir: Path | None = None,
 
     classifier = load_template_pack(pack_dir)
     reader = ClassReader(cfg.vision.ocr_max_edit_distance)
-    debug = DebugLog(debug_dir, max_anomaly_frames=cfg.debug.max_anomaly_frames) if debug_dir else None
+    debug = DebugLog(debug_dir, max_anomaly_frames=cfg.debug.max_anomaly_frames,
+                     unknown_dir=_unknowns_dir(),
+                     max_unknown_frames=cfg.debug.max_unknown_frames) if debug_dir else None
 
     return Engine(
         cfg, adb, backend, display, classifier, reader,

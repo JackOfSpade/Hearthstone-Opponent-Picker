@@ -244,6 +244,73 @@ class Engine:
             cls, frame = self._classify()
         return cls, frame
 
+    # ── waiting by looking, never by sleeping ────────────────────────────────
+
+    def _record_unknown(self, frame: Frame | None, *, where: str, **context) -> None:
+        """Keep the pixels of a screen we could not name. See :mod:`hop.debuglog`.
+
+        This is the one capture the tool retains on purpose: it cannot be re-taken
+        (nobody knows how to navigate back to a screen nobody identified) and it is
+        what the anchor that prevents the next halt gets built from.
+        """
+        if self.debug:
+            self.debug.unknown_screen(frame, where=where, **context)
+
+    def _wait_until(self, predicate, *, what: str,
+                    attempts: int | None = None,
+                    timeout_s: float | None = None,
+                    poll_s: float | None = None) -> tuple[bool, Classification, Frame]:
+        """Poll the screen until ``predicate(cls, frame)`` holds. **Never taps.**
+
+        Returns ``(satisfied, last_classification, last_frame)``; the caller decides
+        whether a timeout is a Halt, because sometimes it isn't.
+
+        Waiting is done by *looking*, not by sleeping a fixed amount. A screencap
+        costs ~1.0 s over USB and ~1.4 s over Wi-Fi on this phone, and Hearthstone's
+        transitions stretch with the network - so a constant delay is a guess that is
+        either wasted time or, worse, a tap into a screen that has not arrived. Two
+        bounds apply and the first to trip wins: a poll count (which is also what
+        makes this terminate under a frozen test clock) and a wall-clock deadline.
+        """
+        v = self.cfg.vision
+        attempts = max(1, v.screen_wait_attempts if attempts is None else attempts)
+        timeout_s = v.screen_wait_timeout_s if timeout_s is None else timeout_s
+        poll_s = v.screen_wait_poll_s if poll_s is None else poll_s
+        deadline = self.clock() + timeout_s
+        cls, frame = self._classify()
+        for _ in range(attempts - 1):
+            if predicate(cls, frame):
+                return True, cls, frame
+            if self.clock() >= deadline:
+                break
+            self.sleep(timing.human_delay(self.rng, poll_s, self.cfg.timing))
+            cls, frame = self._classify()
+        satisfied = predicate(cls, frame)
+        if not satisfied and self.debug:
+            self.debug.record("wait_timeout", what=what, state=cls.state.value)
+        return satisfied, cls, frame
+
+    def _wait_until_screen_leaves(self, state: ScreenState, *, where: str, stuck: str) -> Classification:
+        """Wait until the screen *positively* shows something other than ``state``.
+
+        **UNKNOWN is never proof that we left.** A frame we could not read is a frame
+        we could not read - and confirming a mulligan or a concede is asynchronous, so
+        the frames right after the tap are exactly the ones the classifier cannot name.
+        Accepting UNKNOWN here would let the next action be aimed at a screen nobody
+        identified, which is the whole thing closed-loop navigation exists to prevent.
+
+        So UNKNOWN keeps us waiting, and if the budget runs out we fail closed and
+        keep the pixels.
+        """
+        ok, cls, frame = self._wait_until(
+            lambda c, _f: c.state not in (state, ScreenState.UNKNOWN), what=where)
+        if ok:
+            return cls
+        if cls.state == ScreenState.UNKNOWN:
+            self._record_unknown(frame, where=where, confidence=round(cls.confidence, 3),
+                                 waiting_to_leave=state.value)
+        raise Halt(stuck)
+
     def run(self, max_iterations: int | None = None) -> RunStats:
         """Main hunt loop. Returns when a target is found, a cap is hit, the app
         closes, an unexpected halt occurs, or stop is requested."""
@@ -322,8 +389,7 @@ class Engine:
             # Unexpected here means a reject-play beat; a plausible pass, then re-loop
             self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
         else:  # UNKNOWN -> fail closed
-            if self.debug:
-                self.debug.anomaly("unknown screen", after=frame, confidence=round(cls.confidence, 3))
+            self._record_unknown(frame, where="dispatch", confidence=round(cls.confidence, 3))
             raise Halt(f"unknown screen (best confidence {cls.confidence:.2f})")
 
     def _reconnect(self) -> None:
@@ -358,6 +424,12 @@ class Engine:
 
         for _ in range(max(1, self.cfg.vision.reconnecting_wait_attempts)):
             cls, _frame = self._classify()
+            if cls.state == ScreenState.UNKNOWN:
+                # Mid-reconnect the client redraws; an unreadable frame is not
+                # evidence the reconnect resolved. Keep waiting (never tapping)
+                # rather than book a success we did not observe.
+                self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+                continue
             if cls.state not in (ScreenState.RECONNECTING, ScreenState.RECONNECT_DIALOG):
                 if self.debug:
                     self.debug.record("reconnect_resolved", state=cls.state.value)
@@ -441,15 +513,18 @@ class Engine:
 
         So: require only that something changed, never correct, and then verify the
         real semantic end-state - that we are no longer on the mulligan - by looking.
+
+        And *looking* means seeing a screen we can name. The old loop accepted
+        ``cls.state != MULLIGAN``, which an UNKNOWN frame satisfies - so a single
+        unreadable frame (of which a confirm animation produces several) was taken as
+        proof the mulligan was gone, and ``_play_beats``/``_concede`` then tapped on
+        that premise. UNKNOWN is not an observation; it is the absence of one.
         """
         self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
                   expected_change=None, allow_correction=False, what="mulligan_confirm")
-        for _ in range(max(1, self.cfg.vision.unknown_settle_attempts)):
-            cls, _frame = self._classify()
-            if cls.state != ScreenState.MULLIGAN:
-                return
-            self.sleep(timing.human_delay(self.rng, 1.0, self.cfg.timing))
-        raise Halt("mulligan Confirm did not dismiss the mulligan")
+        self._wait_until_screen_leaves(
+            ScreenState.MULLIGAN, where="mulligan_confirm",
+            stuck="mulligan Confirm did not dismiss the mulligan")
 
     def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
         """Mark one mulligan card for replacement. Returns whether it took.
@@ -510,43 +585,95 @@ class Engine:
                     return  # board state moved on; fine, we're conceding anyway
 
     def _concede(self) -> None:
-        # gear -> concede -> confirm; the classifier verifies each transition.
+        """gear -> Concede, then wait for the Game Menu to actually go away.
+
+        **There is no confirm button, and there must be no blind tap here.** The
+        Game Menu reads Concede / Options / Quit top to bottom. The old code, if the
+        menu was still classified afterwards, tapped a fixed "concede_confirm" point
+        at y=0.56 - which is *dead centre on Quit* (measured against the real
+        concede_menu capture: the 0.9x144 px truncation disc lies almost entirely on
+        the Quit plate). So the recovery path for "the Concede tap was ignored" was
+        "quit Hearthstone" - and this client is known to ignore taps.
+
+        Conceding is also **asynchronous**: the board dissolves over a second or
+        more, and the menu can still be drawn on the frame right after the tap. So
+        wait for the menu to leave, exactly as :meth:`_confirm_mulligan` waits for
+        the mulligan, and fail closed if it never does. An UNKNOWN frame is never
+        proof that we left - see :meth:`_wait_until_screen_leaves`.
+        """
         # The gear opens a menu that dims the whole board, so this is a
         # full_transition, not a bottom_sheet (measured: thirds 21.5/21.1/3.7).
         self._tap(self.layout.gear_button, committing=False, decision_type="commit",
                   expected_change="full_transition", what="gear")
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                   expected_change="full_transition", what="concede")
-        # some clients show a confirm; tap it if a concede menu is still up.
-        # (This one concedes immediately, so the menu is gone and we skip it.)
-        cls, _ = self._classify_settled()
-        if cls.state == ScreenState.CONCEDE_MENU:
-            self._tap(self.layout.concede_confirm, committing=False, decision_type="commit",
-                      expected_change="full_transition", allow_correction=False, what="concede_confirm")
+        self._wait_until_screen_leaves(
+            ScreenState.CONCEDE_MENU, where="concede",
+            stuck="Concede did not dismiss the Game Menu; refusing to tap again "
+                  "(the entry below Concede is Quit)")
+
+    #: Screens ``_clear_end_screens`` is allowed to tap ``end_dismiss`` on. The tap is
+    #: a fixed point, so the set of screens it may land on has to be closed and named.
+    END_SCREENS = (ScreenState.VICTORY, ScreenState.DEFEAT,
+                   ScreenState.REWARDS, ScreenState.QUEST_POPUP)
+    #: Screens that mean "the post-game stack is cleared". DECK_SELECT belongs here:
+    #: Hearthstone drops back to the deck LIST after a game, and dispatch knows how to
+    #: reopen the deck from there. Leaving it out is what let the loop tap end_dismiss
+    #: on the deck list - i.e. on "My Collection" and the deck boxes.
+    HOME_SCREENS = (ScreenState.PLAY_SCREEN, ScreenState.QUEUE,
+                    ScreenState.MENU, ScreenState.DECK_SELECT)
 
     def _clear_end_screens(self, max_taps: int = 8) -> None:
-        """Tap through victory/defeat/rewards/quest popups until back at play/queue.
+        """Tap through victory/defeat/rewards/quest popups until back at a home screen.
 
         Hearthstone stacks several of these after a game - the end banner, a rewards
-        popup, and "Your Quests" - in an order that varies, so this is a loop rather
+        screen, and "Your Quests" - in an order that varies, so this is a loop rather
         than a fixed sequence. Bounded and closed-loop: each tap is verified and we
-        re-classify, so a stuck or unrecognized popup halts instead of looping."""
-        for _ in range(max_taps):
+        re-classify, so a stuck or unrecognized popup halts instead of looping.
+
+        **``end_dismiss`` is a fixed point, so it may only be tapped on screens we
+        have positively identified as end screens.** The old fallthrough tapped it on
+        *every* state outside a five-case whitelist, and (1200, 972) with a 216 px
+        truncation disc is 27 px from the mulligan's Confirm button, 205 px from the
+        reconnect dialog's *Cancel* - "the worst failure mode available", per
+        :meth:`_reconnect` - and squarely on the deck list's "My Collection" plate.
+        Anything not on the list is an unexpected screen: fail closed, keep the pixels.
+
+        The tap budget and the wait budget are also **separate**. Waiting for the board
+        to finish dissolving is not a tap, and it used to consume the same counter - so
+        a slow fade could exhaust the budget, whereupon the loop *returned normally*,
+        indistinguishable from having reached a home screen. Exhausting either budget
+        is a Halt. Both are bounded and every iteration spends one or leaves, so the
+        loop terminates.
+        """
+        taps = waits = 0
+        max_waits = max(1, self.cfg.vision.screen_wait_attempts)
+        while True:
             cls, frame = self._classify_settled()
-            # Hearthstone drops back to the deck's Play screen after a game; MENU
-            # is also terminal (the caller's next dispatch reports it).
-            if cls.state in (ScreenState.PLAY_SCREEN, ScreenState.QUEUE, ScreenState.MENU):
+            if cls.state in self.HOME_SCREENS:
                 return
             if cls.state == ScreenState.UNKNOWN:
-                raise Halt("unknown screen while clearing end screens")
+                self._record_unknown(frame, where="clear_end_screens",
+                                     confidence=round(cls.confidence, 3))
+                raise Halt(f"unknown screen while clearing end screens "
+                           f"(best confidence {cls.confidence:.2f})")
             if cls.state == ScreenState.IN_GAME:
                 # Just after a concede the board is still fading, so the End Turn
                 # housing that anchors IN_GAME is still drawn while the Defeat
                 # banner is not yet. Wait it out; do not tap the dissolving board.
+                if waits >= max_waits:
+                    raise Halt("board never finished dissolving after the concede")
+                waits += 1
                 self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
                 continue
+            if cls.state not in self.END_SCREENS:
+                raise Halt(f"unexpected screen {cls.state.value!r} while clearing end "
+                           f"screens; refusing to blind-tap end_dismiss there")
+            if taps >= max_taps:
+                raise Halt(f"end screens did not clear after {taps} dismiss taps")
             self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
                       expected_change="full_transition", allow_correction=False, what="end_dismiss")
+            taps += 1
 
     # ── alerts ───────────────────────────────────────────────────────────────
 

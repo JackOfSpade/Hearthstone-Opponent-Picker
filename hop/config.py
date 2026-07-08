@@ -186,6 +186,11 @@ class VisionConfig:
     ocr_max_edit_distance: int
     weak_match_margin: float
     unknown_settle_attempts: int
+    #: `wait_until` bounds. Both apply; whichever trips first ends the wait. The
+    #: attempt count is what keeps a frozen-clock unit test terminating.
+    screen_wait_attempts: int
+    screen_wait_timeout_s: float
+    screen_wait_poll_s: float
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
     mulligan_card_tap_attempts: int
@@ -206,6 +211,12 @@ class DebugConfig:
     #: The journal (a few KB) is what diagnoses a halt; the PNGs are ~1 MB apiece.
     keep_runs: int
     max_anomaly_frames: int
+    #: UNKNOWN-screen frames are the exception: they are the only capture that
+    #: cannot be re-taken (nobody knows how to get back to a screen nobody named),
+    #: and they are what the next anchor is built from. Kept outside the run dirs,
+    #: in a folder that is empty when the hunt is healthy. This is a runaway
+    #: backstop, not a retention policy; <= 0 disables pruning entirely.
+    max_unknown_frames: int = 30
 
 
 @dataclass(frozen=True)

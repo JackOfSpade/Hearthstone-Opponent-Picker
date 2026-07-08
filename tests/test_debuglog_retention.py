@@ -1,5 +1,10 @@
 """Retention: capture is for analysis, and analysed pixels are dead weight.
 
+...with exactly one exception. A frame of a screen the classifier could not *name*
+cannot be re-taken - nobody knows how to navigate back to a screen nobody identified -
+and it is what the anchor that prevents the next halt gets built from. Those are kept,
+outside the run dirs, in a folder that is empty when the hunt is healthy.
+
 The planners are pure so the policy is testable without a phone, a run, or Pillow.
 """
 
@@ -10,9 +15,11 @@ import pytest
 from hop.debuglog import (
     DEFAULT_KEEP_RUNS,
     DEFAULT_MAX_ANOMALY_FRAMES,
+    DEFAULT_MAX_UNKNOWN_FRAMES,
     DebugLog,
     plan_frame_pruning,
     plan_run_pruning,
+    plan_unknown_pruning,
     prune_runs,
 )
 
@@ -124,3 +131,84 @@ def test_debuglog_journal_is_never_pruned(tmp_path):
 def test_defaults_are_bounded():
     assert 0 < DEFAULT_MAX_ANOMALY_FRAMES < 100
     assert 0 < DEFAULT_KEEP_RUNS < 100
+    assert 0 < DEFAULT_MAX_UNKNOWN_FRAMES < 100
+
+
+# ── the exception: frames of screens nobody named ────────────────────────────
+
+def _unknowns(n: int) -> list[Path]:
+    return [Path(f"unknown_20260708-1200{i:02d}-{i:03d}_dispatch.png") for i in range(1, n + 1)]
+
+
+def test_unknown_pruning_is_chronological_because_names_are_timestamps():
+    assert plan_unknown_pruning(_unknowns(4), keep=2) == _unknowns(2)
+
+
+def test_unknown_pruning_keep_zero_means_never_prune_not_delete_everything():
+    """The store exists to be read by a human. `keep <= 0` must not wipe it.
+
+    This is the opposite convention to `plan_frame_pruning`, deliberately: anomaly
+    frames are bulk to be bounded, unknown frames are evidence to be preserved.
+    """
+    assert plan_unknown_pruning(_unknowns(3), keep=0) == []
+    assert plan_unknown_pruning(_unknowns(3), keep=-1) == []
+
+
+def test_unknown_pruning_is_a_noop_below_the_cap():
+    assert plan_unknown_pruning(_unknowns(2), keep=30) == []
+
+
+def test_unknown_dir_is_a_sibling_of_the_run_dirs_not_a_child(tmp_path):
+    """`keep_runs` retires run dirs. The one frame worth keeping must not ride along."""
+    run_dir = tmp_path / "runs" / "20260708-020000"
+    log = DebugLog(run_dir)
+    assert log.unknown_dir == tmp_path / "unknowns"
+    assert log.unknown_dir not in run_dir.parents
+
+    (tmp_path / "unknowns").mkdir(parents=True)
+    (tmp_path / "unknowns" / "unknown_x_dispatch.png").write_bytes(b"x")
+    prune_runs(tmp_path / "runs", keep=0)
+    assert not run_dir.exists()
+    assert (tmp_path / "unknowns" / "unknown_x_dispatch.png").exists()
+
+
+def test_unknown_screen_journals_even_without_pillow(tmp_path):
+    log = DebugLog(tmp_path / "runs" / "r1", clock=lambda: 0.0)
+    log.unknown_screen(None, where="clear_end_screens", confidence=0.31)
+    journal = (tmp_path / "runs" / "r1" / "journal.jsonl").read_text()
+    assert "unknown_screen" in journal
+    assert "clear_end_screens" in journal
+
+
+def test_unknown_screen_writes_frame_and_sidecar(tmp_path):
+    pytest.importorskip("PIL")
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    from hop.perception.image import Frame
+
+    rgb = np.zeros((4, 6, 3), dtype="uint8")
+    rgb[..., 0] = 200                       # colour must survive: the vision layer is
+    frame = Frame(6, 4, np.zeros((4, 6), dtype="uint8"), rgb=rgb)   # gray, humans aren't
+
+    log = DebugLog(tmp_path / "runs" / "r1", clock=lambda: 0.0,
+                   unknown_dir=tmp_path / "unknowns")
+    path = log.unknown_screen(frame, where="dispatch", confidence=0.4)
+    assert path is not None and path.exists()
+    assert path.parent == tmp_path / "unknowns"
+    assert "dispatch" in path.name
+
+    from PIL import Image
+    assert Image.open(path).mode == "RGB"
+    assert Image.open(path).getpixel((0, 0)) == (200, 0, 0)
+
+    sidecar = path.with_suffix(".json")
+    assert sidecar.exists() and "dispatch" in sidecar.read_text()
+
+
+def test_unknown_store_is_empty_when_nothing_is_unknown(tmp_path):
+    """Its non-emptiness IS the signal, so a healthy run must not create it."""
+    log = DebugLog(tmp_path / "runs" / "r1", unknown_dir=tmp_path / "unknowns")
+    log.record("tap", what="gear")
+    log.anomaly("missed tap")
+    assert not (tmp_path / "unknowns").exists()

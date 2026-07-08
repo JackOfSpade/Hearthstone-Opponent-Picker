@@ -15,6 +15,21 @@ So both are bounded, asymmetrically: keep the newest ``max_anomaly_frames`` fram
 in a run and the newest ``keep_runs`` run directories, and never prune a journal
 that still has a run dir. Deleting the *oldest* frames is the right end to cut
 from - a halt is diagnosed from the anomaly that stopped it, which is the last one.
+
+**One exception: UNKNOWN screens.** Every other frame can be re-captured on
+demand - point the phone at the mulligan again and take another screencap. A frame
+the classifier could not *name* cannot. It is, by definition, a screen nobody
+anticipated (a "Ban Notice" modal; the Collection), it halts the loop, and the only
+way to stop the *next* halt is to build an anchor from those exact pixels. So
+:meth:`DebugLog.unknown_screen` writes them, in **colour**, to a directory that
+lives *outside* the run dirs and is never touched by ``keep_runs``:
+
+    ~/.config/hop/unknowns/
+
+That directory is **empty when the hunt is healthy**. Its non-emptiness is the
+signal. Empty it by hand once each frame has become an anchor (``hop capture
+--from-file``). ``max_unknown_frames`` is a runaway backstop - a bound on a
+pathological loop, not a retention policy - not a licence to discard evidence.
 """
 
 from __future__ import annotations
@@ -30,6 +45,10 @@ from .perception.image import Frame, pil_available
 #: A frame pair per anomaly, so this is ~4 anomalies' worth of before/after.
 DEFAULT_MAX_ANOMALY_FRAMES = 8
 DEFAULT_KEEP_RUNS = 5
+#: Runaway backstop for the unknown-screen store, NOT a retention policy. A Halt
+#: ends the run, so a healthy-then-surprised hunt writes one frame and stops; only
+#: a pathological caller could reach this. Keep it well above any real run.
+DEFAULT_MAX_UNKNOWN_FRAMES = 30
 
 
 def plan_frame_pruning(frames: list[Path], keep: int) -> list[Path]:
@@ -50,6 +69,19 @@ def plan_frame_pruning(frames: list[Path], keep: int) -> list[Path]:
             return (-1, p.name)
 
     ordered = sorted(frames, key=sort_key)
+    return ordered[: max(0, len(ordered) - keep)]
+
+
+def plan_unknown_pruning(frames: list[Path], keep: int) -> list[Path]:
+    """Which unknown-screen frames to delete so at most ``keep`` newest survive.
+
+    ``keep <= 0`` means *never prune* - the store is meant to be emptied by a human
+    who has looked at it. Names are ``unknown_<YYYYmmdd-HHMMSS-ffffff>_<where>.png``,
+    so lexicographic order is chronological and no stat() is needed.
+    """
+    if keep <= 0:
+        return []
+    ordered = sorted(frames, key=lambda p: p.name)
     return ordered[: max(0, len(ordered) - keep)]
 
 
@@ -88,13 +120,21 @@ class JournalEntry:
 
 class DebugLog:
     def __init__(self, run_dir: str | Path, clock=time.time,
-                 max_anomaly_frames: int = DEFAULT_MAX_ANOMALY_FRAMES):
+                 max_anomaly_frames: int = DEFAULT_MAX_ANOMALY_FRAMES,
+                 unknown_dir: str | Path | None = None,
+                 max_unknown_frames: int = DEFAULT_MAX_UNKNOWN_FRAMES):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._journal = self.run_dir / "journal.jsonl"
         self._clock = clock
         self._n = 0
+        self._unknowns = 0
         self.max_anomaly_frames = max_anomaly_frames
+        # Deliberately a SIBLING of the run dirs, not a child: `keep_runs` retires
+        # run dirs, and the one frame we must never lose lives here.
+        self.unknown_dir = Path(unknown_dir) if unknown_dir is not None \
+            else self.run_dir.parent.parent / "unknowns"
+        self.max_unknown_frames = max_unknown_frames
 
     def record(self, kind: str, **detail: Any) -> None:
         entry = JournalEntry(t=self._clock(), kind=kind, detail=_jsonable(detail))
@@ -114,8 +154,39 @@ class DebugLog:
         if pil_available():
             for tag, frame in (("before", before), ("after", after)):
                 if frame is not None:
-                    self._save_frame(frame, f"anomaly_{self._n}_{tag}.png")
+                    self._save_frame(frame, self.run_dir / f"anomaly_{self._n}_{tag}.png")
             self._prune_frames()
+
+    def unknown_screen(self, frame: Frame | None, *, where: str, **context: Any) -> Path | None:
+        """Persist a frame the classifier could not name. Returns the path written.
+
+        This is the *only* capture `hop` keeps on purpose. Written in colour (the
+        vision layer is grayscale, but a human diagnosing "what screen is this?"
+        needs the hue, and `hop capture --from-file` builds the new anchor from
+        this file), to :attr:`unknown_dir`, which ``keep_runs`` never touches.
+
+        ``where`` names the call site - ``dispatch``, ``clear_end_screens``, ... -
+        so a folder listing already says which part of the loop got lost.
+        """
+        self._unknowns += 1
+        self.record("unknown_screen", where=where, **context)
+        if frame is None or not pil_available():
+            return None
+        self.unknown_dir.mkdir(parents=True, exist_ok=True)
+        # microseconds: two unknowns inside one second must not collide, and the
+        # name has to sort chronologically for `plan_unknown_pruning`.
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(self._clock()))
+        stamp = f"{stamp}-{self._unknowns:03d}"
+        path = self.unknown_dir / f"unknown_{stamp}_{where}.png"
+        written = self._save_frame(frame, path, colour=True)
+        sidecar = path.with_suffix(".json")
+        try:
+            sidecar.write_text(json.dumps({"where": where, "t": self._clock(),
+                                           **_jsonable(context)}, indent=2) + "\n")
+        except OSError:
+            pass
+        self._prune_unknowns()
+        return path if written else None
 
     def _prune_frames(self) -> None:
         """Hold this run to ``max_anomaly_frames`` newest frames.
@@ -127,17 +198,27 @@ class DebugLog:
                                     self.max_anomaly_frames):
             p.unlink(missing_ok=True)
 
-    def _save_frame(self, frame: Frame, name: str) -> None:  # pragma: no cover - needs Pillow
+    def _prune_unknowns(self) -> None:
+        """Runaway backstop only - see ``DEFAULT_MAX_UNKNOWN_FRAMES``."""
+        for p in plan_unknown_pruning(list(self.unknown_dir.glob("unknown_*.png")),
+                                      self.max_unknown_frames):
+            p.unlink(missing_ok=True)
+            p.with_suffix(".json").unlink(missing_ok=True)
+
+    def _save_frame(self, frame: Frame, path: Path,
+                    colour: bool = False) -> bool:  # pragma: no cover - needs Pillow
         try:
             from PIL import Image
             import numpy as np
-            path = self.run_dir / name
-            if isinstance(frame.data, (bytes, bytearray)):
+            if colour and frame.rgb is not None:
+                Image.fromarray(np.asarray(frame.rgb, dtype="uint8"), "RGB").save(path)
+            elif isinstance(frame.data, (bytes, bytearray)):
                 Image.frombytes("L", (frame.width, frame.height), bytes(frame.data)).save(path)
             else:
                 Image.fromarray(np.asarray(frame.data, dtype="uint8"), "L").save(path)
+            return True
         except Exception:
-            pass
+            return False
 
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
