@@ -83,6 +83,35 @@ def endpoint_spread(
     return (rng.gauss(0.0, sigma_px), rng.gauss(0.0, sigma_px))
 
 
+
+_ENDPOINT_RESAMPLES = 8
+
+
+def _endpoint_inside(rng: Random, hit_radius_px: float, panel: PanelGeometry,
+                     cfg: MotorConfig, state: HumanState) -> tuple[float, float]:
+    """FFitts endpoint offset, conditioned on landing inside the hit area.
+
+    **Resample, don't clamp.** For a small control the FFitts sigma exceeds the hit
+    radius, so scaling every out-of-bounds draw back onto the ``0.9 * r`` circle
+    piles the distribution up on that circle: measured 52% of taps at a 30px radius
+    landed at exactly 27px from centre, and 21% even at 120px. A ring of identical
+    offsets is a signature, and no finger produces one.
+
+    Rejection sampling keeps the Gaussian shape *inside* the disc, which is what
+    "aim for the control, land somewhere plausible on it" actually means. If the
+    sigma is so much larger than the target that we can't land in a few tries, we
+    fall back to a uniformly-random point in the disc rather than a fixed ring -
+    still bounded, still not degenerate.
+    """
+    limit = hit_radius_px * 0.9
+    for _ in range(_ENDPOINT_RESAMPLES):
+        ox, oy = endpoint_spread(rng, 2 * hit_radius_px, panel, cfg, state)
+        if math.hypot(ox, oy) <= limit:
+            return ox, oy
+    r = limit * math.sqrt(rng.random())          # sqrt => uniform over the area
+    theta = rng.uniform(0.0, 2 * math.pi)
+    return r * math.cos(theta), r * math.sin(theta)
+
 def _minjerk_phase(s: float) -> float:
     """Minimum-jerk position profile in [0, 1] for normalized time s in [0, 1]."""
     if s <= 0.0:
@@ -118,12 +147,7 @@ def synth_tap(
     pad compresses; the final sample is an explicit release (tip=False,
     pressure 0).
     """
-    ox, oy = endpoint_spread(rng, 2 * hit_radius_px, panel, cfg, state)
-    # truncate offset to stay inside the hit area (still off-center, just safe)
-    mag = math.hypot(ox, oy)
-    if mag > hit_radius_px * 0.9 and mag > 0:
-        scale = (hit_radius_px * 0.9) / mag
-        ox, oy = ox * scale, oy * scale
+    ox, oy = _endpoint_inside(rng, hit_radius_px, panel, cfg, state)
     ex, ey = target[0] + ox, target[1] + oy
 
     dwell = tap_dwell(rng, cfg, state)
