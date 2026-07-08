@@ -1,4 +1,3 @@
-from dataclasses import replace
 from random import Random
 
 import pytest
@@ -6,7 +5,7 @@ import pytest
 from hop.engine import Engine, evaluate_matchup
 from hop.hearthstone import GameLayout, MulliganRead
 from hop.hero_classes import HeroClass
-from hop.humanize.limiter import CapReached, Limiter
+from hop.humanize.limiter import Limiter
 from hop.perception.screens import ScreenState
 
 from conftest import FakeAdb, FakeBackend, FakeClassifier, ScriptedCapturer, gray_frame
@@ -210,6 +209,33 @@ def test_error_dialog_is_dismissed_not_halted(cfg):
 def test_deck_select_reopens_the_deck(cfg):
     eng, backend = _dispatch_once(cfg, ScreenState.DECK_SELECT)
     assert len(backend.gestures) == 1          # tapped the deck slot
+
+
+def test_collection_is_backed_out_of_not_halted(cfg):
+    """hop is never meant to be in the Collection, but a stray navigation there must be
+    recoverable: tap the back arrow to the deck list, don't halt.
+
+    (Live-verified on a Pixel 7a: collection 0.92 -> back -> deck_select 0.91.)
+    """
+    eng, backend = _dispatch_once(cfg, ScreenState.COLLECTION)
+    assert len(backend.gestures) == 1          # tapped the back arrow
+    assert eng.limiter.commits_this_run == 0   # backing out is not a committing action
+
+
+def test_collection_back_tap_stays_on_the_button_not_off_the_bottom():
+    """Wide, short button: the hit radius must come from the smaller (height) half.
+
+    Its centre is below Android's y=996 gesture inset (taps there are delivered on this
+    device), but the 0.9r disc must not spill off the bottom of a 1080px panel.
+    """
+    from hop.hearthstone import GameLayout
+    from hop.geometry import PanelGeometry
+
+    panel = PanelGeometry(2400, 1080, 420.0)
+    x, y, r = GameLayout().collection_back.to_px(panel)
+    assert y + r * 0.9 <= panel.height_px - 1
+    assert 1930 <= x <= 2130                    # within the button interior
+    assert r < 45                               # from the ~37px height half, not width
 
 
 def _bottom_sheet_frame(w=80, h=40, base=20, bottom=220) -> "object":

@@ -69,6 +69,7 @@ hop capture --state concede_menu     --glyph 0.4475,0.0444,0.1075,0.0352 --prior
 hop capture --state error_dialog     --glyph 0.4350,0.3111,0.1250,0.0444 --priority 10
 hop capture --state reconnect_dialog --glyph 0.4200,0.1000,0.1600,0.0560 --priority 10
 hop capture --state reconnecting     --glyph 0.4088,0.6500,0.1821,0.0620 --priority 20
+hop capture --state collection       --glyph 0.7542,0.0148,0.1063,0.0444
 ```
 (Those glyph boxes are measured on a 2400x1080 landscape frame.) `--from-file
 <png>` rebuilds an anchor offline from a saved `<state>_full.png`.
@@ -297,6 +298,26 @@ non-emptiness is the signal. It is the one exception to "delete captured media".
 
 Note also that the Ban Notice *masked* the deck-list bug: the loop halted before it
 ever tapped "My Collection".
+
+### The Collection is now a recoverable state, not a halt
+
+Navigated into live (deck list → "My Collection"), captured, and driven back out.
+`collection` classifies at **0.9215**, and cross-validates 15/15: its "My Decks" banner
+anchor scores ≤ 0.43 against every other stored screen, and no other anchor clears on
+the collection frame (next-highest `reconnect_dialog` at 0.59, below the 0.72 accept).
+The anchor is the "My Decks" banner — chrome, present whatever cards or class filter are
+showing — not any card, which changes.
+
+`_dispatch` now taps the bottom-right back arrow (`collection_back`, LIVE-VERIFIED
+collection 0.92 → deck_select 0.91) instead of halting. hop is never *meant* to be here
+— the `end_dismiss` geometry and the `END_SCREENS` whitelist keep it off the "My
+Collection" plate — but a stray navigation self-heals rather than stopping the hunt.
+
+Incidental measurement: **discrete taps below Android's y=996 gesture inset ARE
+delivered on this device** (`input tap 1200 1020` navigated fine). That inset reserves
+the home-swipe *gesture*, not taps — which is why `collection_back` at y≈1012 is safe
+even though `end_dismiss`'s *spread* into that band was not (the latter also spilled
+off-screen and wasn't on a control).
 
 ### Two dead ends the loop could never leave
 

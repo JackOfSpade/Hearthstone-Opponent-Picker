@@ -489,6 +489,13 @@ class Engine:
                 raise Halt(f"still queueing after {self._queue_polls} polls; "
                            "matchmaking never matched")
             self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+        elif st == ScreenState.COLLECTION:
+            # hop is never meant to be here; a stray navigation got us in. Back out to
+            # the deck list (a home screen) rather than halt. See ScreenState.COLLECTION.
+            if self.debug:
+                self.debug.record("collection_backout")
+            self._tap(self.layout.collection_back, committing=False, decision_type="commit",
+                      expected_change="full_transition", what="collection_back")
         elif st == ScreenState.MENU:
             raise Halt("at the Hearthstone main menu; open Play and select a deck first "
                        "(the hunt loop queues from that deck's Play screen)")

@@ -50,6 +50,12 @@ class ScreenState(str, Enum):
     # black frames as a transient UNKNOWN. The state and its wait-branch remain for
     # clients that do show one; if yours does, capture an anchor and it just works.
     VS_SPLASH = "vs_splash"
+    # The card Collection / deck manager. hop is never *supposed* to be here - the
+    # end_dismiss geometry + END_SCREENS whitelist keep it from tapping "My Collection"
+    # on the deck list - but a stray navigation must be recoverable, not a halt: back
+    # out to the deck list. Anchored on the "My Decks" banner, which is chrome (present
+    # whatever cards or class filter are showing), not content.
+    COLLECTION = "collection"
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs
     VICTORY = "victory"

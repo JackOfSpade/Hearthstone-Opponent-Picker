@@ -100,6 +100,15 @@ class GameLayout:
     # clear of the deck list's "My Collection" plate at y >= 990.
     end_dismiss: Point = Point(0.50, 0.87, 0.0125)
     pass_turn_button: Point = Point(0.80, 0.497, 0.012)
+    # The Collection's back arrow (bottom-right). hop is never meant to be in the
+    # Collection - the end_dismiss geometry and the END_SCREENS whitelist keep it off
+    # the deck list's "My Collection" plate - but a stray navigation must be
+    # recoverable, not a halt: this returns to the deck list. LIVE-MEASURED (Pixel 7a):
+    # the button interior is x 1930-2130, y 975-1050. It is wide and short, so the hit
+    # radius comes from the smaller (height) half-dimension. Its centre is below
+    # Android's y=996 gesture inset, but discrete taps there are delivered on this
+    # device (measured: `input tap 1200 1020` navigated fine).
+    collection_back: Point = Point(0.846, 0.9370, 0.0154)
     # Recovery: the first deck on the deck-select list, and the OK button of
     # Hearthstone's "There was an error starting your game." dialog (a frequent,
     # transient network blip - dismiss and requeue; no long backoff needed).
