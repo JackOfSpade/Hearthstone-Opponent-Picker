@@ -224,6 +224,17 @@ hand_center_tolerance_f = 0.02     # mean interior centre must be this close to 
 # 400px; at 300px a 4-card hand reads 3. Real screencaps are 2400px wide.
 min_count_frame_width = 400
 
+[debug]
+# Capture is for analysis; once analysed the pixels are dead weight. A 2400x1080
+# grayscale anomaly PNG is ~1 MB and an unattended hunt can throw many (a single
+# debugging session left 10 MB behind), so both the per-run frame count and the
+# number of retained runs are bounded. The journal - append-only JSONL, a few KB -
+# is what a halt is actually diagnosed from, and it rides along with its run dir.
+# Oldest is pruned first: a halt is explained by the anomaly that stopped it, and
+# that is the newest one. Set max_anomaly_frames = 0 to keep no pixels at all.
+keep_runs = 5
+max_anomaly_frames = 8            # 2 frames (before/after) per anomaly => 4 anomalies
+
 [calibration]
 # Filled in by `hop calibrate`. device/date/tester provenance for the values
 # actually measured on your phone. Empty = running on unverified priors.

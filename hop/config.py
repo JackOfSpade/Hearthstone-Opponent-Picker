@@ -201,6 +201,14 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class DebugConfig:
+    #: Bounded so a long unattended hunt cannot fill the disk with anomaly frames.
+    #: The journal (a few KB) is what diagnoses a halt; the PNGs are ~1 MB apiece.
+    keep_runs: int
+    max_anomaly_frames: int
+
+
+@dataclass(frozen=True)
 class Config:
     criteria: Criteria
     device: DeviceConfig
@@ -213,6 +221,7 @@ class Config:
     sensor: SensorConfig
     caps: CapsConfig
     vision: VisionConfig
+    debug: DebugConfig
     risk_profile: str
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -252,6 +261,7 @@ def load_config(path: str | Path | None = None) -> Config:
     sn = merged["sensor"]
     cp = merged["caps"]
     v = merged["vision"]
+    dbg = merged["debug"]
 
     profile = merged["risk"]["profile"]
     if profile not in RISK_PROFILES:
@@ -297,6 +307,7 @@ def load_config(path: str | Path | None = None) -> Config:
         sensor=SensorConfig(**{k: sn[k] for k in SensorConfig.__annotations__}),
         caps=CapsConfig(**{k: cp[k] for k in CapsConfig.__annotations__}),
         vision=VisionConfig(**{k: v[k] for k in VisionConfig.__annotations__}),
+        debug=DebugConfig(**{k: dbg[k] for k in DebugConfig.__annotations__}),
         risk_profile=profile,
         raw=merged,
     )
@@ -333,6 +344,7 @@ def save_criteria(
 
     names = ", ".join(f'"{c.name}"' for c in target_classes)
     text = upsert_toml_scalar(text, "criteria", "target_classes", f"[{names}]")
+    text = upsert_toml_scalar(text, "criteria", "avoid_classes", "[]")
     text = upsert_toml_scalar(text, "criteria", "require_second",
                               "true" if require_second else "false")
     if mode is not None:

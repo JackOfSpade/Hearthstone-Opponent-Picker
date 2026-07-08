@@ -29,7 +29,7 @@ from . import __version__
 from .adb import Adb, AdbError
 from .alerts import Alerter
 from .config import Config, load_config, profile_multipliers
-from .debuglog import DebugLog
+from .debuglog import DebugLog, prune_runs
 from .engine import Engine
 from .geometry import PanelGeometry
 from .hearthstone import GameLayout
@@ -44,8 +44,22 @@ def _default_pack_dir() -> Path:
     return Path.home() / ".config" / "hop" / "templates"
 
 
-def _default_run_dir() -> Path:
-    return Path.home() / ".config" / "hop" / "runs" / time.strftime("%Y%m%d-%H%M%S")
+def _runs_root() -> Path:
+    return Path.home() / ".config" / "hop" / "runs"
+
+
+def _default_run_dir(keep_runs: int | None = None) -> Path:
+    """A fresh run dir, after retiring the oldest runs past ``keep_runs``.
+
+    Pruning on the way *in* rather than on the way out: a run that halts hard or is
+    killed never reaches its own cleanup, and those are exactly the runs that dump
+    frames. ``None`` skips pruning (callers without a Config).
+    """
+    if keep_runs is not None:
+        removed = prune_runs(_runs_root(), keep_runs)
+        if removed:
+            print(f"pruned {len(removed)} old run dir(s)", flush=True)
+    return _runs_root() / time.strftime("%Y%m%d-%H%M%S")
 
 
 # ── engine wiring shared by `run` and `dashboard` ───────────────────────────
@@ -75,7 +89,7 @@ def build_engine(cfg: Config, *, pack_dir: Path, debug_dir: Path | None = None,
 
     classifier = load_template_pack(pack_dir)
     reader = ClassReader(cfg.vision.ocr_max_edit_distance)
-    debug = DebugLog(debug_dir) if debug_dir else None
+    debug = DebugLog(debug_dir, max_anomaly_frames=cfg.debug.max_anomaly_frames) if debug_dir else None
 
     return Engine(
         cfg, adb, backend, display, classifier, reader,
@@ -339,7 +353,7 @@ def cmd_run(args) -> int:
                       target_classes=tuple(parse_class(c) for c in args.classes)))
     alerter = Alerter(cfg.alerts)
     pack_dir = Path(args.templates or _default_pack_dir())
-    debug_dir = _default_run_dir()
+    debug_dir = _default_run_dir(cfg.debug.keep_runs)
     print(f"run: criteria pass-rate ~{cfg.criteria.pass_rate_estimate()*100:.0f}%, "
           f"risk={cfg.risk_profile}, logs -> {debug_dir}")
     engine = build_engine(cfg, pack_dir=pack_dir, debug_dir=debug_dir, alerter=alerter,
@@ -365,7 +379,7 @@ def cmd_app(args) -> int:
 
     def factory(overrides: dict) -> Engine:
         c = _apply_overrides(cfg, overrides)
-        return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(),
+        return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(c.debug.keep_runs),
                             alerter=alerter, seed=args.seed)
 
     try:
@@ -384,7 +398,7 @@ def cmd_dashboard(args) -> int:
 
     def factory(overrides: dict) -> Engine:
         c = _apply_overrides(cfg, overrides)
-        return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(),
+        return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(c.debug.keep_runs),
                             alerter=alerter, seed=args.seed)
 
     controller = EngineController(factory, alerter=alerter)

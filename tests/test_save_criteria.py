@@ -46,6 +46,18 @@ def test_empty_target_classes_means_accept_any(tmp_path):
     assert cfg.criteria.accepts(HeroClass.DRUID, we_go_second=False) is True
 
 
+def test_saving_targets_clears_avoid_classes(tmp_path):
+    p = _user_cfg(
+        tmp_path,
+        '[criteria]\ntarget_classes = ["MAGE"]\navoid_classes = ["PRIEST"]\n'
+        'require_second = false\n',
+    )
+    save_criteria(target_classes=(), require_second=False, path=p)
+    cfg = load_config(p)
+    assert cfg.criteria.avoid_classes == ()
+    assert cfg.criteria.accepts(HeroClass.PRIEST, we_go_second=False) is True
+
+
 def test_preserves_comments_and_unrelated_tables(tmp_path):
     body = (
         "# hop user config\n"

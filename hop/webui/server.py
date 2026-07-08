@@ -220,13 +220,26 @@ async function loadCriteria(){
     box.appendChild(l);
   });
   document.getElementById('second').checked=CRIT.require_second;
-  document.getElementById('passrate').textContent=(CRIT.pass_rate*100).toFixed(0)+'%';
-  document.getElementById('concederate').textContent=(CRIT.concede_rate*100).toFixed(0)+'%';
-  const r=document.getElementById('risk'); r.textContent=CRIT.barcode_risk; r.className='risk-'+CRIT.barcode_risk;
+  box.onchange=updateRiskFromForm;
+  document.getElementById('second').onchange=updateRiskFromForm;
+  updateRiskFromForm();
 }
 function chosenCriteria(){
   const classes=[...document.querySelectorAll('#classes input:checked')].map(i=>i.value);
   return {target_classes:classes, require_second:document.getElementById('second').checked};
+}
+function updateRiskFromForm(){
+  if(!CRIT) return;
+  const chosen=chosenCriteria();
+  let pass=chosen.target_classes.length?chosen.target_classes.length/Math.max(1,CRIT.all_classes.length):1;
+  if(chosen.require_second) pass*=0.5;
+  const concede=1-pass;
+  let risk='moderate';
+  if(concede>=0.9) risk='high';
+  else if(concede>=0.7) risk='elevated';
+  document.getElementById('passrate').textContent=(pass*100).toFixed(0)+'%';
+  document.getElementById('concederate').textContent=(concede*100).toFixed(0)+'%';
+  const r=document.getElementById('risk'); r.textContent=risk; r.className='risk-'+risk;
 }
 async function start(){ await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(chosenCriteria())}); }
 async function stop(){ await fetch('/stop',{method:'POST'}); }
