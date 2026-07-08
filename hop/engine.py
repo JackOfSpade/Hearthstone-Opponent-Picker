@@ -462,12 +462,13 @@ class Engine:
         tap was aimed at - the honest question, and a stricter one, because a tap that
         misses the card leaves the card unchanged and still fails.
 
-        **Hearthstone accepts it only intermittently.** On a live mulligan, six
-        identical taps at the same pixel (endpoint spread 4-6px) toggled the card
-        twice, and every success was followed by an ignored tap. That is a post-toggle
-        debounce in the game, not a property of our touch: the same taps land on
-        buttons every time, and the kernel sees a clean DOWN/UP with correct
-        coordinates. So retry a bounded number of times.
+        **Hearthstone accepts it only intermittently** - about 1 tap in 3, while
+        accepting every button tap. The cause is *unknown*; see CALIBRATION.md for the
+        suspects that measurement has killed (contact scale, position, dwell,
+        micro-slip, event delivery, an unfinished deal-in animation, and stale latched
+        centres). The kernel sees a clean DOWN/UP at the right coordinates on a hand
+        that has been at rest for ten seconds, and the game ignores it anyway. So retry
+        a bounded number of times rather than pretend to understand it.
 
         If it still won't take, **keep the card and carry on**. A card that refuses to
         toggle is not an unknown state - we are still on the mulligan and know exactly

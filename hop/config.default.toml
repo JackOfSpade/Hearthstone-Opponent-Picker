@@ -186,12 +186,15 @@ reconnecting_wait_attempts = 12
 # ...and make at most this many Reconnect taps per run. A reconnect that keeps
 # failing means the network or the account needs a human, so fail closed.
 reconnect_attempt_cap = 3
-# Hearthstone accepts a mulligan card tap only intermittently: on a live mulligan,
-# six identical taps at the same pixel (endpoint spread 4-6px) toggled the card
-# twice, and each success was followed by an ignored tap -- a post-toggle debounce,
-# not a property of our touch. Retry a bounded number of times, then KEEP the card:
-# a card that won't toggle is not an unknown state (we are still on the mulligan),
-# so halting the hunt over it would be fail-closed applied where nothing is closed.
+# Hearthstone accepts a mulligan card tap only intermittently -- ~1 time in 3, while
+# accepting every button tap. Cause UNKNOWN; see CALIBRATION.md. Ruled out by
+# measurement: contact scale, position, dwell, micro-slip, event delivery, and (via a
+# screenrecord of the deal-in) both "the cards are still animating" and "the latched
+# centres are stale" -- the hand is at rest 0.2s after the banner matches and the
+# centres are good to 8px against a 176px card half-width.
+# Retry a bounded number of times, then KEEP the card: a card that won't toggle is not
+# an unknown state (we are still on the mulligan), so halting the hunt over it would be
+# fail-closed applied where nothing is closed.
 mulligan_card_tap_attempts = 3
 # Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
 # The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of

@@ -212,12 +212,46 @@ same pixel works every time. Ruled out by experiment on live mulligans:
 | Micro-slip (drag detection) | `tap_micro_slip_px` 2.5 vs 0 | 1/3 vs 1/3 |
 | Contact scale | the axis clone | **0/7 → 33%** — this was the big one |
 | Event delivery | `getevent` on the virtual node | clean `DOWN`…`UP`, `TRACKING_ID -1`, correct coords |
+| Deal-in animation not finished | 10 fps analysis of a `screenrecord` of the deal | **refuted** — see below |
+| Stale card centres | ditto | **refuted** — aim error 2/5/8 px vs a 176 px card half-width |
 
-Every success is followed by an ignored tap, which smells like a post-toggle
-animation gate, but the engine's own taps are 9–14 s apart and still see ~33%. Not
-explained. `mulligan_card_tap_attempts = 3` brings the per-card success rate to ~70%;
-a card that never takes is simply kept, and `stats.ignored_card_taps` surfaces the
-rate. Nothing about the *committing* action (the concede) depends on this.
+Two explanations have since died. A *post-toggle animation gate* was the first: it
+came from a probe that retapped every 1.2 s, but the engine's real taps are **12–17 s
+apart** (measured from `journal.jsonl`) and still see ~33%, so no gate that short can
+be responsible. The second was **"the cards are still being dealt"** — the natural
+reading, since `_classify_settled()` settles the screen's *identity*, not its
+*content*, and the mulligan is read off the very first frame that matches the banner.
+
+That one is measurable. Recording the queue→mulligan transition with `screenrecord`
+(native fps, analysed offline at 10 fps with the real classifier and the real
+centre-finder) gives:
+
+| Quantity | Measured |
+|---|---|
+| First frame the classifier calls `MULLIGAN` | t = 30.80 s |
+| Card-row motion (`mean_abs_diff`) falls below 1.0 | t = 31.00 s — **0.2 s later** |
+| Centres on that first frame vs the settled hand | **2 px, 5 px, 8 px** (half-width 176 px) |
+
+So the hand is at rest almost immediately, the latched centres are good to 8 px, and
+the engine taps ~10 s after that regardless. Waiting longer cannot help, and neither
+can re-measuring. **The cause is still unidentified.** What is known: the tap is
+delivered (kernel-verified), lands on the card, at a plausible dwell, with a settled
+target — and Hearthstone ignores it ~2 times in 3, while ignoring no button, ever.
+
+Note that verification here is *loose*, not strict: the card tap passes
+`expected_change=None`, so `Verifier` only requires `classify_change != "none"` inside
+the card's rectangle. An ignored tap is therefore a genuine no-op, not a missed
+detection — which is what rules out "it toggled but we failed to see it".
+
+`mulligan_card_tap_attempts = 3` brings the per-card success rate to ~70%; a card that
+never takes is simply kept, and `stats.ignored_card_taps` surfaces the rate. Nothing
+about the *committing* action (the concede) depends on this.
+
+Next suspects, untested: the contact's **azimuth/orientation** channel (buttons may
+not raycast on it while a draggable card does); Unity's drag threshold applied to the
+*first* report rather than the trajectory; and a `Contact Count Maximum` feature
+report we never expose, which could make Android's input classifier treat our single
+contact as unconfirmed on hit-tests that consult it.
 
 Two hazards worth carrying to any future device:
 
