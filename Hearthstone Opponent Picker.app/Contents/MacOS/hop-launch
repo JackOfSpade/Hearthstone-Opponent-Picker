@@ -1,0 +1,76 @@
+#!/bin/zsh
+# Hearthstone Opponent Picker.app — launches the menu-bar control panel (`hop app`).
+#
+# hop is pure Python installed EDITABLE (`pip install -e .`), so its source is always
+# live: there is nothing to build and no staleness window for code changes -- this app
+# always runs the latest source. The only thing an editable install freezes is package
+# METADATA, so we re-run `pip install -e .` just when pyproject.toml is newer than the
+# install marker; every other launch is instant.
+#
+# There is no Terminal window (this is a real .app), so all output goes to the log at
+# ~/Library/Logs/hop.log -- read it if the menu-bar icon never appears.
+
+LOG="$HOME/Library/Logs/hop.log"
+mkdir -p "$(dirname "$LOG")"
+exec >"$LOG" 2>&1                        # truncate each launch; keeps the log bounded
+echo "[$(date)] Hearthstone Opponent Picker launching"
+
+notify() { osascript -e "display notification \"$1\" with title \"Hearthstone Opponent Picker\" sound name \"$2\"" >/dev/null 2>&1; }
+
+# Pick the first python3 that can actually `import hop`, never just the first on PATH:
+# hop lives in one framework python (with numpy/Pillow/pyobjc); the login PATH's python3
+# may be a different one. Run the loop in THIS shell (not a $(...) subshell) so the
+# permission-vs-missing distinction survives -- the two failures need opposite fixes.
+PY=""
+saw_perm_denied=0
+for cand in \
+    python3 \
+    /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
+    /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+  command -v "$cand" >/dev/null 2>&1 || continue
+  if err="$("$cand" -c 'import hop' 2>&1)"; then PY="$cand"; break; fi
+  echo "  ($cand: ${err##*$'\n'})"
+  case "$err" in *"Operation not permitted"*|*PermissionError*) saw_perm_denied=1 ;; esac
+done
+
+if [ -z "$PY" ]; then
+  if [ "$saw_perm_denied" -eq 1 ]; then
+    echo "x macOS blocked reading hop's source (it lives under ~/Desktop, a protected folder)."
+    echo "  Grant access ONCE, then relaunch:"
+    echo "    System Settings > Privacy & Security > Full Disk Access > [+]"
+    echo "    > add 'Hearthstone Opponent Picker.app' > toggle it on."
+    echo "  If it is still blocked, add /Library/Frameworks/Python.framework there too."
+    notify "Allow me in Full Disk Access, then relaunch. See ~/Library/Logs/hop.log" "Basso"
+  else
+    echo "x No python3 can import hop. Install it once from the project dir with: pip install -e ."
+    notify "hop is not installed. See ~/Library/Logs/hop.log" "Basso"
+  fi
+  exit 1
+fi
+echo "> Using $PY"
+
+# Self-locate the project from the editable install itself (no hardcoded or
+# bundle-relative paths): hop.__file__ is <project>/hop/__init__.py.
+PROJECT_DIR="$("$PY" -c 'import hop, os; print(os.path.dirname(os.path.dirname(os.path.realpath(hop.__file__))))')"
+echo "> Project: $PROJECT_DIR"
+cd "$PROJECT_DIR" || { echo "x project dir vanished: $PROJECT_DIR"; notify "hop project not found." "Basso"; exit 1; }
+
+# Refresh only when project metadata changed (deps/entry points). Code edits are live.
+MARKER="hop.egg-info/PKG-INFO"
+if [ ! -e "$MARKER" ] || [ pyproject.toml -nt "$MARKER" ]; then
+  echo "> pyproject.toml changed since the last install -- refreshing dependencies..."
+  "$PY" -m pip install -e . --quiet \
+    && notify "hop dependencies refreshed." "Glass" \
+    || { echo "x pip install failed -- launching on the existing install."; notify "Dependency refresh failed." "Basso"; }
+else
+  echo "> Up to date."
+fi
+
+if "$PY" -c 'import AppKit' >/dev/null 2>&1; then
+  echo "> Launching the menu-bar app (accessory: no Dock icon; quit from its menu)."
+  exec "$PY" -m hop.cli app
+else
+  echo "x pyobjc missing; opening the web dashboard instead (pip install 'hop[mac]')."
+  exec "$PY" -m hop.cli dashboard
+fi
