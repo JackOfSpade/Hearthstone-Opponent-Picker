@@ -251,13 +251,22 @@ def cmd_capture(args) -> int:
         print(f"--state must be one of: {', '.join(valid)}", file=sys.stderr)
         return 2
 
+    # One screen state can wear several faces. Hearthstone's reward popup is a scroll
+    # whose header ("Level 12 Reward!") and gold count change every time, and its ranked
+    # medal screen is different again - but all dismiss identically, so they are one
+    # STATE with several anchors. `--variant` names the face; classify() already accepts
+    # any number of anchors per state and takes the best. Without it, behaviour is
+    # exactly as before (one anchor per state, replaced on recapture).
+    variant = getattr(args, "variant", None)
+    suffix = f"_{variant}" if variant else ""
+
     # Always keep the full frame for reference/recalibration.
-    (pack_dir / f"{state}_full.png").write_bytes(png)
+    (pack_dir / f"{state}{suffix}_full.png").write_bytes(png)
 
     # The template image MUST be smaller than its search region: best_match()
     # slides the template inside the region and bails when tw>rw. So crop the
     # anchor glyph out of the frame rather than storing the whole screen.
-    img_name = f"{state}.png"
+    img_name = f"{state}{suffix}.png"
     if args.glyph:
         glyph = [float(v) for v in args.glyph.split(",")]
         try:
@@ -279,13 +288,21 @@ def cmd_capture(args) -> int:
 
     meta_path = pack_dir / "screens.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {"anchors": []}
-    meta["anchors"] = [a for a in meta["anchors"] if a["state"] != state]
-    meta["anchors"].append({
+    # Replace only the SAME (state, variant). A pre-existing entry has no "variant"
+    # key -> None, so a plain `--state rewards` still replaces the old single anchor,
+    # while `--state rewards --variant banner` coexists with it.
+    meta["anchors"] = [a for a in meta["anchors"]
+                       if not (a["state"] == state and a.get("variant") == variant)]
+    entry = {
         "state": state, "image": img_name, "region": region,
         "threshold": args.threshold, "priority": args.priority,
-    })
+    }
+    if variant:
+        entry["variant"] = variant
+    meta["anchors"].append(entry)
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"saved {state} anchor -> {pack_dir/img_name} (search region {[round(v,4) for v in region]})")
+    label = f"{state}/{variant}" if variant else state
+    print(f"saved {label} anchor -> {pack_dir/img_name} (search region {[round(v,4) for v in region]})")
     return 0
 
 
@@ -583,6 +600,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("capture", help="save a labeled screen into the template pack")
     sp.add_argument("--state", required=True, help="screen state name (mulligan, victory, ...)")
+    sp.add_argument("--variant", help="name a second visual face of the same state (e.g. "
+                    "'banner' for the reward-scroll popup vs the ranked medal). Coexists "
+                    "with other variants; omit to keep one anchor per state.")
     sp.add_argument("--glyph", help="crop box of the anchor glyph 'xf,yf,wf,hf' (strongly recommended)")
     sp.add_argument("--region", help="anchor search region 'xf,yf,wf,hf' (default: glyph box + margin)")
     sp.add_argument("--from-file", dest="from_file",

@@ -70,7 +70,18 @@ hop capture --state error_dialog     --glyph 0.4350,0.3111,0.1250,0.0444 --prior
 hop capture --state reconnect_dialog --glyph 0.4200,0.1000,0.1600,0.0560 --priority 10
 hop capture --state reconnecting     --glyph 0.4088,0.6500,0.1821,0.0620 --priority 20
 hop capture --state collection       --glyph 0.7542,0.0148,0.1063,0.0444
+hop capture --state rewards --variant banner --glyph 0.4029,0.6528,0.1817,0.1074
 ```
+
+**One state can have several faces.** `--variant` adds a second anchor for a state
+instead of replacing the first; `classify()` already takes the best of any number of
+anchors per state. The reward popup is the reason: the shipped `rewards` anchor was the
+ranked **medal** screen ("519 / Legend"), which never appears in casual play, and the
+reward you actually get after a game is a **scroll** whose header ("Level 12 Reward!")
+and gold count change every time. The invariant across every reward scroll is the blue
+**"Hearthstone Reward!"** banner, so that is the glyph. One tap anywhere dismisses it,
+so it lives in `END_SCREENS` and `end_dismiss` clears it (live-verified: reward scroll
+0.89 → one tap → menu 0.97).
 (Those glyph boxes are measured on a 2400x1080 landscape frame.) `--from-file
 <png>` rebuilds an anchor offline from a saved `<state>_full.png`.
 
