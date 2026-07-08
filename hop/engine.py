@@ -281,7 +281,8 @@ class Engine:
             self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
         elif st == ScreenState.MULLIGAN:
             self._handle_mulligan(frame)
-        elif st in (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS):
+        elif st in (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
+                    ScreenState.QUEST_POPUP):
             self._clear_end_screens()
         elif st == ScreenState.CONCEDE_MENU:
             self._tap(self.layout.concede_button, committing=True, decision_type="reject",
@@ -432,10 +433,12 @@ class Engine:
                       expected_change="full_transition", allow_correction=False)
 
     def _clear_end_screens(self, max_taps: int = 8) -> None:
-        """Tap through victory/defeat/rewards popups until back at menu/queue.
+        """Tap through victory/defeat/rewards/quest popups until back at play/queue.
 
-        Bounded and closed-loop: each tap is verified and we re-classify, so a
-        stuck popup halts instead of looping forever."""
+        Hearthstone stacks several of these after a game - the end banner, a rewards
+        popup, and "Your Quests" - in an order that varies, so this is a loop rather
+        than a fixed sequence. Bounded and closed-loop: each tap is verified and we
+        re-classify, so a stuck or unrecognized popup halts instead of looping."""
         for _ in range(max_taps):
             cls, frame = self._classify_settled()
             # Hearthstone drops back to the deck's Play screen after a game; MENU

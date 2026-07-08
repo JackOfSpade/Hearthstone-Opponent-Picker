@@ -50,7 +50,10 @@ class ScreenState(str, Enum):
     IN_GAME = "in_game"           # board visible, our turn or theirs
     VICTORY = "victory"
     DEFEAT = "defeat"
-    REWARDS = "rewards"           # post-game rewards/quest popups
+    REWARDS = "rewards"           # post-game rewards popups
+    # "Your Quests" - Hearthstone throws this over the play screen after a game.
+    # An overlay, so the screen beneath still matches: it needs a higher priority.
+    QUEST_POPUP = "quest_popup"
     CONCEDE_MENU = "concede_menu" # the settings/gear overlay with Concede
     UNKNOWN = "unknown"
 

@@ -59,16 +59,38 @@ region defaults to that box plus a margin.
 hop capture --state play_screen  --glyph 0.6925,0.8167,0.0725,0.0611
 hop capture --state queue        --glyph 0.4375,0.0685,0.1525,0.0370
 hop capture --state mulligan     --glyph 0.4200,0.1000,0.1600,0.0560
-hop capture --state concede_menu --glyph 0.4475,0.0444,0.1075,0.0352
 hop capture --state defeat       --glyph 0.4450,0.6170,0.1825,0.0889
 hop capture --state rewards      --glyph 0.4500,0.7500,0.1025,0.0500
 hop capture --state deck_select  --glyph 0.4400,0.9333,0.1125,0.0426
-hop capture --state error_dialog --glyph 0.4350,0.3111,0.1250,0.0444 --priority 10
+hop capture --state in_game      --glyph 0.7642,0.5352,0.0650,0.0481
+hop capture --state concede_menu     --glyph 0.4475,0.0444,0.1075,0.0352 --priority 10
+hop capture --state error_dialog     --glyph 0.4350,0.3111,0.1250,0.0444 --priority 10
+hop capture --state reconnect_dialog --glyph 0.4200,0.1000,0.1600,0.0560 --priority 10
+hop capture --state reconnecting     --glyph 0.4088,0.6500,0.1821,0.0620 --priority 20
 ```
-(Those glyph boxes are measured on a 2400x1080 landscape frame.) Modal dialogs
-need a higher `--priority` because they don't hide the screen underneath, so both
-anchors match the same frame. `--from-file <png>` rebuilds an anchor offline from
-a saved `<state>_full.png`.
+(Those glyph boxes are measured on a 2400x1080 landscape frame.) `--from-file
+<png>` rebuilds an anchor offline from a saved `<state>_full.png`.
+
+**Priority is not cosmetic — it encodes what is drawn over what.** An overlay does
+not hide the screen beneath it, so both anchors clear their thresholds on the same
+frame and the higher priority must win:
+
+* `concede_menu` is drawn over the board, and the `in_game` anchor still matches
+  through it. At equal priority `in_game` wins on score, the engine *waits* instead
+  of tapping Concede, and **the loop never concedes**.
+* `reconnecting` must outrank `reconnect_dialog`: mid-reconnect the title banner is
+  unchanged, so the dialog anchor still matches — but the buttons are gone and a tap
+  would hit dead space.
+
+Two anchors need care beyond a glyph box:
+
+* **`in_game`** must be read from the End Turn button's *housing*, not its plate.
+  The plate reads `END TURN` on your turn and `ENEMY TURN` on theirs — and since a
+  going-second game begins on the opponent's turn, an anchor on the text fails
+  exactly when it is first needed. Measured pairwise NCC across both turn states:
+  housing **0.86 min**, whole button **0.60 min** (below the 0.72 accept level).
+* **`reconnecting`** is the same dialog as `reconnect_dialog` with a different body,
+  so anchor it on the body text, not the title.
 
 Then verify the coordinates in `hop.hearthstone.GameLayout` against your
 resolution. Note that hit radii should come from each control's **smaller**
