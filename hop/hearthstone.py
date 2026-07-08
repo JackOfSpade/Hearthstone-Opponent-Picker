@@ -60,14 +60,20 @@ class GameLayout:
     # deck-detail screen (ScreenState.PLAY_SCREEN) at the lower right of the deck
     # panel - not centered at the bottom. Hearthstone returns here after a game.
     play_button: Point = Point(0.728, 0.85, 0.025)
-    # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the mulligan "Confirm" button
-    # sits at ~y0.85, not 0.92 (measured from a real Starting-Hand screen).
-    mulligan_confirm: Point = Point(0.50, 0.85, 0.05)
-    gear_button: Point = Point(0.965, 0.05, 0.03)
-    concede_button: Point = Point(0.50, 0.42, 0.06)
+    # All LIVE-VERIFIED on a Pixel 7a (2400x1080 landscape). Hit radii are set from
+    # the control's SMALLER half-dimension, because the FFitts endpoint spread is
+    # isotropic and truncated to 0.9*radius - an over-large radius throws taps off
+    # short, wide buttons (which is how the old values missed).
+    mulligan_confirm: Point = Point(0.50, 0.87, 0.012)
+    gear_button: Point = Point(0.935, 0.037, 0.0125)
+    # In the in-game "Game Menu" the order is Concede / Options / Quit. The old
+    # y=0.42 landed between Options and Quit; Concede is the TOP entry at y~0.196.
+    concede_button: Point = Point(0.5025, 0.196, 0.014)
+    # This client concedes immediately with no confirmation dialog; _concede() only
+    # taps this if a concede menu is still classified afterwards.
     concede_confirm: Point = Point(0.50, 0.56, 0.06)
     end_dismiss: Point = Point(0.50, 0.90, 0.10)
-    pass_turn_button: Point = Point(0.92, 0.50, 0.05)
+    pass_turn_button: Point = Point(0.80, 0.497, 0.012)
 
     def card_slot(self, slot: int, num_cards: int, panel: PanelGeometry) -> Point:
         """Center of mulligan card ``slot`` given the layout has ``num_cards``.

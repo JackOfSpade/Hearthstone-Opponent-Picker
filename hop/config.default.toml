@@ -153,6 +153,11 @@ dedupe_signature_size = 24         # NxN downsample for frame-advance detection
 ncc_match_threshold = 0.72         # normalized cross-correlation accept level
 ocr_max_edit_distance = 3          # snap-to-class fails closed beyond this
 weak_match_margin = 0.08           # match this-close to threshold => low confidence -> inspect
+# Hearthstone animates between screens, so a single unrecognized frame usually
+# means we looked mid-transition (e.g. the blurred board fade after a concede),
+# not that we are lost. Re-look this many times - never tapping - before failing
+# closed on UNKNOWN.
+unknown_settle_attempts = 4
 # Mulligan card counting: each card carries exactly one blue mana gem, and gems
 # never merge. We mask blue pixels in the gem row and keep column-runs whose
 # width matches a gem, which rejects blue *card art* (much wider) and slivers.

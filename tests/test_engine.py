@@ -55,8 +55,33 @@ def test_target_found_alerts_and_stops(cfg):
 
 
 def test_unknown_screen_halts(cfg):
+    """A *persistently* unrecognized screen must fail closed."""
     eng, backend = _engine(cfg, [ScreenState.UNKNOWN])
     stats = eng.run(max_iterations=2)
+    assert stats.stop_reason.startswith("halt")
+    assert backend.gestures == []  # never blind-tap an unknown screen
+
+
+def test_transient_unknown_is_tolerated(cfg):
+    """Hearthstone animates between screens; one blurred frame is not 'lost'.
+
+    The classifier yields UNKNOWN once, then MULLIGAN. The engine must re-look
+    (without tapping) rather than halt.
+    """
+    read = MulliganRead(HeroClass.MAGE, True, 4, 0.98, "MAGE", "tesseract")
+    eng, backend = _engine(cfg, [ScreenState.UNKNOWN, ScreenState.MULLIGAN],
+                           target_read=read)
+    stats = eng.run(max_iterations=2)
+    assert not stats.stop_reason.startswith("halt")
+    assert stats.target_found is True
+
+
+def test_settle_retries_are_bounded(cfg):
+    """More consecutive UNKNOWNs than the settle budget -> still halts."""
+    n = cfg.vision.unknown_settle_attempts
+    states = [ScreenState.UNKNOWN] * (n + 2)
+    eng, backend = _engine(cfg, states)
+    stats = eng.run(max_iterations=1)
     assert stats.stop_reason.startswith("halt")
 
 

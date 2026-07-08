@@ -196,6 +196,24 @@ class Engine:
         frame = self._capture()
         return self.classifier.classify(frame), frame
 
+    def _classify_settled(self) -> tuple[Classification, Frame]:
+        """Classify, tolerating transient animation frames.
+
+        Hearthstone animates between screens (the board blurs and fades out after
+        a concede, banners slide in, ...), so a single UNKNOWN frame usually means
+        we looked mid-transition rather than that we are lost. Re-look a bounded
+        number of times - **never tapping** - and only then let UNKNOWN stand so
+        the caller can fail closed.
+        """
+        attempts = max(1, self.cfg.vision.unknown_settle_attempts)
+        cls, frame = self._classify()
+        for _ in range(attempts - 1):
+            if cls.state != ScreenState.UNKNOWN:
+                break
+            self.sleep(timing.human_delay(self.rng, 0.8, self.cfg.timing))
+            cls, frame = self._classify()
+        return cls, frame
+
     def run(self, max_iterations: int | None = None) -> RunStats:
         """Main hunt loop. Returns when a target is found, a cap is hit, the app
         closes, an unexpected halt occurs, or stop is requested."""
@@ -208,7 +226,7 @@ class Engine:
                     self.stats.stop_reason = "max_iterations"
                     break
                 iters += 1
-                cls, frame = self._classify()
+                cls, frame = self._classify_settled()
                 self._dispatch(cls, frame)
                 # inter-action spacing (never burst)
                 self.sleep(timing.between_actions(self.rng, self.cfg.timing, self.state) * self.delay_scale)
@@ -348,8 +366,9 @@ class Engine:
                   expected_change="bottom_sheet")
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                   expected_change="full_transition")
-        # some clients show a confirm; tap it if a concede menu is still up
-        cls, _ = self._classify()
+        # some clients show a confirm; tap it if a concede menu is still up.
+        # (This one concedes immediately, so the menu is gone and we skip it.)
+        cls, _ = self._classify_settled()
         if cls.state == ScreenState.CONCEDE_MENU:
             self._tap(self.layout.concede_confirm, committing=False, decision_type="commit",
                       expected_change="full_transition", allow_correction=False)
@@ -360,7 +379,7 @@ class Engine:
         Bounded and closed-loop: each tap is verified and we re-classify, so a
         stuck popup halts instead of looping forever."""
         for _ in range(max_taps):
-            cls, frame = self._classify()
+            cls, frame = self._classify_settled()
             # Hearthstone drops back to the deck's Play screen after a game; MENU
             # is also terminal (the caller's next dispatch reports it).
             if cls.state in (ScreenState.PLAY_SCREEN, ScreenState.QUEUE, ScreenState.MENU):
