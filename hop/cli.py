@@ -265,31 +265,36 @@ def cmd_capture(args) -> int:
 
 
 def cmd_calibrate(args) -> int:
+    from .calibrate import upsert_toml_scalar
+
     cfg = load_config(args.config)
     adb = Adb(cfg.device.adb_address)
     adb.connect()
     panel = adb.measure_panel()
-    rate = _measure_report_rate(adb) if args.report_rate else None
+    rate = _measure_report_rate(adb, args.swipe_seconds) if args.report_rate else None
+    if args.report_rate and rate is None:
+        print("could not measure a report rate - did you swipe during the window?",
+              file=sys.stderr)
+        return 1
 
     user_path = Path(args.config) if args.config else (Path.home() / ".config" / "hop" / "config.toml")
     user_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "# written by `hop calibrate`",
-        "[motor]",
-        f"# panel {panel.width_px}x{panel.height_px} @ {panel.dpi:.0f} dpi",
-    ]
+    text = user_path.read_text() if user_path.exists() else ""
+
+    date = time.strftime("%Y-%m-%d")
+    model = _device_model(adb)
     if rate:
-        lines.append(f"report_rate_hz = {rate}")
-    lines += [
-        "[calibration]",
-        f'device = "{_device_model(adb)}"',
-        f'date = "{time.strftime("%Y-%m-%d")}"',
-    ]
-    existing = user_path.read_text() if user_path.exists() else ""
-    user_path.write_text(existing + "\n" + "\n".join(lines) + "\n")
-    print(f"calibration appended to {user_path}")
+        text = upsert_toml_scalar(
+            text, "motor", "report_rate_hz", str(int(round(rate))),
+            comment=f"LIVE-VERIFIED {date} ({model}): median SYN_REPORT interval",
+        )
+    text = upsert_toml_scalar(text, "calibration", "device", f'"{model}"')
+    text = upsert_toml_scalar(text, "calibration", "date", f'"{date}"')
+    user_path.write_text(text)
+
+    print(f"calibration written to {user_path}")
     print(f"panel: {panel.width_px}x{panel.height_px} @ {panel.dpi:.0f} dpi"
-          + (f", report_rate ~= {rate} Hz" if rate else ""))
+          + (f", report_rate = {rate:.1f} Hz -> {int(round(rate))}" if rate else ""))
     print("Complete the remaining §10 steps (getevent pressure/dwell, InputDevice "
           "vid/pid via `hop doctor`) and record provenance.")
     return 0
@@ -400,27 +405,38 @@ def _install_hotkeys(engine: Engine) -> None:
     print("(hotkey: F12 = panic stop)")
 
 
-def _measure_report_rate(adb) -> int | None:
-    """Best-effort touch report-rate measurement via getevent timing.
+def _measure_report_rate(adb, swipe_seconds: int = 20) -> float | None:
+    """Measure the panel's touch report rate; needs a human swipe in the window.
 
-    Requires the human to swipe during the sample window. Returns Hz or None.
+    Captures from the touchscreen node **only** (a phone's fingerprint reader and
+    haptics also emit input events) and hands the raw text to the pure estimator
+    in :mod:`hop.calibrate`, which counts ``SYN_REPORT`` frames rather than
+    position axes. See that module for why the distinction matters.
     """
+    from .calibrate import estimate_report_rate_hz, parse_touch_event_node
+
+    node = parse_touch_event_node(adb.shell("getevent -pl 2>/dev/null"))
+    if not node:
+        print("could not identify the touchscreen input node", file=sys.stderr)
+        return None
+    print(f"sampling {node} for {swipe_seconds}s - SWIPE ON THE PHONE NOW "
+          "(a few natural drags)...", flush=True)
+    prev_timeout, adb.timeout = adb.timeout, swipe_seconds + 15
     try:
-        out = adb.shell("getevent -lt -c 200 2>/dev/null | head -200")
-        times = []
-        for line in out.splitlines():
-            if "ABS_MT_POSITION" in line and "[" in line:
-                try:
-                    times.append(float(line.split("[", 1)[1].split("]", 1)[0]))
-                except Exception:
-                    pass
-        if len(times) > 10:
-            span = times[-1] - times[0]
-            if span > 0:
-                return int(round((len(times) - 1) / span))
-    except Exception:
-        pass
-    return None
+        # `timeout` exits 124 when it fires, which is the *normal* end of this
+        # capture - but adb propagates that exit code and Adb._run raises on any
+        # non-zero status, which would discard a perfectly good sample. Swallow
+        # the status on-device so the events still come back on stdout.
+        out = adb.shell(f"timeout {swipe_seconds} getevent -lt {node} || true")
+    except AdbError as e:
+        print(f"getevent capture failed: {e}", file=sys.stderr)
+        return None
+    finally:
+        adb.timeout = prev_timeout
+
+    frames = sum(1 for line in out.splitlines() if "SYN_REPORT" in line)
+    print(f"captured {frames} touch report frames", flush=True)
+    return estimate_report_rate_hz(out)
 
 
 def _device_model(adb) -> str:
@@ -533,6 +549,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("calibrate", help="measure panel/report-rate into user config")
     sp.add_argument("--report-rate", action="store_true", help="measure touch report rate (swipe during window)")
+    sp.add_argument("--swipe-seconds", type=int, default=20,
+                    help="length of the sample window during which you swipe (default 20)")
     sp.set_defaults(func=cmd_calibrate)
 
     sp = sub.add_parser("test-click", help="emit one humanized tap to test the transport")
