@@ -45,7 +45,11 @@ class ScreenState(str, Enum):
     # dead space, so this must be a distinct, wait-only state - and it must outrank
     # RECONNECT_DIALOG, whose title-banner anchor still matches during it.
     RECONNECTING = "reconnecting"
-    VS_SPLASH = "vs_splash"       # the VS intro
+    # The VS intro. **No anchor is shipped for it**: this client fades queue->black->
+    # mulligan with no distinct splash frame, and `_classify_settled` absorbs the
+    # black frames as a transient UNKNOWN. The state and its wait-branch remain for
+    # clients that do show one; if yours does, capture an anchor and it just works.
+    VS_SPLASH = "vs_splash"
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs
     VICTORY = "victory"

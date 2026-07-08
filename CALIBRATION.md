@@ -199,6 +199,26 @@ adb shell getevent -pl | sed -n '/goodix/,/input props/p'   # TOUCH_MAJOR/MINOR/
 Beware the self-clone: once registered, the virtual device carries the panel's name
 too, and `getevent` lists it first. `hop` takes the lowest event number.
 
+### Open: mulligan card taps are accepted only ~1 time in 3
+
+After the axis fix, Hearthstone accepts a UHID tap on a mulligan **card** about 33%
+of the time (0% before). Buttons are accepted every time, and `adb input tap` on the
+same pixel works every time. Ruled out by experiment on live mulligans:
+
+| Suspect | Test | Result |
+|---|---|---|
+| Position / FFitts spread | dead-centre (offset 4 px) vs 39 px off | centre failed, off-centre succeeded |
+| Dwell | 0.15 s vs 0.50 s vs the lognormal draw | no relationship; real human dwell is 65–535 ms |
+| Micro-slip (drag detection) | `tap_micro_slip_px` 2.5 vs 0 | 1/3 vs 1/3 |
+| Contact scale | the axis clone | **0/7 → 33%** — this was the big one |
+| Event delivery | `getevent` on the virtual node | clean `DOWN`…`UP`, `TRACKING_ID -1`, correct coords |
+
+Every success is followed by an ignored tap, which smells like a post-toggle
+animation gate, but the engine's own taps are 9–14 s apart and still see ~33%. Not
+explained. `mulligan_card_tap_attempts = 3` brings the per-card success rate to ~70%;
+a card that never takes is simply kept, and `stats.ignored_card_taps` surfaces the
+rate. Nothing about the *committing* action (the concede) depends on this.
+
 Two hazards worth carrying to any future device:
 
 * **A card marked for replacement loses its keep-glow.** On a 4-card hand that
