@@ -199,34 +199,68 @@ def cmd_connect(args) -> int:
     return 0
 
 
+def _expand_box(box: list[float], margin: float = 0.35) -> list[float]:
+    """Grow a glyph box into a search region by ``margin`` of its size, clamped."""
+    xf, yf, wf, hf = box
+    mx, my = wf * margin, hf * margin
+    x0, y0 = max(0.0, xf - mx), max(0.0, yf - my)
+    x1, y1 = min(1.0, xf + wf + mx), min(1.0, yf + hf + my)
+    return [x0, y0, x1 - x0, y1 - y0]
+
+
 def cmd_capture(args) -> int:
     cfg = load_config(args.config)
     pack_dir = Path(args.templates or _default_pack_dir())
     pack_dir.mkdir(parents=True, exist_ok=True)
-    adb = Adb(cfg.device.adb_address)
-    adb.connect()
-    png = adb.screencap_png()
+    if args.from_file:
+        # Rebuild an anchor offline from a saved frame (e.g. a <state>_full.png).
+        png = Path(args.from_file).read_bytes()
+    else:
+        adb = Adb(cfg.device.adb_address)
+        adb.connect()
+        png = adb.screencap_png()
 
     state = args.state
     valid = [s.value for s in ScreenState if s != ScreenState.UNKNOWN]
     if state not in valid:
         print(f"--state must be one of: {', '.join(valid)}", file=sys.stderr)
         return 2
+
+    # Always keep the full frame for reference/recalibration.
+    (pack_dir / f"{state}_full.png").write_bytes(png)
+
+    # The template image MUST be smaller than its search region: best_match()
+    # slides the template inside the region and bails when tw>rw. So crop the
+    # anchor glyph out of the frame rather than storing the whole screen.
     img_name = f"{state}.png"
-    (pack_dir / img_name).write_bytes(png)
+    if args.glyph:
+        glyph = [float(v) for v in args.glyph.split(",")]
+        try:
+            import io
+            from PIL import Image
+        except Exception:
+            print("--glyph needs Pillow: pip install 'hop[vision]'", file=sys.stderr)
+            return 2
+        im = Image.open(io.BytesIO(png))
+        gx, gy = int(glyph[0] * im.width), int(glyph[1] * im.height)
+        gw, gh = int(glyph[2] * im.width), int(glyph[3] * im.height)
+        im.crop((gx, gy, gx + gw, gy + gh)).save(pack_dir / img_name)
+        region = [float(x) for x in args.region.split(",")] if args.region else _expand_box(glyph)
+    else:
+        (pack_dir / img_name).write_bytes(png)
+        region = [float(x) for x in args.region.split(",")] if args.region else [0.0, 0.0, 1.0, 1.0]
+        print("WARNING: no --glyph given, so the whole screen is the template. It can only "
+              "match with a full-frame region (brittle). Prefer --glyph xf,yf,wf,hf.")
 
     meta_path = pack_dir / "screens.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {"anchors": []}
     meta["anchors"] = [a for a in meta["anchors"] if a["state"] != state]
-    region = [float(x) for x in args.region.split(",")] if args.region else [0.3, 0.02, 0.4, 0.12]
     meta["anchors"].append({
         "state": state, "image": img_name, "region": region,
         "threshold": args.threshold,
     })
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"saved {state} anchor -> {pack_dir/img_name} (region {region})")
-    print("NOTE: crop the saved PNG to just the anchor glyph for a tight template, "
-          "or leave full-screen and rely on the region filter.")
+    print(f"saved {state} anchor -> {pack_dir/img_name} (search region {[round(v,4) for v in region]})")
     return 0
 
 
@@ -488,7 +522,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("capture", help="save a labeled screen into the template pack")
     sp.add_argument("--state", required=True, help="screen state name (mulligan, victory, ...)")
-    sp.add_argument("--region", help="anchor search region 'xf,yf,wf,hf'")
+    sp.add_argument("--glyph", help="crop box of the anchor glyph 'xf,yf,wf,hf' (strongly recommended)")
+    sp.add_argument("--region", help="anchor search region 'xf,yf,wf,hf' (default: glyph box + margin)")
+    sp.add_argument("--from-file", dest="from_file",
+                    help="build the anchor from a saved PNG instead of a live screencap")
     sp.add_argument("--threshold", type=float, default=0.72)
     sp.set_defaults(func=cmd_capture)
 

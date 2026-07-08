@@ -52,7 +52,9 @@ class GameLayout:
 
     # action points (center + hit radius, screen fractions)
     play_button: Point = Point(0.50, 0.88, 0.06)
-    mulligan_confirm: Point = Point(0.50, 0.92, 0.05)
+    # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the mulligan "Confirm" button
+    # sits at ~y0.85, not 0.92 (measured from a real Starting-Hand screen).
+    mulligan_confirm: Point = Point(0.50, 0.85, 0.05)
     gear_button: Point = Point(0.965, 0.05, 0.03)
     concede_button: Point = Point(0.50, 0.42, 0.06)
     concede_confirm: Point = Point(0.50, 0.56, 0.06)
