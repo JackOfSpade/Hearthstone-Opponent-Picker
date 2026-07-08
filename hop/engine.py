@@ -9,12 +9,15 @@ schedule, never insta-conceding.
 Flow per game:
 
     classify screen
-      MENU/PLAY      -> tap Play (queue)
+      PLAY_SCREEN    -> tap Play (queue). This is the loop's home state: the
+                        deck-detail screen Hearthstone returns to after a game.
+      QUEUE          -> wait (tapping while searching CANCELS the queue)
+      MENU           -> HALT (main menu; the user must open Play and pick a deck)
       VS_SPLASH      -> wait for the board
       MULLIGAN       -> read class + card-count
                           target?  -> ALERT + stop touching the game (you play)
                           reject?  -> run the plausible-exit journey, then requeue
-      VICTORY/DEFEAT/REWARDS -> dismiss -> requeue
+      VICTORY/DEFEAT/REWARDS -> dismiss -> back to PLAY_SCREEN -> requeue
       CONCEDE_MENU   -> tap Concede
       UNKNOWN        -> HALT + alert (fail closed; never blind-tap)
 
@@ -229,9 +232,16 @@ class Engine:
 
     def _dispatch(self, cls: Classification, frame: Frame) -> None:
         st = cls.state
-        if st in (ScreenState.MENU, ScreenState.QUEUE):
+        if st == ScreenState.PLAY_SCREEN:
+            # the loop's home state: the deck's Play button queues a game
             self._tap(self.layout.play_button, committing=False, decision_type="commit",
                       expected_change="full_transition", novelty=0.1)
+        elif st == ScreenState.QUEUE:
+            # searching for an opponent - tapping here CANCELS the queue, so wait
+            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+        elif st == ScreenState.MENU:
+            raise Halt("at the Hearthstone main menu; open Play and select a deck first "
+                       "(the hunt loop queues from that deck's Play screen)")
         elif st == ScreenState.VS_SPLASH:
             self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
         elif st == ScreenState.MULLIGAN:
@@ -349,7 +359,9 @@ class Engine:
         stuck popup halts instead of looping forever."""
         for _ in range(max_taps):
             cls, frame = self._classify()
-            if cls.state in (ScreenState.MENU, ScreenState.QUEUE):
+            # Hearthstone drops back to the deck's Play screen after a game; MENU
+            # is also terminal (the caller's next dispatch reports it).
+            if cls.state in (ScreenState.PLAY_SCREEN, ScreenState.QUEUE, ScreenState.MENU):
                 return
             if cls.state == ScreenState.UNKNOWN:
                 raise Halt("unknown screen while clearing end screens")

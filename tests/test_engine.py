@@ -95,17 +95,36 @@ def test_committing_cap_stops_run(cfg):
 
 
 def test_tap_emits_and_registers(cfg):
-    # A menu tap: before/after differ as a full transition so verify passes.
+    # A Play-screen tap: before/after differ as a full transition so verify passes.
     adb = FakeAdb()
     backend = FakeBackend()
     from hop.geometry import PanelGeometry
     panel = PanelGeometry(80, 40, 400.0)
     before = gray_frame(80, 40, 20)
     after = gray_frame(80, 40, 220)
-    eng = Engine(cfg, adb, backend, panel, FakeClassifier([ScreenState.MENU]),
+    eng = Engine(cfg, adb, backend, panel, FakeClassifier([ScreenState.PLAY_SCREEN]),
                  reader=None, sleep=lambda s: None, rng=Random(1),
                  capturer=ScriptedCapturer([before, after]))
-    # one dispatch of the menu state should emit exactly one Play tap
+    # one dispatch of the play screen should emit exactly one Play tap
     eng._dispatch(eng.classifier.classify(before), before)
     assert len(backend.gestures) == 1
     assert eng.limiter.actions_this_run == 1
+
+
+def test_queue_screen_never_taps(cfg):
+    """Tapping while Hearthstone searches for an opponent CANCELS the queue."""
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    frame = gray_frame(80, 40)
+    eng._dispatch(eng.classifier.classify(frame), frame)
+    assert backend.gestures == []
+    assert eng.limiter.actions_this_run == 0
+
+
+def test_main_menu_halts_with_guidance(cfg):
+    """The loop queues from the deck's Play screen; the main menu is not it."""
+    from hop.verify import Halt
+    eng, backend = _engine(cfg, [ScreenState.MENU])
+    frame = gray_frame(80, 40)
+    with pytest.raises(Halt):
+        eng._dispatch(eng.classifier.classify(frame), frame)
+    assert backend.gestures == []

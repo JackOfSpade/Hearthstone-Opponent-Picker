@@ -51,7 +51,10 @@ class GameLayout:
     card_row: Region = Region(0.12, 0.24, 0.76, 0.45)
 
     # action points (center + hit radius, screen fractions)
-    play_button: Point = Point(0.50, 0.88, 0.06)
+    # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the Play button lives on the
+    # deck-detail screen (ScreenState.PLAY_SCREEN) at the lower right of the deck
+    # panel - not centered at the bottom. Hearthstone returns here after a game.
+    play_button: Point = Point(0.728, 0.85, 0.025)
     # LIVE-VERIFY (Pixel 7a, 2400x1080 landscape): the mulligan "Confirm" button
     # sits at ~y0.85, not 0.92 (measured from a real Starting-Hand screen).
     mulligan_confirm: Point = Point(0.50, 0.85, 0.05)

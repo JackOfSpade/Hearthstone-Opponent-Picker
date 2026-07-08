@@ -25,8 +25,12 @@ from .templates import Region, Template, best_match
 
 
 class ScreenState(str, Enum):
-    MENU = "menu"                 # main menu / mode select
-    QUEUE = "queue"               # searching for opponent
+    MENU = "menu"                 # main menu / mode wheel (NOT where we queue from)
+    # The deck-detail screen carrying the big Play button. This is where the hunt
+    # loop queues from, and where Hearthstone returns to after a game ends, so it
+    # is the loop's home state (verified on-device).
+    PLAY_SCREEN = "play_screen"
+    QUEUE = "queue"               # searching for opponent (do NOT tap: cancels)
     VS_SPLASH = "vs_splash"       # the VS intro
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs
