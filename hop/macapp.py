@@ -1,0 +1,298 @@
+"""The Mac control panel: a menu-bar app that drives the hunt loop.
+
+Why a menu-bar app and not a window: the whole point of `hop` is that you are *not*
+watching it. It queues, reads the mulligan, concedes what you don't want, and the
+moment your matchup appears it shouts and takes its hands off the game. The right
+surface for that is a status item you glance at, and a loud alert you can't miss.
+
+Why pyobjc and not Swift: the engine is Python. A Swift app would add a build step,
+a signing story, and an IPC boundary in exchange for a menu with a few toggles.
+Here the menu items call :class:`~hop.runner.EngineController` directly - no HTTP
+hop, no serialization, no second process to keep alive. The existing web dashboard
+(``hop dashboard``) is still one click away for the rich panel: live screen, risk
+meter, per-run stats.
+
+Threading: the engine's hunt loop is blocking, so ``EngineController`` already runs
+it on a daemon thread. AppKit owns the main thread and drives everything here from
+a repeating timer, so no engine call ever blocks the UI.
+
+    hop app          # menu bar
+    hop dashboard    # the web panel
+
+Requires ``pip install 'hop[mac]'`` (pyobjc). Everything degrades to the CLI and the
+dashboard without it.
+"""
+
+from __future__ import annotations
+
+import threading
+import webbrowser
+from dataclasses import replace
+from pathlib import Path
+
+from .config import Config, save_criteria
+from .hero_classes import DISPLAY_NAMES, HeroClass
+
+MENU_BAR_IDLE = "hop"
+MENU_BAR_HUNTING = "hop ▶"
+MENU_BAR_TARGET = "hop ●"
+MENU_BAR_HALTED = "hop ⚠"
+DASHBOARD_PORT = 8765
+
+
+class MacAppUnavailable(RuntimeError):
+    """pyobjc is not installed, so there is no menu bar to attach to."""
+
+
+def _require_appkit():
+    try:
+        import AppKit  # noqa: F401
+        import objc  # noqa: F401
+    except Exception as e:  # pragma: no cover - import guard
+        raise MacAppUnavailable(
+            "the control panel needs pyobjc: pip install 'hop[mac]'\n"
+            "(the CLI and `hop dashboard` work without it)"
+        ) from e
+    return __import__("AppKit"), __import__("objc")
+
+
+def run_menubar(cfg: Config, engine_factory, alerter=None,
+                config_path: str | Path | None = None) -> int:
+    """Run the menu-bar control panel. Blocks until the user quits."""
+    AppKit, objc = _require_appkit()
+    from .runner import EngineController
+
+    controller = EngineController(engine_factory, alerter=alerter)
+    app = AppKit.NSApplication.sharedApplication()
+    # Accessory: a menu-bar item with no Dock icon and no main window.
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    delegate = _HopMenuDelegate.alloc().initWithState_(
+        _AppState(cfg=cfg, controller=controller, config_path=config_path, AppKit=AppKit)
+    )
+    app.setDelegate_(delegate)
+    delegate.build()
+    app.run()
+    return 0
+
+
+class _AppState:
+    """Plain-Python state, kept out of the Objective-C subclass."""
+
+    def __init__(self, cfg: Config, controller, config_path, AppKit):
+        self.cfg = cfg
+        self.controller = controller
+        self.config_path = config_path
+        self.AppKit = AppKit
+        self.status_item = None
+        self.menu = None
+        self.class_items: dict[HeroClass, object] = {}
+        self.require_second_item = None
+        self.status_line = None
+        self.risk_line = None
+        self.dashboard_thread: threading.Thread | None = None
+
+    # ── criteria ──────────────────────────────────────────────────────────────
+
+    @property
+    def targets(self) -> tuple[HeroClass, ...]:
+        return self.cfg.criteria.target_classes
+
+    def toggle_class(self, hero: HeroClass) -> None:
+        current = list(self.targets)
+        if hero in current:
+            current.remove(hero)
+        else:
+            current.append(hero)
+        self._commit(tuple(current), self.cfg.criteria.require_second)
+
+    def toggle_require_second(self) -> None:
+        self._commit(self.targets, not self.cfg.criteria.require_second)
+
+    def _commit(self, targets: tuple[HeroClass, ...], require_second: bool) -> None:
+        self.cfg = replace(self.cfg, criteria=replace(
+            self.cfg.criteria, target_classes=targets, require_second=require_second))
+        save_criteria(target_classes=targets, require_second=require_second,
+                      path=self.config_path)
+
+    # ── derived text ──────────────────────────────────────────────────────────
+
+    def title(self) -> str:
+        st = self.controller.status()
+        if st.get("target_found"):
+            return MENU_BAR_TARGET
+        if st.get("last_error") or (st.get("stop_reason") or "").startswith("halt"):
+            return MENU_BAR_HALTED
+        return MENU_BAR_HUNTING if st.get("running") else MENU_BAR_IDLE
+
+    def status_text(self) -> str:
+        st = self.controller.status()
+        if st.get("target_found"):
+            return f"TARGET: {st.get('last_opponent', '?')} — your turn"
+        err = st.get("last_error")
+        if err:
+            return f"Halted: {err[:48]}"
+        if not st.get("running"):
+            reason = st.get("stop_reason")
+            return f"Idle ({reason})" if reason else "Idle"
+        b = st.get("budget") or {}
+        return (f"Hunting · {st.get('games', 0)} games · "
+                f"{b.get('concedes_run', 0)}/{b.get('concedes_cap', '?')} concedes")
+
+    def risk_text(self) -> str:
+        crit = self.cfg.criteria
+        pass_rate = crit.pass_rate_estimate()
+        concede = 1.0 - pass_rate
+        if concede >= 0.9:
+            label = "HIGH — barcode-shaped"
+        elif concede >= 0.7:
+            label = "elevated"
+        else:
+            label = "moderate"
+        return f"Concede rate ≈{concede * 100:.0f}%  ·  risk: {label}"
+
+
+try:  # pragma: no cover - only importable on macOS with pyobjc
+    import AppKit as _AppKit
+    import objc as _objc
+
+    class _HopMenuDelegate(_AppKit.NSObject):
+        """The Objective-C side. Holds only a pointer to :class:`_AppState`."""
+
+        def initWithState_(self, state):
+            self = _objc.super(_HopMenuDelegate, self).init()
+            if self is None:
+                return None
+            self._state = state
+            return self
+
+        # ── construction ──────────────────────────────────────────────────────
+
+        def build(self):
+            s = self._state
+            AppKit = s.AppKit
+            bar = AppKit.NSStatusBar.systemStatusBar()
+            s.status_item = bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+            s.status_item.button().setTitle_(MENU_BAR_IDLE)
+
+            menu = AppKit.NSMenu.alloc().init()
+            menu.setAutoenablesItems_(False)
+
+            s.status_line = self._disabled(menu, "Idle")
+            s.risk_line = self._disabled(menu, s.risk_text())
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+
+            self._action(menu, "Start hunting", "start:", key="s")
+            self._action(menu, "Stop", "stop:", key=".")
+            self._action(menu, "Silence alarm", "ack:", key="a")
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+
+            # target classes: a checkable submenu, empty = accept any class
+            classes_item = AppKit.NSMenuItem.alloc().init()
+            classes_item.setTitle_("Target classes")
+            submenu = AppKit.NSMenu.alloc().init()
+            submenu.setAutoenablesItems_(False)
+            for hero in HeroClass:
+                item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    DISPLAY_NAMES[hero], _objc.selector(self.toggleClass_, signature=b"v@:@"), "")
+                item.setTarget_(self)
+                item.setRepresentedObject_(hero.name)
+                item.setState_(1 if hero in s.targets else 0)
+                submenu.addItem_(item)
+                s.class_items[hero] = item
+            classes_item.setSubmenu_(submenu)
+            menu.addItem_(classes_item)
+
+            s.require_second_item = self._action(
+                menu, "Only when going 2nd", "toggleSecond:")
+            s.require_second_item.setState_(1 if s.cfg.criteria.require_second else 0)
+
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            self._action(menu, "Open dashboard…", "dashboard:")
+            self._action(menu, "Quit hop", "quit:", key="q")
+
+            s.status_item.setMenu_(menu)
+            s.menu = menu
+
+            AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1.0, self, _objc.selector(self.refresh_, signature=b"v@:@"), None, True)
+
+        def _disabled(self, menu, title):
+            AppKit = self._state.AppKit
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+            item.setEnabled_(False)
+            menu.addItem_(item)
+            return item
+
+        def _action(self, menu, title, selector_name, key=""):
+            AppKit = self._state.AppKit
+            sel = _objc.selector(getattr(self, selector_name.rstrip(":") + "_"), signature=b"v@:@")
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, key)
+            item.setTarget_(self)
+            menu.addItem_(item)
+            return item
+
+        # ── actions ───────────────────────────────────────────────────────────
+
+        def start_(self, sender):
+            s = self._state
+            crit = s.cfg.criteria
+            s.controller.start({
+                "target_classes": [c.name for c in crit.target_classes],
+                "require_second": crit.require_second,
+            })
+
+        def stop_(self, sender):
+            self._state.controller.stop()
+
+        def ack_(self, sender):
+            self._state.controller.ack_alarm()
+
+        def toggleClass_(self, sender):
+            s = self._state
+            hero = HeroClass[sender.representedObject()]
+            s.toggle_class(hero)
+            sender.setState_(1 if hero in s.targets else 0)
+            s.risk_line.setTitle_(s.risk_text())
+
+        def toggleSecond_(self, sender):
+            s = self._state
+            s.toggle_require_second()
+            sender.setState_(1 if s.cfg.criteria.require_second else 0)
+            s.risk_line.setTitle_(s.risk_text())
+
+        def dashboard_(self, sender):
+            self._state.dashboard_thread = _ensure_dashboard(self._state)
+            webbrowser.open(f"http://127.0.0.1:{DASHBOARD_PORT}/")
+
+        def quit_(self, sender):
+            self._state.controller.stop()
+            self._state.AppKit.NSApplication.sharedApplication().terminate_(self)
+
+        # ── the 1 Hz refresh ──────────────────────────────────────────────────
+
+        def refresh_(self, timer):
+            s = self._state
+            s.status_item.button().setTitle_(s.title())
+            s.status_line.setTitle_(s.status_text())
+
+except Exception:  # pragma: no cover - non-Mac or pyobjc missing
+    _HopMenuDelegate = None  # type: ignore[assignment]
+
+
+def _ensure_dashboard(state: _AppState) -> threading.Thread:
+    """Start the stdlib dashboard on a daemon thread, once.
+
+    Note ``webui.serve()`` already blocks in ``serve_forever``; we construct the
+    server directly so the thread owns the loop.
+    """
+    if state.dashboard_thread and state.dashboard_thread.is_alive():
+        return state.dashboard_thread
+    from .webui import DashboardServer
+
+    def _serve():
+        DashboardServer(state.controller, state.cfg, port=DASHBOARD_PORT).serve_forever()
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    return t

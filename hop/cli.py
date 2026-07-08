@@ -355,6 +355,26 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_app(args) -> int:
+    """The Mac control panel: a menu-bar item that drives the hunt loop."""
+    from .macapp import MacAppUnavailable, run_menubar
+
+    cfg = load_config(args.config)
+    alerter = Alerter(cfg.alerts)
+    pack_dir = Path(args.templates or _default_pack_dir())
+
+    def factory(overrides: dict) -> Engine:
+        c = _apply_overrides(cfg, overrides)
+        return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(),
+                            alerter=alerter, seed=args.seed)
+
+    try:
+        return run_menubar(cfg, factory, alerter=alerter, config_path=args.config)
+    except MacAppUnavailable as e:
+        print(e, file=sys.stderr)
+        return 2
+
+
 def cmd_dashboard(args) -> int:
     cfg = load_config(args.config)
     alerter = Alerter(cfg.alerts)
@@ -562,6 +582,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-iterations", type=int, default=None)
     sp.add_argument("--seed", type=int, default=None, help="deterministic RNG seed (testing)")
     sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("app", help="Mac menu-bar control panel (criteria, start/stop, alerts)")
+    sp.add_argument("--seed", type=int, default=None)
+    sp.set_defaults(func=cmd_app)
 
     sp = sub.add_parser("dashboard", help="run the local web dashboard")
     sp.add_argument("--host", default="127.0.0.1")

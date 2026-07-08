@@ -60,9 +60,11 @@ hop capture --state play_screen  --glyph 0.6925,0.8167,0.0725,0.0611
 hop capture --state queue        --glyph 0.4375,0.0685,0.1525,0.0370
 hop capture --state mulligan     --glyph 0.4200,0.1000,0.1600,0.0560
 hop capture --state defeat       --glyph 0.4450,0.6170,0.1825,0.0889
+hop capture --state victory      --glyph 0.4350,0.5950,0.1650,0.0850
 hop capture --state rewards      --glyph 0.4500,0.7500,0.1025,0.0500
 hop capture --state deck_select  --glyph 0.4400,0.9333,0.1125,0.0426
 hop capture --state in_game      --glyph 0.7642,0.5352,0.0650,0.0481
+hop capture --state quest_popup      --glyph 0.4117,0.1000,0.1604,0.1157 --priority 10
 hop capture --state concede_menu     --glyph 0.4475,0.0444,0.1075,0.0352 --priority 10
 hop capture --state error_dialog     --glyph 0.4350,0.3111,0.1250,0.0444 --priority 10
 hop capture --state reconnect_dialog --glyph 0.4200,0.1000,0.1600,0.0560 --priority 10
@@ -155,3 +157,30 @@ hop calibrate --report-rate     # then SWIPE on the phone during the sample wind
 Reference measurement (Pixel 7a, `goodix_ts0`, 2026-07-07): pressure `ramp`
 (0..255, physical), `TOUCH_MAJOR` max 2399, `TOUCH_MINOR` max 1079,
 `ORIENTATION` -4096..4096 (interpolated), 10 contact slots, size cal `GEOMETRIC`.
+
+---
+
+## What live bring-up actually changed (Pixel 7a, 2026-07-08)
+
+Everything below was wrong until a real phone said so. Recorded because the next
+device will need the same treatment, and because the *method* transfers even where
+the numbers don't.
+
+| Constant / assumption | Shipped | Measured | How it failed |
+|---|---|---|---|
+| `motor.report_rate_hz` | 180 (placeholder) | **183** | The measuring code itself was broken three ways; see `hop/calibrate.py`. |
+| Mulligan card count | mana gems / brightness | **card interiors between keep-glows** | Both returned 3 on a real 4-card hand, inverting `we_go_second`. |
+| Mulligan card centres | evenly spaced 0.20…0.80 | **measured from the frame** | ~100px off; FFitts spread pushed taps off the card. |
+| Gear-tap change kind | `bottom_sheet` | **`full_transition`** | Halted every concede. |
+| Card-replace tap | whole-frame verify | **region-scoped verify** | Whole-frame delta 4.80 < threshold 9.0 → "missed tap". |
+| `concede_menu` priority | 0 | **10** | The menu draws over the board, so `in_game` won and the loop never conceded. |
+| `in_game` anchor | End Turn *plate* | End Turn **housing** | Plate reads "ENEMY TURN" on their turn — i.e. exactly when a going-second game starts. |
+
+Two hazards worth carrying to any future device:
+
+* **A card marked for replacement loses its keep-glow.** On a 4-card hand that
+  leaves three interiors: a plausible reading that silently flips `we_go_second`.
+  Guarded by contiguity + hand-centre symmetry (`hearthstone.hand_is_coherent`).
+* **Synthetic fixtures certify nothing here.** Three separate card counters passed
+  full unit-test suites built on drawn gems and bars. Every one was wrong on the
+  first real frame. `tests/data/frames/` holds real captures for this reason.

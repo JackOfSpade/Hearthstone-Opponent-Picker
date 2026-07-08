@@ -297,3 +297,39 @@ def _default_user_path() -> Path:
 
 def profile_multipliers(cfg: Config) -> dict[str, float]:
     return RISK_PROFILES[cfg.risk_profile]
+
+
+def save_criteria(
+    *,
+    target_classes: tuple[HeroClass, ...] | list[HeroClass],
+    require_second: bool,
+    mode: str | None = None,
+    risk_profile: str | None = None,
+    path: str | Path | None = None,
+) -> Path:
+    """Persist the user-facing criteria to the user config, in place.
+
+    The control app and the dashboard both set these, and a setting that vanishes on
+    restart is worse than no setting at all. Writes through
+    :func:`hop.tomledit.upsert_toml_scalar`, so the file's comments - including every
+    LIVE-VERIFIED provenance note - survive, which a tomllib parse/re-emit would not.
+    """
+    from .tomledit import upsert_toml_scalar
+
+    user_path = Path(path) if path else _default_user_path()
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    text = user_path.read_text() if user_path.exists() else ""
+
+    names = ", ".join(f'"{c.name}"' for c in target_classes)
+    text = upsert_toml_scalar(text, "criteria", "target_classes", f"[{names}]")
+    text = upsert_toml_scalar(text, "criteria", "require_second",
+                              "true" if require_second else "false")
+    if mode is not None:
+        text = upsert_toml_scalar(text, "criteria", "mode", f'"{mode}"')
+    if risk_profile is not None:
+        if risk_profile not in RISK_PROFILES:
+            raise ValueError(f"unknown risk profile: {risk_profile!r}")
+        text = upsert_toml_scalar(text, "risk", "profile", f'"{risk_profile}"')
+
+    user_path.write_text(text)
+    return user_path

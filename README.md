@@ -26,7 +26,7 @@ barcode account**.
 | Signal | How it's read | Why it's reliable |
 |---|---|---|
 | **Opponent class** | OCR the bottom-left class label at mulligan, snap to the 11 known class words by edit distance | The game prints the literal class word — immune to hero skins, multi-class skins, and golden-hero animation (those only change the portrait). Snapping to 11 fixed words makes OCR errors self-correcting. |
-| **Going second** | Count mulligan cards: **3 = first, 4 = second** | The Coin isn't in the mulligan hand and coin skins vary, so we never look for it. Cards are counted by the green **keep-glow** that outlines each one: adjacent cards share a strip and the hand's edges add one each, so N cards make N+1 strips. The glow is UI chrome, so **card artwork cannot fake it** — unlike the mana gems (a gem's own digit splits it, and a card's blue sky is the same hue) or a brightness profile (dark art hides a card). Both of those were tried, both returned 3 on a real 4-card hand, and both had passing *synthetic* tests. The strip count is cross-checked against the card pitch; on disagreement the read is **unusable** and the engine fails closed rather than guess at the signal that decides whether to concede. |
+| **Going second** | Count mulligan cards: **3 = first, 4 = second** | The Coin isn't in the mulligan hand and coin skins vary, so we never look for it. Cards are counted as the **interiors between their green keep-glows** — spans that are both card-wide (0.147 W) and card-bright (the background gap between cards is 2.7× narrower and 3× darker). The glow is UI chrome, so **card artwork cannot fake it** — unlike the mana gems (a gem's own digit splits it, and a card's blue sky is the same hue: `b-g=21` vs `22`) or a brightness profile (dark art hides a card entirely). Both were tried; both returned **3 on a real 4-card hand**; both had passing *synthetic* tests. Counting the glow *strips* fails too — 3 spread-out cards make 6 strips while 4 packed cards make 5. Anything that doesn't cohere returns **unusable** and the engine fails closed rather than guess at the signal that decides whether to concede. |
 | **Which screen we're on** | Template-match anchor glyphs (the "Starting Hand" banner, victory/defeat marks, the gear menu) | Closed-loop navigation: an unrecognized screen **halts and alerts** instead of blind-tapping. Hearthstone animates between screens, so a frame that matches nothing is re-looked at (never tapped) a bounded number of times before failing closed. Overlays carry a higher anchor `priority` so they beat the screen they occlude — the concede menu is drawn *over* the board, so without that the loop would wait instead of conceding. |
 
 **No cloud API, no per-run cost, no ML training.** OCR runs locally
@@ -108,9 +108,30 @@ Hearthstone returns to after every game, so it's where `hop` queues and requeues
 from. (Starting from the main menu halts with guidance instead of blind-tapping.)
 
 ```sh
+hop app                                        # Mac menu-bar control panel
 hop run --classes mage warlock                 # headless; Ctrl-C / F12 to stop
 hop dashboard                                  # or drive it from the web UI
 ```
+
+### The Mac control panel
+
+`hop app` puts a status item in the menu bar — because the point of `hop` is that
+you *aren't* watching it:
+
+```
+hop ▶                     ← idle "hop", hunting "hop ▶", target "hop ●", halted "hop ⚠"
+├─ Hunting · 3 games · 2/15 concedes
+├─ Concede rate ≈91%  ·  risk: HIGH — barcode-shaped
+├─ Start hunting / Stop / Silence alarm
+├─ Target classes  ▸  ✓ Mage   ✓ Warlock   Druid  …     (empty = any class)
+├─ ☐ Only when going 2nd
+└─ Open dashboard…                     ← live screen, stats, risk meter
+```
+
+Criteria you set here are **persisted** to `~/.config/hop/config.toml` (comments and
+provenance notes intact), so they survive a restart. It drives the engine in-process
+— no second process, no HTTP hop — and the web dashboard is one click away for the
+rich panel. Needs `pip install 'hop[mac]'` (pyobjc); everything else works without it.
 
 ---
 
@@ -124,6 +145,7 @@ hop dashboard                                  # or drive it from the web UI
 | `hop calibrate` | Measure panel + report rate into your user config (§10). |
 | `hop test-click --at xf,yf` | Emit one humanized tap to verify the transport. |
 | `hop run` | Run the hunt loop headless. |
+| `hop app` | Mac menu-bar control panel: criteria, start/stop, live status, alarm. |
 | `hop dashboard` | Local web dashboard (criteria, live view, stats, risk meter). |
 
 ## Configuration
@@ -168,7 +190,10 @@ hop/
   engine.py     the hunt-loop state machine
   alerts.py     Mac notification/sound/say + ntfy push
   webui/        stdlib web dashboard
-  cli.py        connect / doctor / capture / calibrate / test-click / run / dashboard
+  macapp.py     Mac menu-bar control panel (pyobjc NSStatusItem)
+  calibrate.py  pure §10 parsers (getevent -> report rate)
+  tomledit.py   comment-preserving TOML upsert (config writes)
+  cli.py        connect / doctor / capture / calibrate / test-click / run / app / dashboard
 tests/          pytest suite for the pure layers + engine integration
 Archive/        the original desktop AHK scripts (reference only)
 ```
