@@ -152,9 +152,17 @@ class _AppState:
         return f"Concede rate ≈{concede * 100:.0f}%  ·  risk: {label}"
 
 
-try:  # pragma: no cover - only importable on macOS with pyobjc
+# pyobjc turns EVERY method of an NSObject subclass into an Objective-C selector,
+# so a plain Python helper like `_disabled(self, menu, title)` raises BadPrototypeError
+# at class-creation time. Helpers must be marked `@objc.python_method`. Only the
+# import is guarded here -- a broad `except Exception` around the class body once hid
+# exactly that error and made the app pretend pyobjc was missing.
+try:  # pragma: no cover - macOS + pyobjc only
     import AppKit as _AppKit
     import objc as _objc
+except ImportError:  # pragma: no cover
+    _HopMenuDelegate = None  # type: ignore[assignment]
+else:  # pragma: no cover - needs a Mac GUI session to exercise
 
     class _HopMenuDelegate(_AppKit.NSObject):
         """The Objective-C side. Holds only a pointer to :class:`_AppState`."""
@@ -168,6 +176,7 @@ try:  # pragma: no cover - only importable on macOS with pyobjc
 
         # ── construction ──────────────────────────────────────────────────────
 
+        @_objc.python_method
         def build(self):
             s = self._state
             AppKit = s.AppKit
@@ -182,19 +191,19 @@ try:  # pragma: no cover - only importable on macOS with pyobjc
             s.risk_line = self._disabled(menu, s.risk_text())
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-            self._action(menu, "Start hunting", "start:", key="s")
-            self._action(menu, "Stop", "stop:", key=".")
-            self._action(menu, "Silence alarm", "ack:", key="a")
+            self._action(menu, "Start hunting", "start_", key="s")
+            self._action(menu, "Stop", "stop_", key=".")
+            self._action(menu, "Silence alarm", "ack_", key="a")
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-            # target classes: a checkable submenu, empty = accept any class
+            # target classes: a checkable submenu; empty selection = accept any class
             classes_item = AppKit.NSMenuItem.alloc().init()
             classes_item.setTitle_("Target classes")
             submenu = AppKit.NSMenu.alloc().init()
             submenu.setAutoenablesItems_(False)
             for hero in HeroClass:
                 item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    DISPLAY_NAMES[hero], _objc.selector(self.toggleClass_, signature=b"v@:@"), "")
+                    DISPLAY_NAMES[hero], b"toggleClass:", "")
                 item.setTarget_(self)
                 item.setRepresentedObject_(hero.name)
                 item.setState_(1 if hero in s.targets else 0)
@@ -203,20 +212,20 @@ try:  # pragma: no cover - only importable on macOS with pyobjc
             classes_item.setSubmenu_(submenu)
             menu.addItem_(classes_item)
 
-            s.require_second_item = self._action(
-                menu, "Only when going 2nd", "toggleSecond:")
+            s.require_second_item = self._action(menu, "Only when going 2nd", "toggleSecond_")
             s.require_second_item.setState_(1 if s.cfg.criteria.require_second else 0)
 
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
-            self._action(menu, "Open dashboard…", "dashboard:")
-            self._action(menu, "Quit hop", "quit:", key="q")
+            self._action(menu, "Open dashboard\u2026", "dashboard_")
+            self._action(menu, "Quit hop", "quit_", key="q")
 
             s.status_item.setMenu_(menu)
             s.menu = menu
 
             AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0, self, _objc.selector(self.refresh_, signature=b"v@:@"), None, True)
+                1.0, self, b"refresh:", None, True)
 
+        @_objc.python_method
         def _disabled(self, menu, title):
             AppKit = self._state.AppKit
             item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
@@ -224,20 +233,21 @@ try:  # pragma: no cover - only importable on macOS with pyobjc
             menu.addItem_(item)
             return item
 
-        def _action(self, menu, title, selector_name, key=""):
+        @_objc.python_method
+        def _action(self, menu, title, method_name, key=""):
+            """Wire a menu item to one of our selectors (``start_`` -> ``start:``)."""
             AppKit = self._state.AppKit
-            sel = _objc.selector(getattr(self, selector_name.rstrip(":") + "_"), signature=b"v@:@")
-            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, key)
+            selector = (method_name[:-1] + ":").encode()
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, selector, key)
             item.setTarget_(self)
             menu.addItem_(item)
             return item
 
-        # ── actions ───────────────────────────────────────────────────────────
+        # ── actions (selectors: one argument, the sender) ─────────────────────
 
         def start_(self, sender):
-            s = self._state
-            crit = s.cfg.criteria
-            s.controller.start({
+            crit = self._state.cfg.criteria
+            self._state.controller.start({
                 "target_classes": [c.name for c in crit.target_classes],
                 "require_second": crit.require_second,
             })
@@ -275,9 +285,6 @@ try:  # pragma: no cover - only importable on macOS with pyobjc
             s = self._state
             s.status_item.button().setTitle_(s.title())
             s.status_line.setTitle_(s.status_text())
-
-except Exception:  # pragma: no cover - non-Mac or pyobjc missing
-    _HopMenuDelegate = None  # type: ignore[assignment]
 
 
 def _ensure_dashboard(state: _AppState) -> threading.Thread:
