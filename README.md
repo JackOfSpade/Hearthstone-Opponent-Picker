@@ -40,12 +40,12 @@ building it.
 projection of a latent *HumanState* rather than independent randomness:
 
 - **Motor (L3):** FFitts target acquisition, minimum-jerk primary stroke + corrective submovements, correlated tremor, beta-ramp pressure with co-evolving contact size/orientation, and a lognormal tap dwell — delivered per-sample.
-- **Transport (L1):** a **persistent virtual HID digitizer** via `/system/bin/hid` over `/dev/uhid` (carries real pressure/size/geometry through the genuine kernel input pipeline; registered **once** per session, never per gesture). Falls back to `adb input` with an explicit fidelity-drop record.
+- **Transport (L1):** a **persistent virtual HID digitizer** via `/system/bin/hid` over `/dev/uhid` (carries real pressure/size/geometry through the genuine kernel input pipeline; registered **once** per session, never per gesture). It clones the panel's **name, vid/pid *and its contact-channel axis ranges*** — Android loads a touch device's calibration by name and applies it to our reports, so declaring a `TOUCH_MAJOR` ceiling of 255 against the panel's real 2399 sizes the contact ~6× too big. Hearthstone silently ignored every mulligan-card tap until that was fixed. Falls back to `adb input` with an explicit fidelity-drop record.
 - **Orientation:** Hearthstone runs **landscape** while the phone's panel is native **portrait**, so perception and the engine work in *display* space while the digitizer reports *native panel* pixels. `hop.orientation` maps between them from the live rotation, handling **both** landscape orientations (a phone can sit either way up).
 - **Timing (L4):** stateful, per-decision think time (a committing action reacts faster than a rejecting one), modulated by fatigue/familiarity/urgency/confidence. No bare `sleep(constant)` on any game-facing action.
 - **Sensorimotor (L4):** predicts the coherent inertial side effect of each touch; a **desk-mounted** run declares its posture and does not claim handheld IMU realism (the honest option for a bench phone driven over ADB, per the standard).
 - **Behavioral caps (L5):** per-run/-session/-day volume caps, a dedicated cap on the **committing action** (the concede — the barcode signal), mandatory jittered breaks, and a non-repetition check so trajectories never replay.
-- **Verify + fail-closed (L6):** after every tap the screen must change *and* cohere; otherwise one evidence-based correction, then a clean halt with a debug snapshot.
+- **Verify + fail-closed (L6):** after every tap the screen must change *and* cohere; otherwise one evidence-based correction, then a clean halt with a debug snapshot. Verification is **scoped to what the tap aimed at** where that's the honest question — marking one mulligan card moves the whole frame by 4.8 (under the 9.0 threshold) and the card's own rectangle by 24.2. And fail-closed means *unknown state*: a card the game declines to toggle leaves us squarely on the mulligan, so the loop retries a bounded number of times and keeps the card rather than halting.
 
 ## Anti-barcode design
 
@@ -83,7 +83,7 @@ protection.
 ```sh
 brew install android-platform-tools            # adb
 brew install tesseract                         # OCR engine (or use zero-ML templates)
-pip install -e '.[all]'                        # hop + vision + web + hotkeys
+pip install -e '.[all]'                        # hop + vision + web + hotkeys + menu-bar app
 ```
 
 ### 3. Configure
