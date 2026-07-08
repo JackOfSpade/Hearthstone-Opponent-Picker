@@ -86,27 +86,63 @@ def test_concede_halts_rather_than_tapping_below_the_concede_button(cfg):
     The tap below Concede is Quit. Exactly two gestures may leave the engine here:
     the gear, and Concede itself.
     """
-    eng, backend = _engine(cfg, [ScreenState.CONCEDE_MENU])
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU])
     with pytest.raises(Halt) as e:
         eng._concede()
     assert "Quit" in str(e.value)
     assert len(backend.gestures) == 2       # gear, concede -- and nothing else
 
 
+def test_concede_requires_the_game_menu_before_the_committing_tap(cfg):
+    """`full_transition` after the gear does not mean the Game Menu opened.
+
+    `_compatible()` admits `top_banner` and `partial` for an expected
+    `full_transition`, so an opponent's turn animating behind a *dropped* gear tap
+    satisfies it. The concede is the loop's committing action; look before you tap.
+    """
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME])   # gear never opened the menu
+    with pytest.raises(Halt) as e:
+        eng._concede()
+    assert "did not open the Game Menu" in str(e.value)
+    assert len(backend.gestures) == 1       # the gear, and nothing after it
+
+
 def test_concede_returns_once_the_menu_is_gone(cfg):
-    eng, backend = _engine(cfg, [ScreenState.IN_GAME])
-    eng._concede()                           # board dissolving == menu left
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU,
+                                 ScreenState.VICTORY])
+    assert eng._concede() is True            # menu opened, then the board dissolved
     assert len(backend.gestures) == 2
 
 
 def test_concede_does_not_accept_unknown_as_proof_the_menu_left(cfg):
     """An unreadable frame is not an observation that we left the menu."""
     debug = _RecordingDebug()
-    eng, backend = _engine(cfg, [ScreenState.UNKNOWN], debug=debug)
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU,
+                                 ScreenState.UNKNOWN], debug=debug)
     with pytest.raises(Halt):
         eng._concede()
     assert len(backend.gestures) == 2
     assert [w for w, _f, _c in debug.unknowns] == ["concede"]
+
+
+def test_concede_is_skipped_when_the_game_already_ended(cfg):
+    """The opponent can concede first, or a lethal can land during _play_beats.
+
+    The gear icon is drawn on the victory screen too, so tapping it there opens
+    something we never anchored -- and booking a concede that never happened inflates
+    the concede/commit ratio the caps exist to keep human.
+    """
+    eng, backend = _engine(cfg, [ScreenState.VICTORY])
+    assert eng._concede() is False
+    assert backend.gestures == []
+
+
+def test_concede_refuses_to_run_from_a_screen_that_is_not_a_live_game(cfg):
+    eng, backend = _engine(cfg, [ScreenState.PLAY_SCREEN])
+    with pytest.raises(Halt) as e:
+        eng._concede()
+    assert "not a live game" in str(e.value)
+    assert backend.gestures == []
 
 
 # ── end_dismiss may only land on a screen we named ───────────────────────────

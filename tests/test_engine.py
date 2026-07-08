@@ -337,6 +337,28 @@ def test_a_card_tap_that_takes_stops_retrying(cfg):
     assert len(eng.backend.gestures) == 1
 
 
+def test_only_a_no_change_halt_counts_as_an_ignored_card_tap(cfg):
+    """`stats.ignored_card_taps` is the statistic CALIBRATION.md chases the ~67%
+    card-tap mystery with. Folding coherence or non-repetition failures into it both
+    hides a real fault and poisons the evidence that would reveal it.
+
+    Only "the screen did not move" means the game ignored the tap.
+    """
+    from hop.verify import Halt
+
+    eng = _mulligan_engine(cfg, _StuckCardCapturer())
+
+    def wrong_change(*a, **k):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._replace_card(slot=0, center_xf=0.25, decision_type="reject")
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert eng.stats.ignored_card_taps == 0        # not our statistic to inflate
+    assert len(eng.backend.gestures) == 1          # and not retried three times
+
+
 def test_card_taps_are_verified_against_the_card_not_the_screen(cfg):
     """Regression: a whole-frame check called a real toggle 'no screen change'.
 

@@ -75,7 +75,14 @@ class Anchor:
 @dataclass(frozen=True)
 class Classification:
     state: ScreenState
-    confidence: float             # NCC score of the winning anchor (0..1)
+    #: NCC score of the **winning** anchor, i.e. of ``state`` - not of whichever
+    #: anchor happened to score highest. ``0.0`` when ``state`` is UNKNOWN, because
+    #: :func:`best_match` returns ``None`` below an anchor's threshold and so a
+    #: sub-threshold score is never observed at all.
+    confidence: float
+    #: Centre of the winning anchor's match, in device px, or ``None`` for UNKNOWN.
+    #: The glyph is on the thing it identifies, so this is where that screen *is*.
+    at: tuple[int, int] | None = None
 
 
 class ScreenClassifier:
@@ -84,27 +91,43 @@ class ScreenClassifier:
         self.accept = accept
 
     def classify(self, frame: Frame) -> Classification:
-        """Return the best-matching screen state and its confidence.
+        """Return the best-matching screen state and *its* confidence.
 
         Among anchors that clear their own threshold, the winner is the highest
         ``priority`` and then the highest score - so a modal dialog beats the
         screen it is drawn over. If nothing clears its threshold the state is
-        UNKNOWN with the best score seen; the engine re-looks a bounded number of
-        times and then halts, never blind-tapping.
+        UNKNOWN; the engine re-looks a bounded number of times and then halts,
+        never blind-tapping.
+
+        The confidence is the **winner's** score. It used to be ``max`` over every
+        anchor that cleared, which is the same number only when priority does not
+        decide the winner - and priority deciding the winner is exactly the
+        interesting case. A concede menu (priority 10, score 0.75) drawn over a
+        board whose ``in_game`` anchor still matches at 0.95 reported
+        ``Classification(CONCEDE_MENU, 0.95)``: the confidence of a *different*
+        screen. It is read by the halt message, the debug journal and the dashboard
+        (:mod:`hop.runner`), i.e. by everything a human uses to decide whether the
+        classifier is trustworthy - so it had better describe the screen we picked.
+
+        (The module docstring above promises this number feeds ``HumanState``. It
+        does not, yet: only the OCR's ``class_confidence`` does. Fixing that is only
+        safe now that this reports the right anchor's score.)
         """
         best_state = ScreenState.UNKNOWN
-        best_score = 0.0
         best_rank: tuple[int, float] | None = None
+        winner = None
         for anchor in self.anchors:
             m = best_match(frame, anchor.template)
             if not m:
                 continue
-            best_score = max(best_score, m.score)
             rank = (anchor.priority, m.score)
             if best_rank is None or rank > best_rank:
                 best_rank = rank
                 best_state = anchor.state
-        return Classification(best_state, best_score)
+                winner = m
+        if winner is None:
+            return Classification(ScreenState.UNKNOWN, 0.0, None)
+        return Classification(best_state, winner.score, (winner.x, winner.y))
 
     @property
     def has_templates(self) -> bool:

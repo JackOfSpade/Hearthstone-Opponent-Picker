@@ -167,9 +167,7 @@ class Engine:
 
         tx, ty, radius = point.to_px(self.panel)
         before = self._capture()
-        gesture = motor.synth_tap(self.rng, (tx, ty), radius, self.panel,
-                                  self.cfg.motor, self.contact, self.state)
-        near_dup = self.limiter.is_near_duplicate(gesture)
+        gesture = self._synth_non_repeating_tap(tx, ty, radius)
 
         if self.debug:
             # Which control did we aim at? Without this the journal is a list of
@@ -187,30 +185,113 @@ class Engine:
         self.state.tick(self.rng, dt=think + settle, action=("commit" if committing else decision_type))
         self.sleep(settle)
         after = self._capture()
+        if verify_region is None:
+            after = self._await_screen_motion(before, after)
 
         b_v, a_v = self._verify_frames(before, after, verify_region)
         try:
             self.verifier.verify(b_v, a_v, expected_change=expected_change,
-                                 gesture=gesture, near_duplicate=near_dup)
-        except Halt:
-            if allow_correction:
-                # ONE evidence-based correction before failing (L5), not blind retry
-                self.state.note_failed_target((tx, ty))
-                if self.debug:
-                    self.debug.record("single_correction", point=(round(tx), round(ty)))
-                self.sleep(timing.human_delay(self.rng, 0.5, self.cfg.timing))
-                before2 = self._capture()
-                g2 = motor.synth_tap(self.rng, (tx, ty), radius, self.panel,
-                                     self.cfg.motor, self.contact, self.state)
-                self.backend.emit(g2)
-                self.limiter.register_action(committing)
-                self.sleep(timing.human_delay(self.rng, 0.6, self.cfg.timing))
-                after2 = self._capture()
-                b2, a2 = self._verify_frames(before2, after2, verify_region)
-                self.verifier.verify(b2, a2, expected_change=expected_change,
-                                     gesture=g2, near_duplicate=False)
-            else:
+                                 gesture=gesture, near_duplicate=False)
+        except Halt as e:
+            # ONE evidence-based correction before failing (L5), not a blind retry -
+            # and only for the ONE failure that means "the tap missed". The others all
+            # say the screen has ALREADY moved, or that we cannot see it at all:
+            #
+            #   NO_CHANGE       nothing moved  -> the tap missed. Correcting is valid.
+            #   WRONG_CHANGE    it moved, differently -> the tap landed on *something*.
+            #                   Re-tapping the old coordinates puts a second touch into
+            #                   a screen we have not re-read: exactly the blind tap
+            #                   closed-loop navigation exists to prevent.
+            #   NEAR_DUPLICATE  the gesture, not the target, was wrong.
+            #   INCOHERENT      the automation is wrong.
+            #   SIZE_MISMATCH   the display rotated; `tx, ty` are stale coordinates.
+            if not (allow_correction and e.kind == Halt.NO_CHANGE):
                 raise
+            self.state.note_failed_target((tx, ty))
+            if self.debug:
+                self.debug.record("single_correction", point=(round(tx), round(ty)))
+            self.sleep(timing.human_delay(self.rng, 0.5, self.cfg.timing))
+            # the correction is a real action: it must clear the cap gate, be counted,
+            # and be remembered - the old code registered it but never gated or
+            # remembered it, so a committing correction could step past the cap.
+            self.limiter.check_before_action(committing)
+            before2 = self._capture()
+            g2 = self._synth_non_repeating_tap(tx, ty, radius)
+            self.backend.emit(g2)
+            self.limiter.register_action(committing)
+            self.limiter.remember_trajectory(g2)
+            self.sleep(timing.human_delay(self.rng, 0.6, self.cfg.timing))
+            after2 = self._capture()
+            b2, a2 = self._verify_frames(before2, after2, verify_region)
+            self.verifier.verify(b2, a2, expected_change=expected_change,
+                                 gesture=g2, near_duplicate=False)
+
+    def _await_screen_motion(self, before: Frame, after: Frame) -> Frame:
+        """Return the first post-tap frame that differs from ``before``, or ``after``.
+
+        "The screen has not moved" and "the screen has not moved *yet*" are the same
+        picture. `_tap` used to settle for a fixed 0.6 s and then treat the second as
+        the first - and the remedy for a missed tap is another tap. **Looking again is
+        strictly better than tapping again**, and a fixed settle is a bet on the
+        network: screencap costs ~1.0 s over USB and ~1.4 s over Wi-Fi on this phone,
+        and Hearthstone's transitions stretch with it.
+
+        This is what :class:`FrameDeduper` is for. It was constructed in ``__init__``
+        and never called; ``advanced()`` is exactly "did this frame change beyond
+        noise", on a 24x24 signature that suppresses capture noise far better than the
+        full-resolution comparison the verifier does.
+
+        Only for **unscoped** taps. A card tap's whole-frame delta is 4.80 against a
+        9.0 threshold (measured), so the signature cannot see it, and `_replace_card`
+        already owns that retry budget.
+
+        If nothing ever moves we return ``after`` unchanged, so the verifier still
+        raises ``NO_CHANGE`` and the caller's single correction still fires.
+        """
+        self.deduper.reset()
+        self.deduper.advanced(before)          # seed the signature with the pre-tap frame
+        if self.deduper.advanced(after):
+            return after                       # already moved; nothing to wait for
+        for _ in range(max(0, self.cfg.vision.motion_wait_attempts)):
+            self.sleep(timing.human_delay(self.rng, self.cfg.vision.screen_wait_poll_s,
+                                          self.cfg.timing))
+            frame = self._capture()
+            if self.deduper.advanced(frame):
+                if self.debug:
+                    self.debug.record("late_motion", after_extra_looks=True)
+                return frame
+        return after
+
+    def _synth_non_repeating_tap(self, tx: float, ty: float, radius: float) -> Gesture:
+        """Draw a tap gesture that does not near-duplicate a prior trajectory.
+
+        Non-repetition is a **pre-action** gate. It used to be a post-action check:
+        the gesture was synthesized, tested, and emitted *anyway*, and the duplicate
+        only surfaced when :meth:`Verifier.verify` raised afterwards - by which point
+        the touch was on the wire. A gate that runs after the action cannot prevent
+        anything; it can only stop the run.
+
+        And it very nearly did, always. Measured over the real per-game tap sequence
+        (300 seeded runs x 30 actions): **14.2% of taps near-duplicate a prior one**,
+        and 293/300 runs flag at least once, median at tap #13. The engine survives
+        today only because the correction retap re-emits with ``near_duplicate=False``
+        hardcoded - i.e. the blind retap this method's caller is about to stop doing
+        was load-bearing for the loop not halting.
+
+        The remedy is the one :func:`hop.humanize.motor._endpoint_inside` already uses
+        for out-of-disc endpoints: **resample, don't clamp**. Each draw is a fresh
+        endpoint, dwell and micro-slip, so a redraw is genuinely a different gesture,
+        not a nudged one. Eight draws take the emitted-duplicate rate to 0.01%; if all
+        eight still collide, the generator is degenerate and we fail closed.
+        """
+        draws = max(1, self.cfg.caps.non_repetition_resamples)
+        for _ in range(draws):
+            gesture = motor.synth_tap(self.rng, (tx, ty), radius, self.panel,
+                                      self.cfg.motor, self.contact, self.state)
+            if not self.limiter.is_near_duplicate(gesture):
+                return gesture
+        raise Halt(f"could not draw a non-repeating gesture in {draws} attempts; "
+                   "the motor generator has collapsed", Halt.NEAR_DUPLICATE)
 
     def _verify_frames(self, before: Frame, after: Frame,
                        region: Region | None) -> tuple[Frame, Frame]:
@@ -484,11 +565,13 @@ class Engine:
             self.sleep(timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
                                          visual_complexity=0.6) * self.delay_scale)
 
-        self._concede()
+        conceded = self._concede()
         self._clear_end_screens()
         self.limiter.register_game()
         self.stats.games += 1
-        self.stats.concedes += 1
+        # A game that ended on its own was not conceded. `concedes` is the numerator of
+        # the concede/commit ratio the caps exist to keep human - do not inflate it.
+        self.stats.concedes += int(conceded)
 
         # mandatory break?
         brk = self.limiter.needs_break(self.rng)
@@ -550,6 +633,12 @@ class Engine:
         where we are - so halting the hunt would be fail-closed applied where nothing
         is closed. A human who fumbles a card simply keeps it. The *committing* action,
         the concede, remains fully verified.
+
+        **Only ``Halt.NO_CHANGE`` means "the game ignored it."** The loop used to
+        swallow every Halt, so a coherence failure or a non-repetition failure - both
+        of which say the *automation* is wrong, not the game - were retried three
+        times, silently discarded, and counted as ignored card taps. That both hid the
+        real fault and poisoned the one statistic that would have revealed it.
         """
         point, region = self.layout.card_point(center_xf), self.layout.card_region(center_xf)
         attempts = max(1, self.cfg.vision.mulligan_card_tap_attempts)
@@ -559,7 +648,9 @@ class Engine:
                           visual_complexity=0.5, verify_region=region,
                           allow_correction=False, what=f"mulligan_card[{slot}]")
                 return True
-            except Halt:
+            except Halt as e:
+                if e.kind != Halt.NO_CHANGE:
+                    raise
                 if self.debug:
                     self.debug.record("mulligan_card_tap_ignored",
                                       slot=slot, attempt=attempt + 1, of=attempts)
@@ -581,10 +672,20 @@ class Engine:
                 try:
                     self._tap(self.layout.pass_turn_button, committing=False, decision_type="commit",
                               expected_change="partial", allow_correction=False, what="pass_turn")
-                except Halt:
-                    return  # board state moved on; fine, we're conceding anyway
+                except Halt as e:
+                    # Two benign readings, and they are not the same thing:
+                    #   NO_CHANGE     it wasn't our turn, so End Turn did nothing.
+                    #   WRONG_CHANGE  the board moved differently than `partial` - the
+                    #                 game ENDED (a full_transition to the end banner).
+                    # Both mean "stop playing beats". Neither means "keep tapping".
+                    # Everything else - a rotation, an incoherent gesture, a degenerate
+                    # generator - is the automation being wrong, and was being swallowed
+                    # under the same comment before we walked into _concede()'s taps.
+                    if e.kind not in (Halt.NO_CHANGE, Halt.WRONG_CHANGE):
+                        raise
+                    return  # _concede() re-classifies and will skip a finished game
 
-    def _concede(self) -> None:
+    def _concede(self) -> bool:
         """gear -> Concede, then wait for the Game Menu to actually go away.
 
         **There is no confirm button, and there must be no blind tap here.** The
@@ -600,17 +701,48 @@ class Engine:
         wait for the menu to leave, exactly as :meth:`_confirm_mulligan` waits for
         the mulligan, and fail closed if it never does. An UNKNOWN frame is never
         proof that we left - see :meth:`_wait_until_screen_leaves`.
+
+        Returns whether a concede actually happened. The game can end *before* we get
+        here - the opponent concedes, or a lethal lands during ``_play_beats`` - and
+        the board's gear icon is drawn on the victory screen too, so tapping it there
+        opens something we never anchored. There is nothing to concede on an end
+        screen; say so, and let the caller clear it instead of booking a concede that
+        never occurred.
         """
+        cls, _frame = self._classify_settled()
+        if cls.state in self.END_SCREENS:
+            if self.debug:
+                self.debug.record("concede_skipped", reason="game already over",
+                                  state=cls.state.value)
+            return False
+        if cls.state != ScreenState.IN_GAME:
+            raise Halt(f"asked to concede from {cls.state.value!r}, not a live game")
+
         # The gear opens a menu that dims the whole board, so this is a
         # full_transition, not a bottom_sheet (measured: thirds 21.5/21.1/3.7).
         self._tap(self.layout.gear_button, committing=False, decision_type="commit",
                   expected_change="full_transition", what="gear")
+        # ...but `full_transition` does not mean "the Game Menu is up". `_compatible`
+        # admits `top_banner` and `partial` too, so that assertion really only says
+        # "something other than the bottom third moved" - which an opponent's turn
+        # animating behind a *dropped* gear tap also satisfies. Then the loop's single
+        # most consequential tap, the concede, would fire on an unclassified screen at
+        # a coordinate that on the board is not a button at all. Look first.
+        ok, cls, frame = self._wait_until(
+            lambda c, _f: c.state == ScreenState.CONCEDE_MENU, what="gear")
+        if not ok:
+            if cls.state == ScreenState.UNKNOWN:
+                self._record_unknown(frame, where="gear", confidence=round(cls.confidence, 3))
+            raise Halt(f"the gear did not open the Game Menu (saw {cls.state.value!r}); "
+                       "refusing to tap Concede on a screen we did not identify")
+
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                   expected_change="full_transition", what="concede")
         self._wait_until_screen_leaves(
             ScreenState.CONCEDE_MENU, where="concede",
             stuck="Concede did not dismiss the Game Menu; refusing to tap again "
                   "(the entry below Concede is Quit)")
+        return True
 
     #: Screens ``_clear_end_screens`` is allowed to tap ``end_dismiss`` on. The tap is
     #: a fixed point, so the set of screens it may land on has to be closed and named.

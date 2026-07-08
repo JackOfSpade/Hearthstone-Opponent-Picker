@@ -176,6 +176,9 @@ class CapsConfig:
     break_min_minutes: int
     break_max_minutes: int
     non_repetition_threshold: float
+    #: Independent gesture draws before a near-duplicate becomes a Halt. The gate is
+    #: pre-action: resample rather than emit-then-notice. See config.default.toml.
+    non_repetition_resamples: int = 8
 
 
 @dataclass(frozen=True)
@@ -191,6 +194,8 @@ class VisionConfig:
     screen_wait_attempts: int
     screen_wait_timeout_s: float
     screen_wait_poll_s: float
+    #: Extra looks for motion after an unscoped tap, before calling it a missed tap.
+    motion_wait_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
     mulligan_card_tap_attempts: int
