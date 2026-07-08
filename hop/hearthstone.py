@@ -64,7 +64,9 @@ class GameLayout:
     # the control's SMALLER half-dimension, because the FFitts endpoint spread is
     # isotropic and truncated to 0.9*radius - an over-large radius throws taps off
     # short, wide buttons (which is how the old values missed).
-    mulligan_confirm: Point = Point(0.50, 0.87, 0.012)
+    # measured from the Confirm button's blue glow centroid on three real mulligan
+    # frames (both 3-card and 4-card hands agree: 0.5035, 0.876 +/- 0.002)
+    mulligan_confirm: Point = Point(0.5035, 0.876, 0.0125)
     gear_button: Point = Point(0.935, 0.037, 0.0125)
     # In the in-game "Game Menu" the order is Concede / Options / Quit. The old
     # y=0.42 landed between Options and Quit; Concede is the TOP entry at y~0.196.
