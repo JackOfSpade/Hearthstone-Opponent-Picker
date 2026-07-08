@@ -145,6 +145,33 @@ def test_queue_screen_never_taps(cfg):
     assert eng.limiter.actions_this_run == 0
 
 
+def _dispatch_once(cfg, state):
+    """Dispatch one screen state with before/after frames that verify as changed."""
+    adb = FakeAdb()
+    backend = FakeBackend()
+    from hop.geometry import PanelGeometry
+    before = gray_frame(80, 40, 20)
+    after = gray_frame(80, 40, 220)
+    eng = Engine(cfg, adb, backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([state]), reader=None, sleep=lambda s: None,
+                 rng=Random(1), capturer=ScriptedCapturer([before, after]))
+    eng._dispatch(eng.classifier.classify(before), before)
+    return eng, backend
+
+
+def test_error_dialog_is_dismissed_not_halted(cfg):
+    """HS throws a transient 'error starting your game'; dismiss and requeue."""
+    eng, backend = _dispatch_once(cfg, ScreenState.ERROR_DIALOG)
+    assert len(backend.gestures) == 1          # tapped OK
+    # dismissing an error is not a committing action (it is not a concede)
+    assert eng.limiter.commits_this_run == 0
+
+
+def test_deck_select_reopens_the_deck(cfg):
+    eng, backend = _dispatch_once(cfg, ScreenState.DECK_SELECT)
+    assert len(backend.gestures) == 1          # tapped the deck slot
+
+
 def test_main_menu_halts_with_guidance(cfg):
     """The loop queues from the deck's Play screen; the main menu is not it."""
     from hop.verify import Halt

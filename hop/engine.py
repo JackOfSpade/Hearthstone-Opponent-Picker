@@ -250,7 +250,19 @@ class Engine:
 
     def _dispatch(self, cls: Classification, frame: Frame) -> None:
         st = cls.state
-        if st == ScreenState.PLAY_SCREEN:
+        if st == ScreenState.ERROR_DIALOG:
+            # "There was an error starting your game." - a transient network blip.
+            # Dismiss and let the loop requeue; no long backoff is warranted, the
+            # journey's own requeue delay supplies the human pacing.
+            if self.debug:
+                self.debug.record("error_dialog_dismissed")
+            self._tap(self.layout.error_ok, committing=False, decision_type="commit",
+                      expected_change="full_transition")
+        elif st == ScreenState.DECK_SELECT:
+            # dropped back to the deck list (e.g. after an error); reopen the deck
+            self._tap(self.layout.deck_slot, committing=False, decision_type="commit",
+                      expected_change="full_transition")
+        elif st == ScreenState.PLAY_SCREEN:
             # the loop's home state: the deck's Play button queues a game
             self._tap(self.layout.play_button, committing=False, decision_type="commit",
                       expected_change="full_transition", novelty=0.1)

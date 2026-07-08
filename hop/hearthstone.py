@@ -74,6 +74,11 @@ class GameLayout:
     concede_confirm: Point = Point(0.50, 0.56, 0.06)
     end_dismiss: Point = Point(0.50, 0.90, 0.10)
     pass_turn_button: Point = Point(0.80, 0.497, 0.012)
+    # Recovery: the first deck on the deck-select list, and the OK button of
+    # Hearthstone's "There was an error starting your game." dialog (a frequent,
+    # transient network blip - dismiss and requeue; no long backoff needed).
+    deck_slot: Point = Point(0.286, 0.289, 0.02)
+    error_ok: Point = Point(0.495, 0.667, 0.02)
 
     def card_slot(self, slot: int, num_cards: int, panel: PanelGeometry) -> Point:
         """Center of mulligan card ``slot`` given the layout has ``num_cards``.

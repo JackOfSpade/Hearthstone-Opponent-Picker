@@ -257,7 +257,7 @@ def cmd_capture(args) -> int:
     meta["anchors"] = [a for a in meta["anchors"] if a["state"] != state]
     meta["anchors"].append({
         "state": state, "image": img_name, "region": region,
-        "threshold": args.threshold,
+        "threshold": args.threshold, "priority": args.priority,
     })
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"saved {state} anchor -> {pack_dir/img_name} (search region {[round(v,4) for v in region]})")
@@ -527,6 +527,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--from-file", dest="from_file",
                     help="build the anchor from a saved PNG instead of a live screencap")
     sp.add_argument("--threshold", type=float, default=0.72)
+    sp.add_argument("--priority", type=int, default=0,
+                    help="higher wins when several anchors match (modal dialogs > screens)")
     sp.set_defaults(func=cmd_capture)
 
     sp = sub.add_parser("calibrate", help="measure panel/report-rate into user config")
