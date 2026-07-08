@@ -294,6 +294,65 @@ def test_reconnect_taps_reconnect_and_never_cancel(cfg):
     assert max(xs) / panel_w < 0.5, "tap drifted past center toward Cancel"
 
 
+class _StuckCardCapturer:
+    """Captures never change: every card tap looks ignored."""
+
+    def capture(self):
+        return gray_frame(80, 40, 60)
+
+
+def _mulligan_engine(cfg, capturer):
+    from hop.geometry import PanelGeometry
+    return Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                  FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                  sleep=lambda s: None, rng=Random(2), capturer=capturer)
+
+
+def test_an_ignored_card_tap_retries_then_keeps_the_card(cfg):
+    """Hearthstone accepts card taps only intermittently; never halt the hunt on one.
+
+    We are still on the mulligan and know exactly where we are, so this is not the
+    unknown state that fail-closed exists for. Retry, then keep the card.
+    """
+    eng = _mulligan_engine(cfg, _StuckCardCapturer())
+    took = eng._replace_card(slot=0, center_xf=0.25, decision_type="reject")
+    assert took is False
+    assert eng.stats.ignored_card_taps == 1
+    assert len(eng.backend.gestures) == cfg.vision.mulligan_card_tap_attempts
+
+
+def test_a_card_tap_that_takes_stops_retrying(cfg):
+    class _TogglesOnFirstTap:
+        def __init__(self):
+            self.n = 0
+
+        def capture(self):
+            self.n += 1
+            # before, then a clearly-changed after
+            return gray_frame(80, 40, 20 if self.n % 2 else 220)
+
+    eng = _mulligan_engine(cfg, _TogglesOnFirstTap())
+    assert eng._replace_card(slot=1, center_xf=0.5, decision_type="reject") is True
+    assert eng.stats.ignored_card_taps == 0
+    assert len(eng.backend.gestures) == 1
+
+
+def test_card_taps_are_verified_against_the_card_not_the_screen(cfg):
+    """Regression: a whole-frame check called a real toggle 'no screen change'.
+
+    Measured on the phone: marking a card moves the whole frame by 4.80 (threshold
+    9.0) and the card's own rectangle by 24.24. Only the scoped check can see it.
+    """
+    from hop.hearthstone import GameLayout
+
+    layout = GameLayout()
+    region = layout.card_region(0.25)
+    assert region.wf == pytest.approx(layout.card_inner_w_f)
+    assert region.hf == pytest.approx(layout.card_row.hf)
+    # centred on the card, not on the screen
+    assert region.xf + region.wf / 2 == pytest.approx(0.25, abs=1e-6)
+
+
 def test_main_menu_halts_with_guidance(cfg):
     """The loop queues from the deck's Play screen; the main menu is not it."""
     from hop.verify import Halt

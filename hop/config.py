@@ -188,6 +188,7 @@ class VisionConfig:
     unknown_settle_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
+    mulligan_card_tap_attempts: int
     glow_green_bias: int
     glow_min_green: int
     glow_col_min_frac: float

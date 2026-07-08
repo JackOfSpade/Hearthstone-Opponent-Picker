@@ -112,7 +112,7 @@ tremor_theta = 40.0                # OU reversion rate
 report_rate_hz = 180               # LIVE-VERIFY: modern panels run 240/720/1200/2000
 tap_dwell_median_s = 0.13          # lognormal down->up
 tap_dwell_sigma = 0.25
-tap_dwell_min_s = 0.04
+tap_dwell_min_s = 0.06             # LIVE-VERIFIED: no real contact was under 65ms
 tap_dwell_max_s = 0.35
 tap_micro_slip_px = 2.5            # finger-pad settle-and-slide on impact
 
@@ -186,6 +186,13 @@ reconnecting_wait_attempts = 12
 # ...and make at most this many Reconnect taps per run. A reconnect that keeps
 # failing means the network or the account needs a human, so fail closed.
 reconnect_attempt_cap = 3
+# Hearthstone accepts a mulligan card tap only intermittently: on a live mulligan,
+# six identical taps at the same pixel (endpoint spread 4-6px) toggled the card
+# twice, and each success was followed by an ignored tap -- a post-toggle debounce,
+# not a property of our touch. Retry a bounded number of times, then KEEP the card:
+# a card that won't toggle is not an unknown state (we are still on the mulligan),
+# so halting the hunt over it would be fail-closed applied where nothing is closed.
+mulligan_card_tap_attempts = 3
 # Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
 # The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
 # which this replaced - card artwork cannot fake it. A strip must span most of the

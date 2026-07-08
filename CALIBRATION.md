@@ -174,7 +174,30 @@ the numbers don't.
 | Gear-tap change kind | `bottom_sheet` | **`full_transition`** | Halted every concede. |
 | Card-replace tap | whole-frame verify | **region-scoped verify** | Whole-frame delta 4.80 < threshold 9.0 → "missed tap". |
 | `concede_menu` priority | 0 | **10** | The menu draws over the board, so `in_game` won and the loop never conceded. |
+| UHID `TOUCH_MAJOR` max | 255 | **2399** (the panel's) | Hearthstone silently ignored every tap on a mulligan card. |
+| `contact.pressure_floor` | 0.22 | **0.52** | Under half the real touch-down pressure. |
+| `contact_major_peak` | 0.55 | **0.12** | ~6× a real contact. |
 | `in_game` anchor | End Turn *plate* | End Turn **housing** | Plate reads "ENEMY TURN" on their turn — i.e. exactly when a going-second game starts. |
+
+### Clone the panel's *axes*, not just its name
+
+Android loads a touch device's calibration (`<name>.idc`) **by name** and applies it
+to our reports. Cloning `goodix_ts0`'s name while declaring `TOUCH_MAJOR` max 255
+(the panel says 2399) means the framework sizes our contact against the wrong
+scale. Hearthstone then ignored every mulligan-card tap while still honouring every
+button tap — and the tap reached the kernel with correct coordinates, a clean
+`BTN_TOUCH DOWN/UP` and a `TRACKING_ID -1` lift. `adb input tap` on the same pixel
+worked, because it injects a MotionEvent above `/dev/input`.
+
+`hop` now reads the panel's ranges from `getevent -pl` at `open()`. If you ever
+change `[uhid] device_name`, re-check them:
+
+```sh
+adb shell getevent -pl | sed -n '/goodix/,/input props/p'   # TOUCH_MAJOR/MINOR/PRESSURE maxima
+```
+
+Beware the self-clone: once registered, the virtual device carries the panel's name
+too, and `getevent` lists it first. `hop` takes the lowest event number.
 
 Two hazards worth carrying to any future device:
 

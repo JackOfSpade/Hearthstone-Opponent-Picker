@@ -401,25 +401,7 @@ class Engine:
         # perform a plausible mulligan: replace the chosen cards, deliberating each
         for d in plan.mulligan:
             if d.replace and d.slot < len(read.card_centers_f):
-                center = read.card_centers_f[d.slot]
-                # Marking a card for replacement redraws only that card, which is far
-                # below the whole-frame change threshold. Verify the card's own pixels.
-                #
-                # A card that refuses to toggle is NOT an unknown state: we are still
-                # on the mulligan, we know exactly where we are, and a human who fails
-                # to flick a card simply keeps it. Halting the hunt over that would be
-                # fail-closed applied where nothing is closed. Record it and move on -
-                # the *committing* action (the concede) is still fully verified.
-                try:
-                    self._tap(self.layout.card_point(center), committing=False,
-                              decision_type=d.decision_type, visual_complexity=0.5,
-                              verify_region=self.layout.card_region(center),
-                              allow_correction=False, what=f"mulligan_card[{d.slot}]")
-                except Halt as e:
-                    if self.debug:
-                        self.debug.record("mulligan_card_tap_ignored",
-                                          slot=d.slot, reason=str(e))
-                    self.stats.ignored_card_taps += 1
+                self._replace_card(d.slot, read.card_centers_f[d.slot], d.decision_type)
         # confirm the mulligan
         self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
                   expected_change="full_transition", what="mulligan_confirm")
@@ -448,6 +430,46 @@ class Engine:
 
         # randomized requeue delay (humans don't requeue instantly)
         self.sleep(timing.human_delay(self.rng, 12.0, self.cfg.timing) * self.delay_scale)
+
+    def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
+        """Mark one mulligan card for replacement. Returns whether it took.
+
+        Two things make this unlike every other tap.
+
+        **It changes only that card.** Marking it redraws the card and nothing else:
+        measured whole-frame mean-abs-diff 4.80 against a 9.0 threshold, versus 24.24
+        inside the card's own rectangle. So verification is scoped to the pixels the
+        tap was aimed at - the honest question, and a stricter one, because a tap that
+        misses the card leaves the card unchanged and still fails.
+
+        **Hearthstone accepts it only intermittently.** On a live mulligan, six
+        identical taps at the same pixel (endpoint spread 4-6px) toggled the card
+        twice, and every success was followed by an ignored tap. That is a post-toggle
+        debounce in the game, not a property of our touch: the same taps land on
+        buttons every time, and the kernel sees a clean DOWN/UP with correct
+        coordinates. So retry a bounded number of times.
+
+        If it still won't take, **keep the card and carry on**. A card that refuses to
+        toggle is not an unknown state - we are still on the mulligan and know exactly
+        where we are - so halting the hunt would be fail-closed applied where nothing
+        is closed. A human who fumbles a card simply keeps it. The *committing* action,
+        the concede, remains fully verified.
+        """
+        point, region = self.layout.card_point(center_xf), self.layout.card_region(center_xf)
+        attempts = max(1, self.cfg.vision.mulligan_card_tap_attempts)
+        for attempt in range(attempts):
+            try:
+                self._tap(point, committing=False, decision_type=decision_type,
+                          visual_complexity=0.5, verify_region=region,
+                          allow_correction=False, what=f"mulligan_card[{slot}]")
+                return True
+            except Halt:
+                if self.debug:
+                    self.debug.record("mulligan_card_tap_ignored",
+                                      slot=slot, attempt=attempt + 1, of=attempts)
+                self.sleep(timing.human_delay(self.rng, 0.7, self.cfg.timing))
+        self.stats.ignored_card_taps += 1
+        return False
 
     def _play_beats(self, plan: journey.RejectPlan) -> None:
         """A few plausible 'reading the board / passing turn' beats before bailing.
