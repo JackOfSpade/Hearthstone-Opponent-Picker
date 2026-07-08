@@ -45,6 +45,7 @@ import time
 
 from ..config import UhidConfig
 from ..geometry import PanelGeometry
+from ..orientation import display_to_native
 from ..touchstream import Gesture, TouchSample
 from . import hid_descriptor as hd
 from .base import TouchBackend
@@ -106,6 +107,10 @@ class UhidBackend(TouchBackend):
             raise RuntimeError("UhidBackend.emit before open()")
         panel = self._panel
         assert panel is not None
+        # Gestures are synthesized in DISPLAY space; the panel is native. Rotate
+        # each sample to native here, keyed on the live rotation (re-read per
+        # gesture so a landscape flip mid-run is handled).
+        rotation = self._current_rotation()
         active: dict[int, hd.ContactReport] = {}
         prev_t = gesture.samples[0].t if gesture.samples else 0.0
 
@@ -116,7 +121,7 @@ class UhidBackend(TouchBackend):
                 self._send({"id": 1, "command": "delay", "duration": dt_ms})
                 prev_t = s.t
 
-            rep = self._sample_to_report(s, panel)
+            rep = self._sample_to_report(s, panel, rotation)
             active[s.pointer_id] = rep
             self._send({
                 "id": 1,
@@ -145,11 +150,21 @@ class UhidBackend(TouchBackend):
 
     # ── encoding ─────────────────────────────────────────────────────────────
 
-    def _sample_to_report(self, s: TouchSample, panel: PanelGeometry) -> hd.ContactReport:
+    def _current_rotation(self) -> int:
+        """Live display rotation (0..3); falls back to 0 if the adb handle can't
+        report it (e.g. the transport unit tests' fake)."""
+        try:
+            return int(self.adb.get_rotation())
+        except Exception:
+            return 0
+
+    def _sample_to_report(self, s: TouchSample, panel: PanelGeometry,
+                          rotation: int) -> hd.ContactReport:
+        nx, ny = display_to_native(s.x, s.y, rotation, panel.width_px, panel.height_px)
         return hd.ContactReport(
             contact_id=s.pointer_id,
-            x=max(0, min(panel.width_px - 1, int(round(s.x)))),
-            y=max(0, min(panel.height_px - 1, int(round(s.y)))),
+            x=max(0, min(panel.width_px - 1, int(round(nx)))),
+            y=max(0, min(panel.height_px - 1, int(round(ny)))),
             pressure=int(round(max(0.0, min(1.0, s.pressure)) * 255)),
             major=int(round(max(0.0, min(1.0, s.major)) * 255)),
             minor=int(round(max(0.0, min(1.0, s.minor)) * 255)),

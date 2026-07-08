@@ -112,6 +112,37 @@ class Adb:
         dpi = _parse_density(density)
         return PanelGeometry(width_px=w, height_px=h, dpi=dpi)
 
+    def get_rotation(self) -> int:
+        """Current display rotation (0,1,2,3 == 0/90/180/270) of the internal
+        display, as the input system sees it - this is the rotation the
+        framework applies to our virtual touchscreen's raw coordinates.
+
+        Primary source is the INTERNAL viewport in ``dumpsys input`` (the input
+        system's own source of truth), which on modern Android prints
+        ``Viewport INTERNAL: ... orientation=3``. Falls back to older viewport
+        formatting and then to ``dumpsys window``'s ``mDisplayRotation``.
+        Defaults to 0 if nothing parses.
+        """
+        import re
+        try:
+            out = self.shell("dumpsys input")
+            for pat in (r"Viewport INTERNAL:[^\n]*?orientation=(\d)",
+                        r"DisplayViewport\{type=INTERNAL.*?orientation=(\d)"):
+                m = re.search(pat, out, re.DOTALL)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        try:
+            win = self.shell("dumpsys window")
+            m = re.search(r"mDisplayRotation=ROTATION_(\d+)", win) or \
+                re.search(r"\bmRotation=ROTATION_(\d+)", win)
+            if m:
+                return {0: 0, 90: 1, 180: 2, 270: 3}.get(int(m.group(1)), 0)
+        except Exception:
+            pass
+        return 0
+
     def screencap_png(self) -> bytes:
         """Raw PNG bytes of the current screen (works while backgrounded)."""
         return self.exec_out("screencap -p")

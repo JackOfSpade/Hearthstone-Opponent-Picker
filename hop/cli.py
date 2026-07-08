@@ -31,8 +31,10 @@ from .alerts import Alerter
 from .config import Config, load_config, profile_multipliers
 from .debuglog import DebugLog
 from .engine import Engine
+from .geometry import PanelGeometry
 from .hearthstone import GameLayout
 from .hero_classes import parse_class
+from .orientation import display_size
 from .perception.ocr import ClassReader, tesseract_available
 from .perception.screens import ScreenState, load_template_pack
 from .transport import make_backend
@@ -62,21 +64,32 @@ def build_engine(cfg: Config, *, pack_dir: Path, debug_dir: Path | None = None,
         adb.stay_awake(True)
     except Exception:
         pass
-    panel = adb.measure_panel()
+    # measure_panel() is the NATIVE (portrait) panel - the UHID descriptor space.
+    # Hearthstone runs landscape, so perception + the engine work in the rotated
+    # DISPLAY geometry; the transport rotates display->native at emit.
+    native = adb.measure_panel()
+    display = _display_geometry(adb, native)
 
     backend = make_backend(cfg.device.touch_backend, adb, cfg.uhid)
-    backend.open(panel)
+    backend.open(native)   # descriptor in native space; backend rotates samples
 
     classifier = load_template_pack(pack_dir)
     reader = ClassReader(cfg.vision.ocr_max_edit_distance)
     debug = DebugLog(debug_dir) if debug_dir else None
 
     return Engine(
-        cfg, adb, backend, panel, classifier, reader,
+        cfg, adb, backend, display, classifier, reader,
         alerts=alerter, debug=debug,
         rng=Random(seed) if seed is not None else Random(),
         layout=GameLayout(),
     )
+
+
+def _display_geometry(adb, native: PanelGeometry) -> PanelGeometry:
+    """The current on-screen (possibly rotated) geometry perception works in."""
+    rotation = adb.get_rotation()
+    dw, dh = display_size(native.width_px, native.height_px, rotation)
+    return PanelGeometry(width_px=dw, height_px=dh, dpi=native.dpi)
 
 
 def _apply_overrides(cfg: Config, overrides: dict) -> Config:
@@ -252,20 +265,27 @@ def cmd_test_click(args) -> int:
     cfg = load_config(args.config)
     adb = Adb(cfg.device.adb_address)
     adb.connect()
-    panel = adb.measure_panel()
+    native = adb.measure_panel()
+    display = _display_geometry(adb, native)
     backend = make_backend(cfg.device.touch_backend, adb, cfg.uhid)
-    backend.open(panel)
+    backend.open(native)   # descriptor native; backend rotates display->native
     try:
         from .humanize.contact import ContactModel
         from .humanize.motor import synth_tap
         from .humanize.state import HumanState
         xf, yf = (float(v) for v in args.at.split(","))
-        target = (xf * panel.width_px, yf * panel.height_px)
-        g = synth_tap(Random(), target, 0.03 * panel.width_px, panel, cfg.motor,
+        # target is a DISPLAY-space fraction (what you see on the landscape screen)
+        target = (xf * display.width_px, yf * display.height_px)
+        g = synth_tap(Random(), target, 0.03 * display.width_px, display, cfg.motor,
                       ContactModel(cfg.contact), HumanState())
-        print(f"emitting tap at ({target[0]:.0f},{target[1]:.0f}) via "
+        print(f"emitting tap at display ({target[0]:.0f},{target[1]:.0f}) "
+              f"[{display.width_px}x{display.height_px} rot={adb.get_rotation()}] via "
               f"{type(backend).__name__} (fidelity={backend.fidelity})")
         backend.emit(g)
+        # Let the release dispatch before we tear the device down, otherwise a
+        # single test tap can be canceled (the engine keeps the device open, so
+        # this only matters for the one-shot test-click).
+        time.sleep(0.4)
         print("done - watch the phone; if nothing happened, check UHID/SELinux or use touch_backend=adb")
     finally:
         backend.close()
