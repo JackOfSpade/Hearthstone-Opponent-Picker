@@ -136,8 +136,12 @@ class _AppState:
             reason = st.get("stop_reason")
             return f"Idle ({reason})" if reason else "Idle"
         b = st.get("budget") or {}
-        return (f"Hunting · {st.get('games', 0)} games · "
+        text = (f"Hunting · {st.get('games', 0)} games · "
                 f"{b.get('concedes_run', 0)}/{b.get('concedes_cap', '?')} concedes")
+        ignored = st.get("ignored_card_taps") or 0
+        if ignored:
+            text += f" · {ignored} card taps ignored"
+        return text
 
     def risk_text(self) -> str:
         crit = self.cfg.criteria

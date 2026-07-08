@@ -82,6 +82,9 @@ class EngineController:
             "target_found": s.target_found,
             "last_opponent": s.last_opponent,
             "stop_reason": s.stop_reason,
+            # Non-fatal, but a rising count means our touch profile is drifting from
+            # what Hearthstone accepts. Surface it rather than let it stay silent.
+            "ignored_card_taps": s.ignored_card_taps,
             "human_state": {
                 "attention": round(st.attention, 2),
                 "confidence": round(st.confidence, 2),
