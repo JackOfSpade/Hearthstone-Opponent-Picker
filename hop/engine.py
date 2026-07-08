@@ -260,7 +260,8 @@ class Engine:
             raise Halt(f"unknown screen (best confidence {cls.confidence:.2f})")
 
     def _handle_mulligan(self, frame: Frame) -> None:
-        read = self._read_mulligan(frame, self.layout, self.reader, self.gem_template)
+        read = self._read_mulligan(frame, self.layout, self.reader,
+                                   self.cfg.vision, self.gem_template)
         self.state.observe_confidence(read.class_confidence)
         self.stats.last_opponent = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
         if self.debug:
@@ -273,7 +274,8 @@ class Engine:
             # a single re-read before halting (perception fallibility, one correction)
             self.sleep(timing.human_delay(self.rng, 0.8, self.cfg.timing))
             frame2 = self._capture()
-            read = self._read_mulligan(frame2, self.layout, self.reader, self.gem_template)
+            read = self._read_mulligan(frame2, self.layout, self.reader,
+                                       self.cfg.vision, self.gem_template)
             decision = evaluate_matchup(read, self.cfg)
             if decision == "unusable":
                 raise Halt(f"could not read mulligan (class={read.class_raw!r}, cards={read.num_cards})")

@@ -43,11 +43,16 @@ class Point:
 class GameLayout:
     """Screen-fraction geometry of the Hearthstone mobile UI. LIVE-VERIFY all."""
 
-    # opponent is bottom-left; class label is the line under the portrait
+    # opponent is bottom-left; class label is the line under the portrait.
+    # LIVE-VERIFIED: reads the OPPONENT's class (you are bottom-right).
     opponent_class_region: Region = Region(0.03, 0.90, 0.20, 0.07)
     # the band across the mulligan card row where the mana gems sit (top of cards)
-    mana_gem_row: Region = Region(0.14, 0.24, 0.72, 0.10)
-    # the whole card row, for the peak-count fallback
+    # LIVE-VERIFY (2400x1080): gems occupy y ~300-400.
+    mana_gem_row: Region = Region(0.12, 0.275, 0.76, 0.10)
+    # a single mana gem's width as a fraction of screen width (~86px @ 2400 wide).
+    # Used to reject blue *card art* (far wider) from the gem mask. LIVE-VERIFY.
+    gem_width_f: float = 0.0358
+    # the whole card row, for the brightness fallback
     card_row: Region = Region(0.12, 0.24, 0.76, 0.45)
 
     # action points (center + hit radius, screen fractions)
@@ -96,21 +101,82 @@ class MulliganRead:
         return self.opponent_class is not None and self.num_cards in (3, 4)
 
 
+def _count_mana_gems(frame: Frame, layout: GameLayout, vision) -> int | None:
+    """Count blue mana gems in the gem row; ``None`` if colour is unavailable.
+
+    Each mulligan card carries exactly one blue mana gem and gems never merge, so
+    they are the reliable count. We mask pixels whose blue channel dominates red
+    and green, project the mask onto columns, and keep only runs whose width
+    matches a gem. That width filter is what makes this robust: blue *card art*
+    also masks blue, but produces runs several times wider (measured 254/269px
+    vs a gem's 86px), and highlights produce slivers.
+
+    NCC-matching a gem *template* does not work here - the gem's digit differs
+    per card (3/2/9/7), which destroys the correlation.
+    """
+    rgb = getattr(frame, "rgb", None)
+    if rgb is None:
+        return None
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover - numpy is a vision extra
+        return None
+
+    rx, ry, rw, rh = layout.mana_gem_row.to_px(frame)
+    band = rgb[ry:ry + rh, rx:rx + rw]
+    if band.size == 0:
+        return None
+    r = band[:, :, 0].astype(np.int16)
+    g = band[:, :, 1].astype(np.int16)
+    b = band[:, :, 2].astype(np.int16)
+    bias = vision.gem_blue_bias
+    mask = (b > r + bias) & (b > g + bias) & (b > vision.gem_min_blue)
+
+    col = mask.sum(axis=0)
+    peak = int(col.max()) if col.size else 0
+    if peak <= 0:
+        return 0
+    thresh = max(1, int(peak * vision.gem_col_min_frac))
+
+    expected = layout.gem_width_f * frame.width
+    lo = expected * (1.0 - vision.gem_width_tolerance)
+    hi = expected * (1.0 + vision.gem_width_tolerance)
+
+    count = run = 0
+    for v in col:
+        if v >= thresh:
+            run += 1
+        else:
+            if lo <= run <= hi:
+                count += 1
+            run = 0
+    if lo <= run <= hi:
+        count += 1
+    return count
+
+
 def count_mulligan_cards(
     frame: Frame,
     layout: GameLayout,
+    vision=None,
     gem_template: Template | None = None,
 ) -> int:
     """Return the number of mulligan cards (expected 3 or 4).
 
-    Primary: count mana-gem matches across the gem-row band (each card has
-    exactly one blue mana gem; gems never merge). Fallback (no template): count
-    brightness "humps" across the card row - cards are bright/colorful, the gaps
-    between them and the table beyond are dark.
+    Primary: count the blue mana gems (:func:`_count_mana_gems`) - one per card,
+    never merging. Fallback: count brightness "humps" across the card row. The
+    fallback is **unreliable** (a dark-art card can sit entirely below the
+    brightness threshold and be skipped, which is how a 4-card hand was once
+    counted as 3), so it is used only when colour is unavailable or the gem count
+    is implausible; an implausible count then fails closed via ``MulliganRead``.
     """
     if gem_template is not None:
         matches: list[Match] = match_all(frame, gem_template, stride=2)
         return len(matches)
+    if vision is not None:
+        n = _count_mana_gems(frame, layout, vision)
+        if n in (3, 4):
+            return n
     return _peak_count_cards(frame, layout.card_row)
 
 
@@ -151,13 +217,19 @@ def read_mulligan(
     frame: Frame,
     layout: GameLayout,
     reader: ClassReader,
+    vision=None,
     gem_template: Template | None = None,
 ) -> MulliganRead:
-    """Extract opponent class + going-second from a mulligan frame."""
+    """Extract opponent class + going-second from a mulligan frame.
+
+    ``vision`` is the :class:`~hop.config.VisionConfig`; it carries the mana-gem
+    thresholds used to count cards. Without it we fall back to the unreliable
+    brightness counter, so the engine always passes it.
+    """
     rx, ry, rw, rh = layout.opponent_class_region.to_px(frame)
     label = frame.crop(rx, ry, rw, rh)
     cr: ClassRead = reader.read(label)
-    num = count_mulligan_cards(frame, layout, gem_template)
+    num = count_mulligan_cards(frame, layout, vision, gem_template)
     return MulliganRead(
         opponent_class=cr.hero_class,
         we_go_second=(num >= 4),

@@ -153,6 +153,14 @@ dedupe_signature_size = 24         # NxN downsample for frame-advance detection
 ncc_match_threshold = 0.72         # normalized cross-correlation accept level
 ocr_max_edit_distance = 3          # snap-to-class fails closed beyond this
 weak_match_margin = 0.08           # match this-close to threshold => low confidence -> inspect
+# Mulligan card counting: each card carries exactly one blue mana gem, and gems
+# never merge. We mask blue pixels in the gem row and keep column-runs whose
+# width matches a gem, which rejects blue *card art* (much wider) and slivers.
+# LIVE-VERIFY on your resolution: measured gem width ~86px on 2400x1080.
+gem_blue_bias = 30                 # blue must exceed red AND green by this much
+gem_min_blue = 90                  # ...and be at least this bright
+gem_col_min_frac = 0.15            # a column counts if >=this fraction of band rows are blue
+gem_width_tolerance = 0.30         # accept runs within +/- this fraction of the gem width
 
 [calibration]
 # Filled in by `hop calibrate`. device/date/tester provenance for the values
