@@ -402,9 +402,7 @@ class Engine:
         for d in plan.mulligan:
             if d.replace and d.slot < len(read.card_centers_f):
                 self._replace_card(d.slot, read.card_centers_f[d.slot], d.decision_type)
-        # confirm the mulligan
-        self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
-                  expected_change="full_transition", what="mulligan_confirm")
+        self._confirm_mulligan()
 
         # play into the game to the chosen concede point (never insta-concede)
         if plan.concede_point in ("turn1", "turn2"):
@@ -430,6 +428,28 @@ class Engine:
 
         # randomized requeue delay (humans don't requeue instantly)
         self.sleep(timing.human_delay(self.rng, 12.0, self.cfg.timing) * self.delay_scale)
+
+    def _confirm_mulligan(self) -> None:
+        """Tap Confirm, then wait for the mulligan to actually go away.
+
+        Confirming is **asynchronous**: the cards fly off and the board draws in over
+        a second or more. Within the tap's settle window only the bottom of the
+        screen has moved, so demanding ``full_transition`` fails on a confirm that
+        worked (measured: ``bottom_sheet``). And the single-correction retap then
+        fires *after* the mulligan is already confirmed - a blind tap into a live
+        game, which is precisely what closed-loop navigation exists to prevent.
+
+        So: require only that something changed, never correct, and then verify the
+        real semantic end-state - that we are no longer on the mulligan - by looking.
+        """
+        self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
+                  expected_change=None, allow_correction=False, what="mulligan_confirm")
+        for _ in range(max(1, self.cfg.vision.unknown_settle_attempts)):
+            cls, _frame = self._classify()
+            if cls.state != ScreenState.MULLIGAN:
+                return
+            self.sleep(timing.human_delay(self.rng, 1.0, self.cfg.timing))
+        raise Halt("mulligan Confirm did not dismiss the mulligan")
 
     def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
         """Mark one mulligan card for replacement. Returns whether it took.

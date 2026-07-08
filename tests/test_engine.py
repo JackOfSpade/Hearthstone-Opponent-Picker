@@ -361,3 +361,24 @@ def test_main_menu_halts_with_guidance(cfg):
     with pytest.raises(Halt):
         eng._dispatch(eng.classifier.classify(frame), frame)
     assert backend.gestures == []
+
+
+def test_mulligan_confirm_waits_for_the_mulligan_to_leave(cfg):
+    """Confirming is asynchronous: within the settle window only the bottom moves.
+
+    Regression: demanding `full_transition` halted on a confirm that had worked
+    (measured `bottom_sheet`), and the single-correction retap then fired *after* the
+    mulligan was already confirmed -- a blind tap into a live game.
+    """
+    eng, backend = _reconnect_engine(
+        cfg, [ScreenState.MULLIGAN, ScreenState.IN_GAME])
+    eng._confirm_mulligan()
+    assert len(backend.gestures) == 1, "must not emit a correction tap into a live game"
+
+
+def test_mulligan_confirm_halts_if_the_mulligan_never_leaves(cfg):
+    from hop.verify import Halt
+
+    eng, _ = _reconnect_engine(cfg, [ScreenState.MULLIGAN])
+    with pytest.raises(Halt, match="did not dismiss"):
+        eng._confirm_mulligan()
