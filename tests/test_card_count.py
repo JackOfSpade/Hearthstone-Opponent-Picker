@@ -1,85 +1,124 @@
-"""Tests for mulligan card counting via blue mana gems.
+"""Mulligan card counting: 3 cards = we go first, 4 = we go second.
 
-Live capture caught the old brightness peak-count reporting **3** on a real
-4-card hand (a dark-art card never crossed the brightness threshold), which would
-invert the going-second signal. The gem counter masks blue pixels in the gem row
-and keeps only column-runs of gem width, so blue *card art* (much wider) and
-specular slivers are rejected. These tests pin that behaviour on synthetic frames
-with the same geometry as a 2400-wide landscape screen.
+A wrong count silently inverts ``require_second``, so this is the highest-stakes
+pure function in the project. It is tested against **real captured frames**.
+
+That is not a stylistic preference. The two previous implementations - masking the
+blue mana gems, and counting brightness "humps" - each passed a full suite of
+synthetic unit tests that drew idealised gems and bars, and each was then observed
+to return **3 on a real 4-card hand**. Synthetic fixtures tested the implementation
+against its own assumptions. The frames below came off the phone:
+
+* ``mulligan_4card_a`` - Knickknack Shack / Bob the Bartender / 2x Shield Battery
+* ``mulligan_4card_b`` - Kologarn / Scrapyard Colossus / Colossus of the Moon /
+  Darkmoon Rabbit. This is the hand that broke gem-masking: the "10" digits punch
+  holes through their own gems, and the Colossus's blue sky (``b-g=21``) is
+  indistinguishable by colour from a real mana gem (``b-g=22``).
+
+Frames are downscaled to 600px wide; the counter works in screen fractions, so it
+is resolution-independent and the small fixtures exercise the same code path.
 """
 
-import numpy as np
+import io
+from pathlib import Path
+
 import pytest
 
-from hop.config import load_config
-from hop.hearthstone import GameLayout, _count_mana_gems, count_mulligan_cards
+from hop.hearthstone import GameLayout, count_mulligan_cards, glow_strip_centers
 from hop.perception.image import Frame
 
-W, H = 2400, 200          # gem band lands inside this height
-GEM_W = 86                # ~ gem_width_f * 2400
-BLUE = (30, 60, 200)      # blue-dominant
-GREY = (120, 120, 120)
+FRAMES = Path(__file__).parent / "data" / "frames"
+FOUR_CARD = ["mulligan_4card_a", "mulligan_4card_b"]
 
 
 @pytest.fixture
-def vision():
-    return load_config().vision
+def layout():
+    return GameLayout()
 
 
-def _frame(runs):
-    """Build a frame whose gem band contains blue rects: runs = [(x, width), ...]"""
-    layout = GameLayout()
-    rgb = np.zeros((H, W, 3), dtype=np.uint8)
-    rgb[:, :] = GREY
-    y0 = int(0.275 * H)
-    y1 = y0 + int(0.10 * H)
-    for x, w in runs:
-        rgb[y0:y1, x:x + w] = BLUE
-    gray = rgb.mean(axis=2).astype(np.uint8)
-    return Frame(W, H, gray, rgb), layout
+def _frame(name: str) -> Frame:
+    return Frame.from_png((FRAMES / f"{name}.png").read_bytes(), keep_rgb=True)
 
 
-def test_counts_four_gems(vision):
-    f, layout = _frame([(400, GEM_W), (800, GEM_W), (1200, GEM_W), (1600, GEM_W)])
-    assert _count_mana_gems(f, layout, vision) == 4
-    assert count_mulligan_cards(f, layout, vision) == 4
+@pytest.mark.parametrize("name", FOUR_CARD)
+def test_counts_a_real_four_card_hand(name, layout, cfg):
+    assert count_mulligan_cards(_frame(name), layout, cfg.vision) == 4
 
 
-def test_counts_three_gems(vision):
-    f, layout = _frame([(600, GEM_W), (1100, GEM_W), (1600, GEM_W)])
-    assert _count_mana_gems(f, layout, vision) == 3
-    assert count_mulligan_cards(f, layout, vision) == 3
+@pytest.mark.parametrize("name", FOUR_CARD)
+def test_four_cards_produce_five_glow_strips(name, layout, cfg):
+    """Adjacent cards share one glow strip, and the hand's edges add one each."""
+    assert len(glow_strip_centers(_frame(name), layout, cfg.vision)) == 5
 
 
-def test_rejects_wide_blue_card_art(vision):
-    """Blue art masks blue too, but is several gem-widths wide."""
-    f, layout = _frame([(400, GEM_W), (800, GEM_W), (1300, 260)])
-    assert _count_mana_gems(f, layout, vision) == 2
+@pytest.mark.parametrize("name", FOUR_CARD)
+def test_glow_strips_are_evenly_pitched(name, layout, cfg):
+    frame = _frame(name)
+    centers = glow_strip_centers(frame, layout, cfg.vision)
+    expected = layout.card_pitch_f * frame.width
+    for a, b in zip(centers, centers[1:]):
+        assert (b - a) == pytest.approx(expected, rel=cfg.vision.card_pitch_tolerance)
 
 
-def test_rejects_thin_specular_slivers(vision):
-    f, layout = _frame([(400, GEM_W), (800, GEM_W), (1200, 8), (1300, 14)])
-    assert _count_mana_gems(f, layout, vision) == 2
+@pytest.mark.parametrize("name", ["defeat", "play_screen"])
+def test_non_mulligan_screens_are_unreadable_not_guessed(name, layout, cfg):
+    """A screen with no hand yields 0 (fail closed), never a plausible 3 or 4."""
+    assert count_mulligan_cards(_frame(name), layout, cfg.vision) == 0
 
 
-def test_no_blue_means_zero_gems(vision):
-    f, layout = _frame([])
-    assert _count_mana_gems(f, layout, vision) == 0
+def test_grayscale_frame_is_unreadable(layout, cfg):
+    """The glow is a *colour*; a frame captured without RGB cannot be counted."""
+    gray = Frame.from_gray_bytes(60, 27, bytes([40]) * (60 * 27))
+    assert glow_strip_centers(gray, layout, cfg.vision) is None
+    assert count_mulligan_cards(gray, layout, cfg.vision) == 0
 
 
-def test_falls_back_when_colour_unavailable(vision):
-    """Grayscale-only frames (no rgb) must not crash; gems return None."""
-    f, layout = _frame([(400, GEM_W), (800, GEM_W)])
-    grayscale_only = Frame(f.width, f.height, f.data, None)
-    assert _count_mana_gems(grayscale_only, layout, vision) is None
-    # count_mulligan_cards then uses the (unreliable) brightness fallback
-    assert isinstance(count_mulligan_cards(grayscale_only, layout, vision), int)
+def test_counter_is_resolution_independent(layout, cfg):
+    """Fractions, not pixels: the same hand at half size must still read 4."""
+    from PIL import Image
+
+    im = Image.open(FRAMES / "mulligan_4card_b.png").convert("RGB")
+    small = im.resize((im.width // 2, im.height // 2), Image.LANCZOS)
+    buf = io.BytesIO()
+    small.save(buf, "PNG")
+    frame = Frame.from_png(buf.getvalue(), keep_rgb=True)
+    assert count_mulligan_cards(frame, layout, cfg.vision) == 4
 
 
-def test_implausible_gem_count_falls_back(vision):
-    """5 gems is impossible; fall through to the brightness counter rather than
-    trusting a nonsense colour read."""
-    f, layout = _frame([(400, GEM_W), (700, GEM_W), (1000, GEM_W),
-                        (1300, GEM_W), (1600, GEM_W)])
-    assert _count_mana_gems(f, layout, vision) == 5
-    assert count_mulligan_cards(f, layout, vision) != 5  # fell back
+def test_a_spurious_strip_inside_the_hand_fails_closed(layout, cfg, monkeypatch):
+    """Green card art faking a strip must not become a fifth card.
+
+    Six strips where one gap is half-pitch is not a hand; refuse to answer rather
+    than report 5 -- or, worse, silently accept a count that flips we_go_second.
+    """
+    import hop.hearthstone as hs
+
+    frame = _frame("mulligan_4card_b")
+    real = glow_strip_centers(frame, layout, cfg.vision)
+    spurious = sorted(real + [(real[1] + real[2]) // 2])
+    monkeypatch.setattr(hs, "glow_strip_centers", lambda *a, **k: spurious)
+    assert hs.count_mulligan_cards(frame, layout, cfg.vision) == 0
+
+
+def test_too_few_strips_is_unreadable(layout, cfg, monkeypatch):
+    import hop.hearthstone as hs
+
+    monkeypatch.setattr(hs, "glow_strip_centers", lambda *a, **k: [100, 200])
+    assert hs.count_mulligan_cards(_frame("mulligan_4card_b"), layout, cfg.vision) == 0
+
+
+def test_a_dropped_edge_strip_reads_as_three_not_unreadable(layout, cfg, monkeypatch):
+    """Documented limit, pinned so nobody assumes more safety than exists.
+
+    Four strips at the true pitch is a *self-consistent* 3-card reading, so neither
+    the pitch check nor the evenness check can catch a dropped outer strip. What
+    protects us is that the glow is high-contrast UI chrome spanning a card's full
+    height -- it is present or absent, never half-detected. If that ever stops
+    holding, this test is where the assumption is written down.
+    """
+    import hop.hearthstone as hs
+
+    frame = _frame("mulligan_4card_b")
+    real = glow_strip_centers(frame, layout, cfg.vision)
+    monkeypatch.setattr(hs, "glow_strip_centers", lambda *a, **k: real[:-1])
+    assert hs.count_mulligan_cards(frame, layout, cfg.vision) == 3

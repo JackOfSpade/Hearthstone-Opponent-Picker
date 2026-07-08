@@ -182,10 +182,11 @@ class VisionConfig:
     unknown_settle_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
-    gem_blue_bias: int
-    gem_min_blue: int
-    gem_col_min_frac: float
-    gem_width_tolerance: float
+    glow_green_bias: int
+    glow_min_green: int
+    glow_col_min_frac: float
+    glow_min_strip_frac: float
+    card_pitch_tolerance: float
 
 
 @dataclass(frozen=True)

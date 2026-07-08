@@ -1,30 +1,10 @@
 import random
 
-from hop.hearthstone import GameLayout, _peak_count_cards
 from hop.perception.capture import FrameDeduper
 from hop.perception.diffing import classify_change
 from hop.perception.image import Frame, mean_abs_diff, ncc
 from hop.perception.templates import Region, Template, best_match, match_all
 from hop.transport import hid_descriptor as hd
-
-
-def _card_frame(n, W=800, H=400):
-    data = bytearray([20]) * (W * H)
-    left, right = 0.20, 0.80
-    cw = int(W * 0.14)
-    for slot in range(n):
-        xf = left + (right - left) * (slot / (n - 1)) if n > 1 else 0.5
-        cx = int(xf * W)
-        for y in range(int(H * 0.10), int(H * 0.85)):
-            for x in range(cx - cw // 2, cx + cw // 2):
-                if 0 <= x < W:
-                    data[y * W + x] = 200
-    return Frame.from_gray_bytes(W, H, bytes(data))
-
-
-def test_card_count_three_and_four():
-    assert _peak_count_cards(_card_frame(3), Region(0.10, 0.05, 0.80, 0.9)) == 3
-    assert _peak_count_cards(_card_frame(4), Region(0.10, 0.05, 0.80, 0.9)) == 4
 
 
 def test_ncc_brightness_invariant():
@@ -66,9 +46,26 @@ def test_match_all_counts_copies():
     assert len(ms) == 2
 
 
+def _bars_frame(n, W=800, H=400):
+    """A frame with ``n`` bright vertical bars: just two distinguishable images.
+
+    (This used to double as a card-count fixture. It doesn't any more -- counting
+    mulligan cards by brightness was wrong on real frames. See test_card_count.py.)
+    """
+    data = bytearray([20]) * (W * H)
+    left, right, cw = 0.20, 0.80, int(W * 0.14)
+    for slot in range(n):
+        xf = left + (right - left) * (slot / (n - 1)) if n > 1 else 0.5
+        cx = int(xf * W)
+        for y in range(int(H * 0.10), int(H * 0.85)):
+            for x in range(max(0, cx - cw // 2), min(W, cx + cw // 2)):
+                data[y * W + x] = 200
+    return Frame.from_gray_bytes(W, H, bytes(data))
+
+
 def test_frame_deduper_edge_detects():
-    f1 = _card_frame(3)
-    f2 = _card_frame(4)
+    f1 = _bars_frame(3)
+    f2 = _bars_frame(4)
     d = FrameDeduper(sig_size=8, change_threshold=9.0)
     assert d.advanced(f1) is True
     assert d.advanced(f1) is False   # same frame -> no advance
