@@ -515,7 +515,7 @@ class Engine:
         self._tap(self.layout.gear_button, committing=False, decision_type="commit",
                   expected_change="full_transition", what="gear")
         self._tap(self.layout.concede_button, committing=True, decision_type="reject",
-                  expected_change="full_transition")
+                  expected_change="full_transition", what="concede")
         # some clients show a confirm; tap it if a concede menu is still up.
         # (This one concedes immediately, so the menu is gone and we skip it.)
         cls, _ = self._classify_settled()

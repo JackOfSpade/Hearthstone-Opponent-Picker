@@ -382,3 +382,20 @@ def test_mulligan_confirm_halts_if_the_mulligan_never_leaves(cfg):
     eng, _ = _reconnect_engine(cfg, [ScreenState.MULLIGAN])
     with pytest.raises(Halt, match="did not dismiss"):
         eng._confirm_mulligan()
+
+
+def test_every_tap_site_is_named_for_the_journal(cfg):
+    """A tap logged as `?` can't be attributed when a run halts.
+
+    The one that slipped through was the *concede* -- the committing action, the
+    single most important thing to be able to identify in a journal.
+    """
+    import inspect
+    import re
+
+    import hop.engine as engine
+
+    src = inspect.getsource(engine.Engine)
+    for m in re.finditer(r"self\._tap\((.{0,320}?)\)\n", src, re.DOTALL):
+        call = m.group(1)
+        assert "what=" in call, f"unnamed tap site: {call.splitlines()[0].strip()}"
