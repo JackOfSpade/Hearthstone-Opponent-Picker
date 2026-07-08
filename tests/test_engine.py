@@ -159,6 +159,46 @@ def _dispatch_once(cfg, state):
     return eng, backend
 
 
+def test_a_soft_locked_queue_halts_instead_of_spinning_forever(cfg):
+    """Tapping the queue cancels it, so the only safe move is to wait -- which made
+    this the loop's one reachable infinite spin. No tap, so no cap; no cap, so no stop.
+
+    (The attempt count, not the frozen test clock, is what terminates this.)
+    """
+    from hop.verify import Halt
+
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    frame = gray_frame(80, 40)
+    for _ in range(cfg.vision.queue_wait_attempts):
+        eng._dispatch(eng.classifier.classify(frame), frame)
+    with pytest.raises(Halt) as e:
+        eng._dispatch(eng.classifier.classify(frame), frame)
+    assert "matchmaking never matched" in str(e.value)
+    assert backend.gestures == []          # never, ever tap the queue
+
+
+def test_finding_a_match_resets_the_queue_patience(cfg):
+    eng, _backend = _engine(cfg, [ScreenState.QUEUE, ScreenState.VS_SPLASH])
+    frame = gray_frame(80, 40)
+    eng._dispatch(eng.classifier.classify(frame), frame)
+    assert eng._queue_polls == 1
+    eng._dispatch(eng.classifier.classify(frame), frame)
+    assert eng._queue_polls == 0
+
+
+def test_session_time_is_wall_clock_and_gates_a_tapless_loop(cfg):
+    """`max_session_minutes` used to gate tap-adjacent time only: session_seconds was
+    accrued inside `_tap`, and every cap was checked there too. A loop that never taps
+    -- a stuck queue -- ran forever, however long. `Engine.clock` existed and was
+    never read."""
+    ticks = iter([0.0] + [cfg.caps.max_session_minutes * 60 + 1] * 10)
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    eng.clock = lambda: next(ticks)
+    stats = eng.run(max_iterations=5)
+    assert stats.stop_reason == "cap:session_minutes"
+    assert backend.gestures == []
+
+
 def test_error_dialog_is_dismissed_not_halted(cfg):
     """HS throws a transient 'error starting your game'; dismiss and requeue."""
     eng, backend = _dispatch_once(cfg, ScreenState.ERROR_DIALOG)

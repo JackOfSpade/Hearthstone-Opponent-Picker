@@ -220,6 +220,74 @@ def test_unknown_while_clearing_keeps_the_pixels(cfg):
     assert backend.gestures == []
 
 
+# ── a live board is not a place to wait forever ──────────────────────────────
+
+def test_a_board_at_the_top_of_the_loop_is_polled_then_abandoned(cfg):
+    """`_execute_reject` can only start from the mulligan, so a board reached any other
+    way had no matchup read and, before this, no exit at all: dispatch slept and
+    re-looped while a game hop queued roped out turn by turn.
+
+    Conceding is not special to the mulligan -- the gear is on every board.
+    """
+    n = cfg.vision.in_game_wait_attempts
+    states = (
+        [ScreenState.IN_GAME] * (n + 1)    # n patient polls, then the one that acts
+        + [ScreenState.IN_GAME]            # _concede() classifies before it taps
+        + [ScreenState.CONCEDE_MENU]       # ...the gear opened the menu
+        + [ScreenState.DEFEAT]             # ...and Concede left it
+        + [ScreenState.DEFEAT,             # _clear_end_screens: dismiss...
+           ScreenState.PLAY_SCREEN]        # ...and home
+    )
+    eng, backend = _engine(cfg, states)
+    eng._own_game = True                                # hop tapped Play; this is ours
+
+    for _ in range(n):                                  # patient first
+        cls, frame = eng._classify_settled()
+        eng._dispatch(cls, frame)
+        assert backend.gestures == []
+
+    cls, frame = eng._classify_settled()                # ...then it acts
+    eng._dispatch(cls, frame)
+    assert eng.stats.games == 1
+    assert eng.stats.concedes == 1
+    assert [g.kind for g in backend.gestures] == ["tap", "tap", "tap"]   # gear, concede, dismiss
+    assert eng._own_game is False
+
+
+def test_hop_never_concedes_a_game_it_did_not_start(cfg):
+    """Restarting the hunt during the user's game -- quite possibly the target game it
+    alerted them about -- must not throw it away."""
+    n = cfg.vision.in_game_wait_attempts
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME])
+    assert eng._own_game is False
+    for _ in range(n):
+        cls, frame = eng._classify_settled()
+        eng._dispatch(cls, frame)
+    cls, frame = eng._classify_settled()
+    with pytest.raises(Halt) as e:
+        eng._dispatch(cls, frame)
+    assert "did not start" in str(e.value)
+    assert backend.gestures == []
+
+
+def test_tapping_play_makes_the_next_game_ours(cfg):
+    eng, _backend = _engine(cfg, [ScreenState.PLAY_SCREEN])
+    assert eng._own_game is False
+    cls, frame = eng._classify_settled()
+    eng._dispatch(cls, frame)
+    assert eng._own_game is True
+
+
+def test_leaving_the_board_resets_the_patience_counter(cfg):
+    eng, _backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.QUEUE])
+    cls, frame = eng._classify_settled()
+    eng._dispatch(cls, frame)
+    assert eng._in_game_polls == 1
+    cls, frame = eng._classify_settled()
+    eng._dispatch(cls, frame)
+    assert eng._in_game_polls == 0
+
+
 # ── end_dismiss geometry ─────────────────────────────────────────────────────
 
 def _disc(p: Point, panel: PanelGeometry):

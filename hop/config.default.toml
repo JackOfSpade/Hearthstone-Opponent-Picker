@@ -222,6 +222,21 @@ screen_wait_poll_s = 1.0           # nominal gap between polls (humanized per dr
 # real toggle moves the whole frame by 4.80 against this 9.0 threshold), and the card
 # tap already has its own measured retry budget in mulligan_card_tap_attempts.
 motion_wait_attempts = 3
+# A live board at the TOP of the hunt loop means we lost the mulligan window -- a slow
+# capture, a reconnect, an app restart. The mulligan is the only place `_execute_reject`
+# can start from, so the loop's old answer to a board was to sleep, forever, while a
+# game it queued roped out. Poll this many times (the board may just be the tail of a
+# concede animation), then abandon the game the way we abandon any reject: the gear sits
+# in the top-right corner of every board, so the concede is not special to the mulligan.
+# hop only concedes a game IT started; a board it did not queue into is a Halt.
+in_game_wait_attempts = 6
+# Tapping while Hearthstone searches for an opponent CANCELS the queue, so the only
+# safe move there is to wait. That made QUEUE the loop's one reachable infinite spin: a
+# matchmaking soft-lock keeps the anchor matching a static screen forever, and because
+# every cap was only ever checked inside `_tap`, a loop that never taps never trips one.
+# Silent: no tap, no cap, no Halt, no alert. Bound it. At ~1.5 s a poll this is ~2 min,
+# far beyond any real queue.
+queue_wait_attempts = 60
 # Hearthstone shuts down idle connections ("You are currently offline"), which the
 # hunt loop's own anti-barcode pacing provokes. Tapping Reconnect starts an
 # ASYNCHRONOUS reconnect: the body becomes "Reconnecting..." and both buttons are

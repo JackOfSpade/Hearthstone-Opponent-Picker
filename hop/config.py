@@ -196,6 +196,10 @@ class VisionConfig:
     screen_wait_poll_s: float
     #: Extra looks for motion after an unscoped tap, before calling it a missed tap.
     motion_wait_attempts: int
+    #: Polls of a live board at the top of the loop before abandoning the game.
+    in_game_wait_attempts: int
+    #: Polls of the matchmaking queue before declaring it soft-locked.
+    queue_wait_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
     mulligan_card_tap_attempts: int

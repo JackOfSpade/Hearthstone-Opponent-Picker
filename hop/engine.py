@@ -121,6 +121,13 @@ class Engine:
         self.stats = RunStats()
         self._stop = False
         self._reconnect_attempts = 0
+        #: consecutive top-level dispatches that saw a live board
+        self._in_game_polls = 0
+        #: consecutive top-level dispatches that saw the matchmaking queue
+        self._queue_polls = 0
+        #: did THIS hunt queue the game currently in progress? Only a game we started
+        #: may be conceded from the board - a board we found ourselves in is the user's.
+        self._own_game = False
 
     # ── stop control (hotkeys/panic) ─────────────────────────────────────────
 
@@ -179,9 +186,9 @@ class Engine:
         self.limiter.register_action(committing)
         self.limiter.remember_trajectory(gesture)
 
-        # settle, then verify
+        # settle, then verify. (Session time is wall clock, accrued by `run()`; adding
+        # think+settle here as well would double-count it.)
         settle = timing.human_delay(self.rng, 0.6, self.cfg.timing)
-        self.limiter.register_time(think + settle)
         self.state.tick(self.rng, dt=think + settle, action=("commit" if committing else decision_type))
         self.sleep(settle)
         after = self._capture()
@@ -394,8 +401,18 @@ class Engine:
 
     def run(self, max_iterations: int | None = None) -> RunStats:
         """Main hunt loop. Returns when a target is found, a cap is hit, the app
-        closes, an unexpected halt occurs, or stop is requested."""
+        closes, an unexpected halt occurs, or stop is requested.
+
+        Session time is **wall clock**, accrued here. It used to be accrued only inside
+        `_tap` (``think + settle``), so ``max_session_minutes`` gated tap-adjacent time
+        while the 12 s requeue delays, `between_actions`, `read_consider` and every
+        settle poll ran for free - and a loop that never tapped, like a soft-locked
+        queue, accrued nothing at all and could never trip a cap.
+
+        ``self.clock`` was taken and stored by ``__init__`` and never read. Read it.
+        """
         iters = 0
+        last = self.clock()
         try:
             if not self.classifier.has_templates:
                 raise Halt("no screen templates loaded; run `hop capture` first (refusing to run blind)")
@@ -404,6 +421,11 @@ class Engine:
                     self.stats.stop_reason = "max_iterations"
                     break
                 iters += 1
+                now = self.clock()
+                self.limiter.register_time(now - last)
+                last = now
+                # the caps that time alone can breach, checked whether or not we tap
+                self.limiter.check_elapsed_caps()
                 cls, frame = self._classify_settled()
                 self._dispatch(cls, frame)
                 # inter-action spacing (never burst)
@@ -428,6 +450,10 @@ class Engine:
 
     def _dispatch(self, cls: Classification, frame: Frame) -> None:
         st = cls.state
+        if st != ScreenState.IN_GAME:
+            self._in_game_polls = 0
+        if st != ScreenState.QUEUE:
+            self._queue_polls = 0
         if st == ScreenState.ERROR_DIALOG:
             # "There was an error starting your game." - a transient network blip.
             # Dismiss and let the loop requeue; no long backoff is warranted, the
@@ -450,8 +476,18 @@ class Engine:
             # the loop's home state: the deck's Play button queues a game
             self._tap(self.layout.play_button, committing=False, decision_type="commit",
                       expected_change="full_transition", novelty=0.1, what="play")
+            # ...and from here the game in progress is OURS to abandon. See
+            # :meth:`_handle_in_game`.
+            self._own_game = True
         elif st == ScreenState.QUEUE:
-            # searching for an opponent - tapping here CANCELS the queue, so wait
+            # Searching for an opponent - tapping here CANCELS the queue, so the only
+            # safe move is to wait. That made this the loop's one reachable infinite
+            # spin: a matchmaking soft-lock holds a static screen, and no cap could ever
+            # fire because every cap used to be checked inside `_tap`. Bound it.
+            self._queue_polls += 1
+            if self._queue_polls > max(1, self.cfg.vision.queue_wait_attempts):
+                raise Halt(f"still queueing after {self._queue_polls} polls; "
+                           "matchmaking never matched")
             self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
         elif st == ScreenState.MENU:
             raise Halt("at the Hearthstone main menu; open Play and select a deck first "
@@ -467,11 +503,66 @@ class Engine:
             self._tap(self.layout.concede_button, committing=True, decision_type="reject",
                       expected_change="full_transition", what="concede")
         elif st == ScreenState.IN_GAME:
-            # Unexpected here means a reject-play beat; a plausible pass, then re-loop
-            self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
+            self._handle_in_game()
         else:  # UNKNOWN -> fail closed
             self._record_unknown(frame, where="dispatch", confidence=round(cls.confidence, 3))
             raise Halt(f"unknown screen (best confidence {cls.confidence:.2f})")
+
+    def _handle_in_game(self) -> None:
+        """A live board at the *top* of the hunt loop, which should never last.
+
+        `_execute_reject` can only start from the mulligan, so a board reached any
+        other way had no matchup read and no exit. The old branch slept and re-looped -
+        forever. A game we queued and then lost the mulligan window on (a slow capture,
+        a reconnect, an app restart) would rope out, turn by turn, with nobody at the
+        controls. That is not a wait; that is a dead end.
+
+        **Conceding is not special to the mulligan.** The gear sits in the top-right
+        corner of every board, and :meth:`_concede` classifies before it taps. So poll a
+        bounded number of times - the board may just be the tail of a concede animation,
+        or a reject-play beat - and then abandon the game exactly as a rejected matchup
+        is abandoned.
+
+        The one game we must never concede is **the user's**. `_own_game` is set only
+        when this hunt tapped Play, so a board we merely found ourselves in - hop
+        restarted during a game the user is playing, quite possibly the target game it
+        alerted them about - fails closed instead.
+        """
+        self._in_game_polls += 1
+        if self._in_game_polls <= max(1, self.cfg.vision.in_game_wait_attempts):
+            self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
+            return
+        if not self._own_game:
+            raise Halt("a game is in progress that this hunt did not start; refusing to "
+                       "concede it. Finish the game, or stop the hunt and restart it "
+                       "from the deck's Play screen.")
+        if self.debug:
+            self.debug.record("abandoning_unread_game", polls=self._in_game_polls)
+        # we never got to read this mulligan, so we never got to hesitate over it
+        self.sleep(timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
+                                     visual_complexity=0.6) * self.delay_scale)
+        conceded = self._concede()
+        self._clear_end_screens()
+        self._book_game(conceded)
+
+    def _book_game(self, conceded: bool) -> None:
+        """Count a finished game, take any mandatory break, then pace the requeue."""
+        self.limiter.register_game()
+        self.stats.games += 1
+        # A game that ended on its own was not conceded. `concedes` is the numerator of
+        # the concede/commit ratio the caps exist to keep human - do not inflate it.
+        self.stats.concedes += int(conceded)
+        self._own_game = False
+        self._in_game_polls = 0
+
+        brk = self.limiter.needs_break(self.rng)
+        if brk is not None:
+            if self.debug:
+                self.debug.record("break", seconds=round(brk))
+            self.sleep(brk)   # wall clock; `run()` accrues it on the next iteration
+
+        # randomized requeue delay (humans don't requeue instantly)
+        self.sleep(timing.human_delay(self.rng, 12.0, self.cfg.timing) * self.delay_scale)
 
     def _reconnect(self) -> None:
         """Tap Reconnect once, then wait out the asynchronous reconnect.
@@ -567,22 +658,7 @@ class Engine:
 
         conceded = self._concede()
         self._clear_end_screens()
-        self.limiter.register_game()
-        self.stats.games += 1
-        # A game that ended on its own was not conceded. `concedes` is the numerator of
-        # the concede/commit ratio the caps exist to keep human - do not inflate it.
-        self.stats.concedes += int(conceded)
-
-        # mandatory break?
-        brk = self.limiter.needs_break(self.rng)
-        if brk is not None:
-            if self.debug:
-                self.debug.record("break", seconds=round(brk))
-            self.limiter.register_time(brk)
-            self.sleep(brk)
-
-        # randomized requeue delay (humans don't requeue instantly)
-        self.sleep(timing.human_delay(self.rng, 12.0, self.cfg.timing) * self.delay_scale)
+        self._book_game(conceded)
 
     def _confirm_mulligan(self) -> None:
         """Tap Confirm, then wait for the mulligan to actually go away.

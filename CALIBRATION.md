@@ -298,6 +298,27 @@ non-emptiness is the signal. It is the one exception to "delete captured media".
 Note also that the Ban Notice *masked* the deck-list bug: the loop halted before it
 ever tapped "My Collection".
 
+### Two dead ends the loop could never leave
+
+Both were silent — no tap, no cap, no Halt, no alert. Both were found by running.
+
+* **A live board.** `_execute_reject` can only start from the mulligan, so a board
+  reached any other way (a slow capture, a reconnect, an app restart) had no matchup
+  read and no exit: `_dispatch` slept and re-looped while a game hop queued roped out,
+  turn by turn. Conceding is *not* special to the mulligan — the gear is in the
+  top-right corner of every board, and `_concede()` classifies before it taps. hop now
+  polls `in_game_wait_attempts`, then abandons the game. It abandons only a game **it
+  started** (`_own_game`, set when it taps Play); a board it merely found itself in may
+  be the user's target game, and fails closed.
+
+* **The matchmaking queue.** Tapping there cancels the queue, so waiting is the only
+  safe move — and *every* cap was checked inside `_tap`, so a loop that never taps could
+  never trip one, however long it ran. Bounded by `queue_wait_attempts`, and
+  `session_seconds` is now honest wall clock accrued by `run()` (it was `think + settle`
+  from inside `_tap`, so the 12 s requeue delays, `between_actions`, `read_consider` and
+  every settle poll ran for free). `Engine.clock` was stored by `__init__` and never
+  read.
+
 ### The non-repetition gate saturates, and the blind retap was hiding it
 
 `trajectory_fingerprint` has ~3 effective degrees of freedom, not 6: `dur ==
@@ -342,6 +363,31 @@ rate to 15.50%.
 * **"Add a panel-bounds check to `motor._endpoint_inside`."** Unnecessary once
   `end_dismiss`'s radius is sane: re-measured over 5000 draws, **0.00%** of endpoints
   leave the panel for any control in `GameLayout`.
+
+* **"Derive the dismiss point from the winning anchor's glyph (`Classification.at`)
+  rather than a fixed `Point`."** Tempting — it is `templates.py`'s own doctrine, and
+  it guarantees the tap lands on the popup rather than on whatever is behind it. It is
+  also **wrong here**, and the pixels say so:
+
+  | | brightness at the fixed point (1200, 940) | at the anchor centre |
+  |---|---|---|
+  | `quest_popup` | 21.6 | 132.0 |
+  | the `play_screen` behind it | 70.5 | 49.5 |
+
+  The fixed point sits on the modal's **dim+blur scrim** (ratio 0.31, matching the
+  far-left scrim at 0.34). The anchor centre sits on the *popup's content* — the "Your
+  Quests" title banner, above a quest card that is plausibly interactive (detail view,
+  claim). All four end screens dismiss by tapping the scrim / anywhere neutral, which is
+  exactly what the fixed point does and what was live-verified at (1208, 941).
+
+  `end_dismiss` is **not a control**. "Locate actions by vision" is a rule about
+  *buttons*, whose position moves. Vision-locating a glyph returns the glyph — precisely
+  the pixel you must not tap on a quest popup. The fixed point's disc (27 px, y 913–967)
+  was checked against both underlying screens: it lands on inert wooden frame, clear of
+  "My Collection" at y ≥ 990.
+
+  `Classification.at` stays: it is what made the confidence bug fixable, and it enriches
+  the journal.
 
 Two hazards worth carrying to any future device:
 
