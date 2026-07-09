@@ -99,6 +99,42 @@ def test_classification_carries_the_winning_match_location():
     assert c.at[0] >= int(0.6 * frame.width)     # inside anchor b's search region
 
 
+def test_rank_surfaces_the_sub_threshold_near_miss_classify_hides():
+    """When a frame is UNKNOWN, rank() says which known screen it was CLOSEST to.
+
+    This is the datum a real halt needed: in_game 0.539 vs threshold 0.72 = "the board,
+    but END TURN was glowing", where classify() only ever reports 'unknown, 0.0'.
+    """
+    frame = _textured_frame()
+    near = Template("near", _noisy_like(frame.crop(0, 0, 10, 10)), Region(0.0, 0.0, 0.5, 1.0), 0.999)
+    clf = ScreenClassifier([Anchor(ScreenState.IN_GAME, near, 0)])
+    assert clf.classify(frame).state == ScreenState.UNKNOWN     # below threshold -> unknown
+    ranked = clf.rank(frame)
+    assert ranked[0][0] == ScreenState.IN_GAME
+    assert 0.0 < ranked[0][1] < 0.999                            # the near-miss score is visible
+    assert ranked[0][2] == 0.999                                 # ...next to the threshold it missed
+
+
+def test_rank_orders_anchors_highest_score_first():
+    frame = _textured_frame()
+    exact = Template("exact", frame.crop(0, 0, 10, 10), Region(0.0, 0.0, 0.5, 1.0), 0.5)
+    weak = Template("weak", _noisy_like(frame.crop(40, 0, 10, 10)), Region(0.6, 0.0, 0.4, 1.0), 0.5)
+    clf = ScreenClassifier([Anchor(ScreenState.CONCEDE_MENU, weak, 0),
+                            Anchor(ScreenState.IN_GAME, exact, 0)])
+    ranked = clf.rank(frame)
+    assert ranked[0][0] == ScreenState.IN_GAME                   # the exact match ranks first
+    assert ranked[0][1] >= ranked[1][1]
+
+
+def test_best_score_returns_the_raw_match_below_threshold():
+    from hop.perception.templates import best_match, best_score
+    frame = _textured_frame()
+    weak = Template("weak", _noisy_like(frame.crop(0, 0, 10, 10)), Region(0.0, 0.0, 1.0, 1.0), 0.999)
+    assert best_match(frame, weak) is None            # gated out below threshold
+    m = best_score(frame, weak)
+    assert m is not None and 0.0 < m.score < 0.999    # ...but the raw score is still available
+
+
 def test_no_match_is_unknown():
     frame = _textured_frame()
     other = _textured_frame(w=60, h=20)

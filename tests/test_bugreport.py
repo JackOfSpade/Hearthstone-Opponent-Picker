@@ -113,6 +113,21 @@ def test_summarize_journal_surfaces_the_runs_active_criteria():
     assert "require_second=False" in summary
 
 
+def test_summarize_journal_surfaces_the_unknown_screen_near_miss():
+    """The closest known screen is the single most actionable line for an unknown halt."""
+    import json
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "mulligan_confirm", "near_misses": [
+            {"state": "in_game", "score": 0.539, "thr": 0.72},
+            {"state": "collection", "score": 0.29, "thr": 0.72}]}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    s = br.summarize_journal(text)
+    assert "closest known screen" in s
+    assert "in_game 0.539 (thr 0.72)" in s
+
+
 def test_summarize_journal_shows_any_when_no_target_classes():
     import json
     text = json.dumps({"kind": "run_criteria",

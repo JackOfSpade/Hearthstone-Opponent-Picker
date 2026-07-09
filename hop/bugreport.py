@@ -152,6 +152,7 @@ def summarize_journal(journal_text: str) -> str:
     anomalies: list[str] = []
     last_halt = ""
     criteria = ""
+    closest = ""
     for e in events:
         k = e.get("kind", "?")
         kinds[k] = kinds.get(k, 0) + 1
@@ -162,6 +163,12 @@ def summarize_journal(journal_text: str) -> str:
             anomalies.append(str(d.get("reason", "?")))
         if k in ("stop", "halt") and d.get("message"):
             last_halt = d["message"]
+        if k == "unknown_screen" and d.get("near_misses"):
+            # the anchor an unknown screen came CLOSEST to: a near-miss below its
+            # threshold usually means "known screen, new visual face" -- the single
+            # most actionable line for an unrecognised-screen halt.
+            top = d["near_misses"][0]
+            closest = f"{top.get('state')} {top.get('score')} (thr {top.get('thr')})"
         if k == "run_criteria":
             targets = d.get("target_classes") or []
             criteria = (f"targets={targets or 'ANY'} require_second={d.get('require_second')} "
@@ -175,6 +182,8 @@ def summarize_journal(journal_text: str) -> str:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
+    if closest:
+        out.append(f"- closest known screen (unknown near-miss): {closest}")
     if last_halt:
         out.append(f"- ended: {last_halt}")
     return "\n".join(out)

@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 
 from .image import Frame
-from .templates import Region, Template, best_match
+from .templates import Region, Template, best_match, best_score
 
 
 class ScreenState(str, Enum):
@@ -141,6 +141,23 @@ class ScreenClassifier:
         if winner is None:
             return Classification(ScreenState.UNKNOWN, 0.0, None)
         return Classification(best_state, winner.score, (winner.x, winner.y))
+
+    def rank(self, frame: Frame) -> list[tuple[ScreenState, float, float]]:
+        """Every anchor's best score *ignoring its threshold*, highest first, as
+        ``(state, score, threshold)`` triples.
+
+        Recorded when a frame comes back UNKNOWN so the journal says which known screen
+        it was CLOSEST to. A near-miss ("in_game 0.539, threshold 0.72") points straight
+        at the fix -- that state needs another visual face, or a looser threshold --
+        where a bare "unknown, confidence 0.0" said nothing at all.
+        """
+        out: list[tuple[ScreenState, float, float]] = []
+        for anchor in self.anchors:
+            m = best_score(frame, anchor.template)
+            if m is not None:
+                out.append((anchor.state, m.score, anchor.template.threshold))
+        out.sort(key=lambda r: -r[1])
+        return out
 
     @property
     def has_templates(self) -> bool:

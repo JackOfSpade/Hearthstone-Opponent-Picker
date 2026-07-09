@@ -407,8 +407,21 @@ class Engine:
         This is the one capture the tool retains on purpose: it cannot be re-taken
         (nobody knows how to navigate back to a screen nobody identified) and it is
         what the anchor that prevents the next halt gets built from.
+
+        We also record the NEAR-MISSES: the top anchors and how close they came. An
+        unknown that is really a known screen just under threshold (in_game 0.539 vs
+        0.72 -> "the board, but END TURN was glowing") is diagnosed from that line
+        alone; a truly novel screen shows every anchor far away instead.
         """
         if self.debug:
+            if frame is not None and hasattr(self.classifier, "rank"):
+                try:  # near-misses are diagnostic only; never let them break the capture
+                    near = self.classifier.rank(frame)[:4]
+                    context.setdefault("near_misses", [
+                        {"state": st.value, "score": round(sc, 3), "thr": th}
+                        for st, sc, th in near])
+                except Exception:
+                    pass
             self.debug.unknown_screen(frame, where=where, **context)
 
     def _wait_until(self, predicate, *, what: str,
