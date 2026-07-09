@@ -28,6 +28,15 @@ def _engine(cfg, states, *, target_read=None, capturer=None, alerter=None):
     return eng, backend
 
 
+def test_phase_label_is_friendly_and_total():
+    from hop.engine import _phase_label
+    assert "queue" in _phase_label(ScreenState.QUEUE)
+    assert "mulligan" in _phase_label(ScreenState.MULLIGAN).lower()
+    # every state maps to a non-empty label (unmapped ones fall back to the value)
+    for st in ScreenState:
+        assert _phase_label(st)
+
+
 def test_interruptible_sleep_raises_when_stopped(cfg):
     from hop.engine import StopRequested
     eng, _ = _engine(cfg, [ScreenState.MENU])

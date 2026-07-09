@@ -51,6 +51,30 @@ def test_stop_after_the_engine_exists_calls_request_stop():
     assert engine.stops == 1
 
 
+def test_status_shows_connecting_phase_during_construction():
+    in_factory = threading.Event()
+    release = threading.Event()
+
+    class SlowEngine(_FakeEngine):
+        phase = "in queue — waiting for a match"
+
+    def factory(overrides):
+        in_factory.set()
+        release.wait(2)            # stay in construction so we can observe the phase
+        return SlowEngine()
+
+    c = EngineController(factory)
+    c.start()
+    assert in_factory.wait(2)
+    # engine is None during construction, so status() takes its light path
+    assert c.status()["phase"].startswith("connecting")
+    release.set()
+    c._thread.join(2)
+    # after run() returns, the controller phase is "stopped" (checked directly to avoid
+    # status()'s full engine read, which the minimal fake doesn't implement)
+    assert c._current_phase() == "stopped"
+
+
 def test_start_clears_a_stale_stop_request():
     """A stop from a previous run must not pre-stop the next start."""
     engines = [_FakeEngine(), _FakeEngine()]

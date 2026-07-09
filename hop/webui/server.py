@@ -293,7 +293,12 @@ document.getElementById('ackBtn').onclick=ack;
 async function poll(){
   try{
     const s=await (await fetch('/status')).json();
-    document.getElementById('conn').textContent=s.running?'running':'idle';
+    // Show the live phase, not a bare "running": the slow, silent connect/enumerate
+    // window now reads as "connecting to phone…" so it never looks stuck.
+    const connEl=document.getElementById('conn');
+    if(s.running) connEl.textContent=s.phase||'running';
+    else if(s.last_error) connEl.textContent='error';
+    else connEl.textContent=(s.phase&&!['running','idle'].includes(s.phase))?s.phase:'idle';
     document.getElementById('startBtn').disabled=s.running;
     // Surface a Search that died on arrival (e.g. missing vision deps) rather than let it
     // read as "nothing happened": a failed start leaves last_error set and running=false.

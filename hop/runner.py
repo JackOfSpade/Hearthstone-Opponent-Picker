@@ -29,10 +29,20 @@ class EngineController:
         #: lost -- see start()/stop(). Building an engine (ADB connect + UHID enumerate)
         #: takes a beat, and a stop in that window used to no-op and let the hunt begin.
         self._stop_requested: bool = False
+        #: coarse lifecycle phase for the UI, so the seconds spent connecting/enumerating
+        #: read as progress ("Connecting to phone…") instead of a blank, stuck-looking
+        #: window. Once the loop is running the engine's own finer phase takes over.
+        self._phase: str = "idle"
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def _current_phase(self) -> str:
+        eng = self._engine
+        if eng is not None and self.running:
+            return getattr(eng, "phase", None) or self._phase
+        return self._phase
 
     def start(self, overrides: dict | None = None) -> bool:
         with self._lock:
@@ -40,19 +50,26 @@ class EngineController:
                 return False
             self._last_error = ""
             self._stop_requested = False
+            self._phase = "connecting to phone…"
             self._started_at = time.time()
 
             def _run():
                 try:
+                    # construction is the slow, silent part: adb connect + panel probe +
+                    # UHID enumerate. Keep _phase = "connecting…" across it so the UI has
+                    # something to show instead of a blank window.
                     eng = self.engine_factory(overrides or {})
                     self._engine = eng
                     # a stop that arrived while we were constructing: honour it now, so
                     # the hunt exits at the first loop check instead of booking a game.
                     if self._stop_requested:
                         eng.request_stop()
+                    self._phase = "running"
                     eng.run()
+                    self._phase = "stopped"
                 except Exception as e:  # surface, don't crash the dashboard
                     self._last_error = f"{type(e).__name__}: {e}"
+                    self._phase = "error"
 
             self._thread = threading.Thread(target=_run, daemon=True)
             self._thread.start()
@@ -84,6 +101,7 @@ class EngineController:
         eng = self._engine
         base = {
             "running": self.running,
+            "phase": self._current_phase(),
             "last_error": self._last_error,
             "uptime_s": round(time.time() - self._started_at, 1) if self._started_at else 0,
         }

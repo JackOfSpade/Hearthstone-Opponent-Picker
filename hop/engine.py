@@ -58,6 +58,28 @@ class StopRequested(Exception):
     """
 
 
+#: Friendly, human-readable label per screen state, surfaced as the live "phase" so the
+#: dashboard shows what the hunt is doing right now instead of a bare "running".
+_PHASE_LABELS = {
+    ScreenState.MENU: "at main menu",
+    ScreenState.DECK_SELECT: "at deck select",
+    ScreenState.PLAY_SCREEN: "at Play — queuing",
+    ScreenState.QUEUE: "in queue — waiting for a match",
+    ScreenState.ERROR_DIALOG: "clearing an error dialog",
+    ScreenState.RECONNECT_DIALOG: "reconnecting…",
+    ScreenState.RECONNECTING: "reconnecting…",
+    ScreenState.VS_SPLASH: "match starting…",
+    ScreenState.COLLECTION: "backing out of Collection",
+    ScreenState.INCOMPLETE_DECK: "incomplete-deck dialog",
+    ScreenState.MULLIGAN: "reading opponent (mulligan)",
+    ScreenState.IN_GAME: "in game",
+}
+
+
+def _phase_label(state) -> str:
+    return _PHASE_LABELS.get(state, state.value.replace("_", " "))
+
+
 @dataclass
 class RunStats:
     games: int = 0
@@ -147,6 +169,8 @@ class Engine:
         #: did THIS hunt queue the game currently in progress? Only a game we started
         #: may be conceded from the board - a board we found ourselves in is the user's.
         self._own_game = False
+        #: live, human-readable phase for the dashboard, refreshed each loop iteration
+        self.phase = "starting"
 
     # ── stop control (hotkeys/panic) ─────────────────────────────────────────
 
@@ -472,6 +496,7 @@ class Engine:
                 # the caps that time alone can breach, checked whether or not we tap
                 self.limiter.check_elapsed_caps()
                 cls, frame = self._classify_settled()
+                self.phase = _phase_label(cls.state)
                 self._dispatch(cls, frame)
                 # inter-action spacing (never burst)
                 self.sleep(timing.between_actions(self.rng, self.cfg.timing, self.state) * self.delay_scale)
