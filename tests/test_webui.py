@@ -44,3 +44,9 @@ def test_dashboard_has_one_toggle_button_and_no_silence_button():
     assert "ackBtn" not in _INDEX_HTML
     assert "Silence alarm" not in _INDEX_HTML
     assert 'id="stopBtn"' not in _INDEX_HTML and 'id="startBtn"' not in _INDEX_HTML
+
+
+def test_dashboard_is_branded_with_the_project_name_not_hop():
+    assert "Hearthstone Opponent Picker" in _INDEX_HTML
+    assert "<h1>hop</h1>" not in _INDEX_HTML
+    assert "<title>hop dashboard</title>" not in _INDEX_HTML

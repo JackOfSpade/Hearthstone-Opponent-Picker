@@ -190,7 +190,7 @@ def serve(controller: EngineController, cfg: Config, host: str = "127.0.0.1", po
 
 
 _INDEX_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>hop dashboard</title>
+<html lang="en"><head><meta charset="utf-8"><title>Hearthstone Opponent Picker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root{color-scheme:dark light;--bg:#12141a;--card:#1c1f28;--fg:#e6e8ee;--mut:#9aa0ad;--acc:#4da3ff;--warn:#ffb454;--bad:#ff5c6c;--ok:#5cd6a0}
@@ -219,7 +219,7 @@ _INDEX_HTML = """<!doctype html>
   #banner.err{background:var(--bad);color:#2a0508}
 </style></head>
 <body>
-<header><h1>hop</h1><span class="pill" id="conn">connecting…</span><span class="pill" id="prof"></span></header>
+<header><h1>Hearthstone Opponent Picker</h1><span class="pill" id="conn">connecting…</span><span class="pill" id="prof"></span></header>
 <main>
   <section>
     <div id="banner"></div>

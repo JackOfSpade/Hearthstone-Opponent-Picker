@@ -101,6 +101,16 @@ def test_menu_bar_title_reflects_engine_state(tmp_path):
     assert s.title() == macapp.MENU_BAR_HALTED
 
 
+def test_app_is_branded_with_the_project_name_not_hop():
+    import hop.macapp as macapp
+
+    assert macapp.APP_NAME == "Hearthstone Opponent Picker"
+    for label in (macapp.MENU_BAR_IDLE, macapp.MENU_BAR_HUNTING,
+                  macapp.MENU_BAR_TARGET, macapp.MENU_BAR_HALTED):
+        assert label.startswith(macapp.APP_NAME)
+        assert "hop" not in label.lower()
+
+
 def test_risk_meter_flags_barcode_shaped_criteria(tmp_path):
     """One class + require-second is ~95% concedes: the shape Blizzard tracks."""
     s, _ = _state(tmp_path)

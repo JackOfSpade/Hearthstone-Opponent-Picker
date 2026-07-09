@@ -32,10 +32,11 @@ from pathlib import Path
 from .config import Config, save_criteria
 from .hero_classes import DISPLAY_NAMES, HeroClass
 
-MENU_BAR_IDLE = "hop"
-MENU_BAR_HUNTING = "hop ▶"
-MENU_BAR_TARGET = "hop ●"
-MENU_BAR_HALTED = "hop ⚠"
+APP_NAME = "Hearthstone Opponent Picker"    # what the app calls itself in its UI
+MENU_BAR_IDLE = APP_NAME
+MENU_BAR_HUNTING = f"{APP_NAME} ▶"
+MENU_BAR_TARGET = f"{APP_NAME} ●"
+MENU_BAR_HALTED = f"{APP_NAME} ⚠"
 DASHBOARD_PORT = 8765
 
 
@@ -273,7 +274,7 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
 
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
             self._action(menu, "Open dashboard\u2026", "dashboard_")
-            self._action(menu, "Quit hop", "quit_", key="q")
+            self._action(menu, "Quit", "quit_", key="q")
 
             s.status_item.setMenu_(menu)
             s.menu = menu
@@ -286,7 +287,7 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
         @_objc.python_method
         def _install_main_menu(self):
             """A minimal main menu so the Dock app behaves like one: an app menu with a
-            working Cmd-Q (routed through our clean stop) and "Open hop Window", plus a
+            working Cmd-Q (routed through our clean stop) and "Open Window", plus a
             standard Edit menu so Cmd-C/V/X/A work in the WKWebView. Accessory apps don't
             need this; a Regular (Dock) app looks broken without it (no Cmd-Q, no app
             menu, and no working copy/paste in text fields).
@@ -299,7 +300,7 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             main.addItem_(app_item)
             app_menu = AppKit.NSMenu.alloc().init()
             show = app_menu.addItemWithTitle_action_keyEquivalent_(
-                "Open hop Window", b"dashboard:", "0")
+                "Open Window", b"dashboard:", "0")
             show.setTarget_(self)
             app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
             quit_item = app_menu.addItemWithTitle_action_keyEquivalent_(
@@ -461,7 +462,7 @@ def _open_dashboard_window(state: _AppState) -> None:
             | AppKit.NSWindowStyleMaskResizable | AppKit.NSWindowStyleMaskMiniaturizable)
     win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         rect, mask, AppKit.NSBackingStoreBuffered, False)
-    win.setTitle_("hop")
+    win.setTitle_(APP_NAME)
     win.setReleasedWhenClosed_(False)   # we hold the ref; closing hides, not frees
     win.setMinSize_(AppKit.NSMakeSize(560, 480))
 
