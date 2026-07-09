@@ -37,11 +37,13 @@ done
 if [ -z "$PY" ]; then
   if [ "$saw_perm_denied" -eq 1 ]; then
     echo "x macOS blocked reading hop's source (it lives under ~/Desktop, a protected folder)."
-    echo "  Grant access ONCE, then relaunch:"
-    echo "    System Settings > Privacy & Security > Full Disk Access > [+]"
-    echo "    > add 'Hearthstone Opponent Picker.app' > toggle it on."
-    echo "  If it is still blocked, add /Library/Frameworks/Python.framework there too."
-    notify "Allow me in Full Disk Access, then relaunch. See ~/Library/Logs/hop.log" "Basso"
+    echo "  Grant Full Disk Access to the PYTHON that reads it -- NOT this app. Python is"
+    echo "  separately signed, so it is its own permission subject; granting the .app does"
+    echo "  nothing. In Finder, open this folder and DRAG python3.14 onto the Full Disk"
+    echo "  Access list (the picker greys out CLI binaries, so dragging is the only way):"
+    echo "    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
+    echo "  Toggle it on, then relaunch. (Or move the project out of ~/Desktop entirely.)"
+    notify "Grant Full Disk Access to python3.14 (drag it in), then relaunch. See ~/Library/Logs/hop.log" "Basso"
   else
     echo "x No python3 can import hop. Install it once from the project dir with: pip install -e ."
     notify "hop is not installed. See ~/Library/Logs/hop.log" "Basso"
