@@ -1,16 +1,16 @@
-"""The Mac control panel: a menu-bar app that drives the hunt loop.
+"""The Mac control panel: a menu-bar item plus a native stats window.
 
-Why a menu-bar app and not a window: the whole point of `hop` is that you are *not*
-watching it. It queues, reads the mulligan, concedes what you don't want, and the
-moment your matchup appears it shouts and takes its hands off the game. The right
-surface for that is a status item you glance at, and a loud alert you can't miss.
+On launch it puts a status item in the menu bar (glanceable state, a loud target
+alert) AND opens a **native window** - a WKWebView hosting the local dashboard, so the
+settings/stats hub is a real macOS window, not a browser tab and not Electron. The
+window renders in-process (the dashboard server is a daemon thread in this same Python
+process), so there is no second runtime and no IPC seam.
 
-Why pyobjc and not Swift: the engine is Python. A Swift app would add a build step,
-a signing story, and an IPC boundary in exchange for a menu with a few toggles.
-Here the menu items call :class:`~hop.runner.EngineController` directly - no HTTP
-hop, no serialization, no second process to keep alive. The existing web dashboard
-(``hop dashboard``) is still one click away for the rich panel: live screen, risk
-meter, per-run stats.
+Why pyobjc and not Swift/Electron: the engine is Python. A Swift or Electron shell
+would add a build step, a signing story, and an IPC boundary between the UI and the
+Python engine, in exchange for nothing a native WKWebView window doesn't already give.
+The menu items call :class:`~hop.runner.EngineController` directly, and the window shows
+the same in-process dashboard.
 
 Threading: the engine's hunt loop is blocking, so ``EngineController`` already runs
 it on a daemon thread. AppKit owns the main thread and drives everything here from
@@ -26,7 +26,6 @@ dashboard without it.
 from __future__ import annotations
 
 import threading
-import webbrowser
 from dataclasses import replace
 from pathlib import Path
 
@@ -72,6 +71,12 @@ def run_menubar(cfg: Config, engine_factory, alerter=None,
     )
     app.setDelegate_(delegate)
     delegate.build()
+    # Open the stats/settings window on launch so a double-click gives a visible hub -
+    # a bare menu-bar item alone reads as "nothing happened". The menu bar stays too.
+    try:
+        _open_dashboard_window(delegate._state)
+    except Exception:
+        pass   # a webview failure must not stop the menu bar from running
     app.run()
     return 0
 
@@ -91,6 +96,9 @@ class _AppState:
         self.status_line = None
         self.risk_line = None
         self.dashboard_thread: threading.Thread | None = None
+        #: the native WKWebView window (kept referenced so it isn't collected)
+        self.dash_window = None
+        self.dash_webview = None
 
     # ── criteria ──────────────────────────────────────────────────────────────
 
@@ -276,8 +284,7 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s.risk_line.setTitle_(s.risk_text())
 
         def dashboard_(self, sender):
-            self._state.dashboard_thread = _ensure_dashboard(self._state)
-            webbrowser.open(f"http://127.0.0.1:{DASHBOARD_PORT}/")
+            _open_dashboard_window(self._state)
 
         def quit_(self, sender):
             self._state.controller.stop()
@@ -307,3 +314,47 @@ def _ensure_dashboard(state: _AppState) -> threading.Thread:
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
     return t
+
+
+def _open_dashboard_window(state: _AppState) -> None:
+    """Show the dashboard in a NATIVE window (a WKWebView), not a browser.
+
+    The dashboard is already served in-process by :func:`_ensure_dashboard`; this just
+    renders that local page in a real macOS window. It is *not* Electron and *not*
+    Chrome - it's the system WebKit view, hosted inside the same Python process, so the
+    settings/stats hub is a native window with zero extra runtime.
+
+    Re-opening reuses the existing window. The app is an accessory (no Dock icon), so we
+    activate it to bring the window to the front.
+    """
+    AppKit = state.AppKit
+    _ensure_dashboard(state)
+
+    if state.dash_window is not None:
+        state.dash_window.makeKeyAndOrderFront_(None)
+        AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        return
+
+    import WebKit
+    from Foundation import NSURL, NSURLRequest, NSMakeRect
+
+    rect = NSMakeRect(0, 0, 920, 700)
+    mask = (AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
+            | AppKit.NSWindowStyleMaskResizable | AppKit.NSWindowStyleMaskMiniaturizable)
+    win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        rect, mask, AppKit.NSBackingStoreBuffered, False)
+    win.setTitle_("hop")
+    win.setReleasedWhenClosed_(False)   # we hold the ref; closing hides, not frees
+    win.setMinSize_(AppKit.NSMakeSize(560, 480))
+
+    config = WebKit.WKWebViewConfiguration.alloc().init()
+    webview = WebKit.WKWebView.alloc().initWithFrame_configuration_(rect, config)
+    win.setContentView_(webview)
+    url = NSURL.URLWithString_(f"http://127.0.0.1:{DASHBOARD_PORT}/")
+    webview.loadRequest_(NSURLRequest.requestWithURL_(url))
+
+    win.center()
+    win.makeKeyAndOrderFront_(None)
+    AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    state.dash_window = win
+    state.dash_webview = webview

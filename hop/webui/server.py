@@ -89,6 +89,12 @@ class DashboardServer:
                 elif self.path.startswith("/ack"):
                     server.controller.ack_alarm()
                     self._json(200, {"acked": True})
+                elif self.path.startswith("/bugreport"):
+                    try:
+                        path = server._bugreport(body.get("description", ""))
+                        self._json(200, {"path": str(path)})
+                    except Exception as e:
+                        self._json(500, {"error": str(e)})
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -98,6 +104,27 @@ class DashboardServer:
     def shutdown(self) -> None:
         if self._httpd:
             self._httpd.shutdown()
+
+    def _bugreport(self, description: str):
+        """Write a self-improving bug report to the Desktop; return its path.
+
+        Skips the live device probe (a fresh adb connection could contend with the
+        hunt's running transport); the journal, config and logs carry the diagnosis.
+        """
+        from pathlib import Path
+        from .. import __version__
+        from .. import bugreport as br
+
+        home = Path.home()
+        paths = br.ReportPaths(
+            config=home / ".config" / "hop" / "config.toml",
+            runs_root=home / ".config" / "hop" / "runs",
+            unknowns_dir=home / ".config" / "hop" / "unknowns",
+            app_log=home / "Library" / "Logs" / "hop.log",
+            templates=home / ".config" / "hop" / "templates",
+        )
+        md = br.collect(description, paths, version=__version__, device_probe=None)
+        return br.write_report(md, home / "Desktop")
 
     def _criteria_summary(self) -> dict:
         crit = self.cfg.criteria
@@ -180,6 +207,12 @@ _INDEX_HTML = """<!doctype html>
       <div class="stat"><span>Estimated concede rate</span><b id="concederate">–</b></div>
       <div class="stat"><span>Risk shape</span><b id="risk">–</b></div>
       <div class="mut" style="margin-top:8px">Fewer target classes + require-2nd → higher concede rate → more barcode-like. Widen criteria to reduce risk and hit targets faster.</div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Report a bug</h2>
+      <div class="mut">Bundles this session's logs + state into a self-improving report on your Desktop. Paste it into Claude Code.</div>
+      <textarea id="bugdesc" rows="3" placeholder="What went wrong?" style="width:100%;margin-top:8px;background:#22262f;color:var(--fg);border:1px solid #2a2e38;border-radius:8px;padding:8px;font:inherit;box-sizing:border-box"></textarea>
+      <div class="row"><button id="bugBtn" class="sec">Create report</button><span class="mut" id="bugout"></span></div>
     </div>
   </section>
   <section>
@@ -303,6 +336,16 @@ function drawDistribution(dist){
   });
   svg.innerHTML=out || '<text x="0" y="20" fill="#9aa0ad" font-size="12">no games yet</text>';
 }
+document.getElementById('bugBtn').onclick=async()=>{
+  const out=document.getElementById('bugout'), btn=document.getElementById('bugBtn');
+  btn.disabled=true; out.textContent='writing…';
+  try{
+    const r=await (await fetch('/bugreport',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({description:document.getElementById('bugdesc').value})})).json();
+    out.textContent=r.path?('saved → '+r.path):('error: '+(r.error||'?'));
+  }catch(e){ out.textContent='failed: '+e; }
+  btn.disabled=false;
+};
 loadCriteria();
 setInterval(poll,1000);
 </script>
