@@ -18,12 +18,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Real test suite (tests/, 60 tests) needs only the `dev` extra
-      # (pytest). The vision/web/hotkeys extras are optional at runtime —
-      # every module that imports them guards the import and falls back to
-      # a pure-Python path, so they add CI time without adding coverage.
+      # Was `.[dev]` only, on the premise that vision/web/hotkeys imports are
+      # always guarded with a pure-Python fallback. That stopped being true
+      # once new tests started importing numpy/etc. directly (unguarded) —
+      # skip `mac` here since pyobjc-framework-* is macOS-only and would
+      # break this Linux runner.
       - name: Install package with dev dependencies
-        run: pip install -e '.[dev]'
+        run: pip install -e '.[dev,vision,web,hotkeys]'
 
       - name: Run test suite
         run: pytest -q
