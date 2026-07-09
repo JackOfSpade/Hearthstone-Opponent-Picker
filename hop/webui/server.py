@@ -184,18 +184,21 @@ _INDEX_HTML = """<!doctype html>
   </section>
   <section>
     <div class="card">
-      <h2>Live phone view</h2>
-      <img id="screen" alt="waiting for frame…">
-      <div class="mut" id="lastopp"></div>
+      <h2>Observed class distribution</h2>
+      <svg id="dist" viewBox="0 0 320 200" width="100%" role="img" aria-label="opponent class distribution"></svg>
+      <div class="mut" id="disttot">no games yet this session</div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Session</h2>
       <div class="stat"><span>Games</span><b id="games">0</b></div>
       <div class="stat"><span>Concedes</span><b id="concedes">0</b></div>
+      <div class="stat"><span>Concedes until target</span><b id="untiltarget">–</b></div>
+      <div class="stat"><span>Coin split (1st / 2nd)</span><b id="coin">0 / 0</b></div>
       <div class="stat"><span>Committing ratio</span><b id="ratio">0</b></div>
       <div class="stat"><span>Actions this run</span><b id="actions">0</b></div>
       <div class="bar"><i id="actbar" style="width:0%"></i></div>
       <div class="stat"><span>Session minutes</span><b id="mins">0</b></div>
+      <div class="stat"><span>Last opponent</span><b id="lastopp">–</b></div>
       <div class="stat"><span>Stop reason</span><b id="stopreason">–</b></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -255,8 +258,11 @@ async function poll(){
     if(s.games!==undefined){
       document.getElementById('games').textContent=s.games;
       document.getElementById('concedes').textContent=s.concedes;
+      document.getElementById('untiltarget').textContent=(s.concedes_until_target!=null)?s.concedes_until_target:'–';
+      document.getElementById('coin').textContent=(s.going_first||0)+' / '+(s.going_second||0);
       document.getElementById('stopreason').textContent=s.stop_reason||(s.last_error||'–');
-      document.getElementById('lastopp').textContent=s.last_opponent?('last opponent: '+s.last_opponent):'';
+      document.getElementById('lastopp').textContent=s.last_opponent||'–';
+      drawDistribution(s.class_distribution||{});
       if(s.budget){
         document.getElementById('ratio').textContent=s.budget.committing_ratio;
         document.getElementById('actions').textContent=s.budget.actions_run+' / '+s.budget.actions_run_cap;
@@ -277,11 +283,28 @@ async function poll(){
     }
   }catch(e){ document.getElementById('conn').textContent='offline'; }
 }
-function refreshScreen(){ document.getElementById('screen').src='/screen.png?t='+Date.now(); }
+// Dependency-free horizontal bar chart of the opponent class distribution, built from
+// SVG <rect>/<text> so it needs no charting library and no CDN (the server is local).
+function drawDistribution(dist){
+  const svg=document.getElementById('dist');
+  const entries=Object.entries(dist).sort((a,b)=>b[1]-a[1]);
+  const total=entries.reduce((n,[,v])=>n+v,0);
+  document.getElementById('disttot').textContent=total?(total+' game'+(total==1?'':'s')+' this session'):'no games yet this session';
+  const W=320, rowH=22, gap=6, labelW=96, x0=labelW+6, maxW=W-x0-34;
+  const max=Math.max(1,...entries.map(([,v])=>v));
+  const H=Math.max(40, entries.length*(rowH+gap));
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  let out='';
+  entries.forEach(([cls,v],i)=>{
+    const y=i*(rowH+gap), w=Math.max(2,maxW*v/max);
+    out+=`<text x="0" y="${y+rowH*0.7}" fill="#9aa0ad" font-size="12">${cls}</text>`;
+    out+=`<rect x="${x0}" y="${y}" width="${w}" height="${rowH}" rx="4" fill="#4da3ff"/>`;
+    out+=`<text x="${x0+w+5}" y="${y+rowH*0.7}" fill="#e6e8ee" font-size="12">${v}</text>`;
+  });
+  svg.innerHTML=out || '<text x="0" y="20" fill="#9aa0ad" font-size="12">no games yet</text>';
+}
 loadCriteria();
 setInterval(poll,1000);
-setInterval(refreshScreen,1500);
-refreshScreen();
 </script>
 </body></html>
 """

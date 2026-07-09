@@ -31,7 +31,7 @@ testable off-device.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from random import Random
 
 from .config import Config, profile_multipliers
@@ -63,6 +63,17 @@ class RunStats:
     #: and simply keep the card), but a rising count means the touch profile is
     #: drifting from what Hearthstone accepts - worth surfacing, not swallowing.
     ignored_card_taps: int = 0
+    #: Opponents seen this session, by class display-name -> count. The hunt is a
+    #: sampler of the ladder, so this is the observed class distribution - the thing
+    #: the dashboard charts. Counted once per mulligan read (every game, target or not).
+    class_distribution: dict[str, int] = field(default_factory=dict)
+    #: how many mulligans we read going first / second (we go second = we have the coin
+    #: = 4 cards). Lets the dashboard show the coin-flip split we actually drew.
+    going_first: int = 0
+    going_second: int = 0
+    #: concedes that had happened when the target finally appeared (== `concedes` at
+    #: that moment, since the hunt stops on a target). None until a target is found.
+    concedes_until_target: int | None = None
 
 
 def evaluate_matchup(read: MulliganRead, cfg: Config) -> str:
@@ -662,8 +673,20 @@ class Engine:
             if decision == "unusable":
                 raise Halt(f"could not read mulligan (class={read.class_raw!r}, cards={read.num_cards})")
 
+        # session stats (once per game, on the resolved read): the observed class
+        # distribution and the coin split the dashboard charts.
+        name = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
+        self.stats.last_opponent = name
+        self.stats.class_distribution[name] = self.stats.class_distribution.get(name, 0) + 1
+        if read.we_go_second:
+            self.stats.going_second += 1
+        else:
+            self.stats.going_first += 1
+
         if decision == "keep":
             self.stats.target_found = True
+            # the hunt stops on a target, so `concedes` right now IS "concedes until target".
+            self.stats.concedes_until_target = self.stats.concedes
             self._alert_target(read)
             return
         self._execute_reject(read)

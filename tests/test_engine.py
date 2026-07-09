@@ -53,6 +53,34 @@ def test_target_found_alerts_and_stops(cfg):
     assert backend.gestures == []
 
 
+def test_target_records_concedes_until_target(cfg):
+    """The hunt stops on a target, so `concedes` at that moment is 'concedes until target'."""
+    read = MulliganRead(HeroClass.MAGE, True, 4, 0.98, "MAGE", "tesseract")
+    eng, _ = _engine(cfg, [ScreenState.MULLIGAN], target_read=read)
+    eng.stats.concedes = 7                      # pretend 7 non-targets were conceded first
+    frame = gray_frame(80, 40)
+    eng._handle_mulligan(frame)
+    assert eng.stats.target_found is True
+    assert eng.stats.concedes_until_target == 7
+
+
+def test_mulligan_read_accumulates_the_class_distribution(cfg):
+    """Every game (target or not) is counted into the observed class histogram + coin split."""
+    from dataclasses import replace
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    eng, _ = _engine(cfg, [ScreenState.MULLIGAN])   # Mage/Warrior are rejects vs a Paladin target
+    eng._execute_reject = lambda read: None     # skip the full concede journey
+    frame = gray_frame(80, 40)
+
+    for cls, second in [(HeroClass.MAGE, False), (HeroClass.MAGE, True), (HeroClass.WARRIOR, False)]:
+        eng._read_mulligan = lambda *a, r=MulliganRead(cls, second, 4 if second else 3, 0.9, "X", "t"), **k: r
+        eng._handle_mulligan(frame)
+
+    assert eng.stats.class_distribution == {"Mage": 2, "Warrior": 1}
+    assert eng.stats.going_first == 2 and eng.stats.going_second == 1
+    assert eng.stats.concedes_until_target is None   # no target yet
+
+
 def test_unknown_screen_halts(cfg):
     """A *persistently* unrecognized screen must fail closed."""
     eng, backend = _engine(cfg, [ScreenState.UNKNOWN])

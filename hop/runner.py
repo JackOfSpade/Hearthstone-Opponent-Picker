@@ -80,8 +80,13 @@ class EngineController:
             "games": s.games,
             "concedes": s.concedes,
             "target_found": s.target_found,
+            "concedes_until_target": s.concedes_until_target,
             "last_opponent": s.last_opponent,
             "stop_reason": s.stop_reason,
+            # the observed class distribution + coin split, for the dashboard charts
+            "class_distribution": dict(s.class_distribution),
+            "going_first": s.going_first,
+            "going_second": s.going_second,
             # Non-fatal, but a rising count means our touch profile is drifting from
             # what Hearthstone accepts. Surface it rather than let it stay silent.
             "ignored_card_taps": s.ignored_card_taps,
