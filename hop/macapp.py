@@ -29,7 +29,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
-from .config import Config, save_criteria
+from .config import Config, load_config, save_criteria
 from .hero_classes import DISPLAY_NAMES, HeroClass
 
 APP_NAME = "Hearthstone Opponent Picker"    # what the app calls itself in its UI
@@ -152,6 +152,7 @@ class _AppState:
         return self.cfg.criteria.target_classes
 
     def toggle_class(self, hero: HeroClass) -> None:
+        self._reload()          # read-modify-write against the file, not a stale snapshot
         current = list(self.targets)
         if hero in current:
             current.remove(hero)
@@ -160,7 +161,22 @@ class _AppState:
         self._commit(tuple(current), self.cfg.criteria.require_second)
 
     def toggle_require_second(self) -> None:
+        self._reload()
         self._commit(self.targets, not self.cfg.criteria.require_second)
+
+    def _reload(self) -> None:
+        """Re-read criteria from disk before a menu edit.
+
+        The menu bar and the dashboard are twins that persist to the *same* config file,
+        but each held its own in-memory ``cfg``. A menu toggle read-modify-wrote from its
+        private snapshot, so it silently wiped classes the dashboard had just saved (and
+        vice versa). Reloading first makes every edit merge with what's actually on disk.
+        Best-effort: a briefly unreadable/half-written file keeps the last-known cfg.
+        """
+        try:
+            self.cfg = load_config(self.config_path)
+        except Exception:
+            pass
 
     def _commit(self, targets: tuple[HeroClass, ...], require_second: bool) -> None:
         self.cfg = replace(self.cfg, criteria=replace(
@@ -372,14 +388,25 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s = self._state
             hero = HeroClass[sender.representedObject()]
             s.toggle_class(hero)
-            sender.setState_(1 if hero in s.targets else 0)
-            s.risk_line.setTitle_(s.risk_text())
+            self._sync_criteria_display()
 
         def toggleSecond_(self, sender):
+            self._state.toggle_require_second()
+            self._sync_criteria_display()
+
+        @_objc.python_method
+        def _sync_criteria_display(self):
+            """Re-check every criteria item from the (freshly reloaded) truth, not just the
+            one clicked. toggle_* reloads from disk first, so a change the dashboard made
+            is now reflected here - and the other submenu checkmarks must follow it, or they
+            would show the pre-reload state."""
             s = self._state
-            s.toggle_require_second()
-            sender.setState_(1 if s.cfg.criteria.require_second else 0)
-            s.risk_line.setTitle_(s.risk_text())
+            for hero, item in s.class_items.items():
+                item.setState_(1 if hero in s.targets else 0)
+            if s.require_second_item is not None:
+                s.require_second_item.setState_(1 if s.cfg.criteria.require_second else 0)
+            if s.risk_line is not None:
+                s.risk_line.setTitle_(s.risk_text())
 
         def dashboard_(self, sender):
             _open_dashboard_window(self._state)

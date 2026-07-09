@@ -53,3 +53,21 @@ def test_halt_still_notifies_and_pings_the_phone():
     calls = _spy(a)
     a.halt("stuck on an unknown screen")
     assert "notify" in calls and "ntfy" in calls
+
+
+def test_mac_notification_flag_actually_suppresses_the_banner(monkeypatch):
+    """Regression: mac_notification=false was parsed but never consulted, so banners
+    still fired. The flag must gate the osascript call, like mac_sound gates afplay."""
+    import hop.alerts as alerts_mod
+
+    calls: list = []
+    # force the darwin path with a resolvable osascript so ONLY the flag decides
+    monkeypatch.setattr(alerts_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(alerts_mod.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(alerts_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    Alerter(_cfg(mac_notification=False))._mac_notify("t", "b")
+    assert calls == []                     # flag off -> no banner
+
+    Alerter(_cfg(mac_notification=True))._mac_notify("t", "b")
+    assert len(calls) == 1                 # flag on -> banner attempted

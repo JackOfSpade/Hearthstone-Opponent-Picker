@@ -87,6 +87,35 @@ def test_toggling_require_second_persists(tmp_path):
     assert load_config(p).criteria.require_second is True
 
 
+def test_menu_toggle_does_not_clobber_criteria_saved_by_the_dashboard(tmp_path):
+    """The menu bar and dashboard are twins writing the SAME config file. A menu toggle
+    used to read-modify-write from its own stale in-memory cfg, silently wiping classes
+    the dashboard had just saved. It must merge with what's on disk instead.
+    """
+    from hop.config import save_criteria
+
+    s, p = _state(tmp_path)                     # menu's in-memory cfg starts empty
+    # the dashboard twin persists Mage+Priest to the same file, out of band
+    save_criteria(target_classes=(HeroClass.MAGE, HeroClass.PRIEST),
+                  require_second=False, path=p)
+    # now toggle Warlock from the menu, whose snapshot is still ()
+    s.toggle_class(HeroClass.WARLOCK)
+    saved = load_config(p).criteria.target_classes
+    assert set(saved) == {HeroClass.MAGE, HeroClass.PRIEST, HeroClass.WARLOCK}
+
+
+def test_menu_reflects_require_second_saved_by_the_dashboard(tmp_path):
+    """Same desync for the go-2nd toggle: a menu edit must not revert a dashboard change."""
+    from hop.config import save_criteria
+
+    s, p = _state(tmp_path)
+    save_criteria(target_classes=(HeroClass.MAGE,), require_second=True, path=p)
+    s.toggle_class(HeroClass.ROGUE)             # a class edit must keep require_second=True
+    saved = load_config(p).criteria
+    assert saved.require_second is True
+    assert set(saved.target_classes) == {HeroClass.MAGE, HeroClass.ROGUE}
+
+
 def test_menu_bar_title_reflects_engine_state(tmp_path):
     import hop.macapp as macapp
 

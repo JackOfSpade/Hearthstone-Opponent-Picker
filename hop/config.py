@@ -185,9 +185,7 @@ class CapsConfig:
 class VisionConfig:
     state_change_threshold: float
     dedupe_signature_size: int
-    ncc_match_threshold: float
     ocr_max_edit_distance: int
-    weak_match_margin: float
     unknown_settle_attempts: int
     #: `wait_until` bounds. Both apply; whichever trips first ends the wait. The
     #: attempt count is what keeps a frozen-clock unit test terminating.

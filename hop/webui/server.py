@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from ..config import Config
+from ..config import Config, load_config
 from ..hero_classes import DISPLAY_NAMES, HeroClass, parse_class
 from ..runner import EngineController
 
@@ -160,7 +160,19 @@ class DashboardServer:
         except (ValueError, OSError):
             pass
 
+    def _refresh_cfg_from_disk(self) -> None:
+        """Re-read the config so the criteria endpoint / risk meter reflect what's on
+        disk, including picks made in the menu-bar twin (both write the same file). The
+        dashboard and menu bar each hold their own in-memory cfg; without this, a class
+        toggled in the menu would not show here until the process restarted. Best-effort:
+        an unreadable/half-written file leaves the last-known cfg in place."""
+        try:
+            self.cfg = load_config(self.config_path)
+        except Exception:
+            pass
+
     def _criteria_summary(self) -> dict:
+        self._refresh_cfg_from_disk()   # reflect picks the menu-bar twin persisted
         crit = self.cfg.criteria
         pass_rate = crit.pass_rate_estimate()
         concede_rate = 1.0 - pass_rate

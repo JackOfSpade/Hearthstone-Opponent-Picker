@@ -385,6 +385,24 @@ def test_reconnect_attempts_are_capped(cfg):
     assert len(backend.gestures) == cap, "no tap once the cap is reached"
 
 
+def test_a_successful_reconnect_resets_the_attempt_counter(cfg):
+    """Regression: the attempt counter was a lifetime tally, never reset on success.
+
+    Idle disconnects are expected traffic the loop's own pacing provokes; each is
+    individually recovered. The cap is meant to bound *consecutive failures* within one
+    episode ('needs a human'), so more successful reconnects than the cap must NOT halt.
+    """
+    from hop.verify import Halt
+
+    cap = cfg.vision.reconnect_attempt_cap
+    # the poll resolves to PLAY_SCREEN on the first look -> a clean, successful reconnect
+    eng, backend = _reconnect_engine(cfg, [ScreenState.PLAY_SCREEN])
+    for _ in range(cap + 3):        # more successful episodes than the failure cap
+        eng._reconnect()            # would raise Halt on the (cap+1)th without the reset
+        assert eng._reconnect_attempts == 0     # each success zeroes the counter
+    assert len(backend.gestures) == cap + 3     # one Reconnect tap per episode, no Halt
+
+
 def test_stuck_on_reconnecting_halts(cfg):
     """If 'Reconnecting...' never resolves, halt rather than wait forever."""
     from hop.verify import Halt

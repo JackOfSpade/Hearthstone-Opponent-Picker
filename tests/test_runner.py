@@ -90,6 +90,36 @@ def test_start_clears_a_stale_stop_request():
     assert engines[1].stops == 0
 
 
+def test_restart_drops_the_previous_engine_during_reconnect():
+    """A restart (Stop then Start) must show 'connecting…' with no stats, not the
+    finished run's engine. _engine was only ever set (never cleared), so during the
+    slow second construction a /status poll read the OLD engine as if it were live.
+    """
+    in_factory = threading.Event()
+    release = threading.Event()
+    engines = [_FakeEngine(), _FakeEngine()]
+    it = iter(engines)
+
+    def factory(overrides):
+        e = next(it)
+        if e is engines[1]:
+            in_factory.set()
+            release.wait(2)        # hold the SECOND construction so we can observe status
+        return e
+
+    c = EngineController(factory)
+    c.start()
+    c._thread.join(2)              # first run finishes; _engine is engines[0]
+    assert c._engine is engines[0]
+
+    c.start()                      # restart
+    assert in_factory.wait(2)
+    assert c._engine is None       # the finished engine was dropped, not reported as live
+    assert c.status()["phase"].startswith("connecting")   # light path, no stale stats
+    release.set()
+    c._thread.join(2)
+
+
 def test_status_captures_a_traceback_when_construction_crashes():
     """A crash must leave a full traceback in status so a bug report pinpoints the line."""
     def boom(overrides):

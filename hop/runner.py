@@ -52,6 +52,11 @@ class EngineController:
         with self._lock:
             if self.running:
                 return False
+            # Drop the previous run's finished engine so a restart takes the light
+            # status path ("connecting to phone…") during the slow reconnect/enumerate
+            # window instead of reporting the OLD run's stats and a stale phase. Safe:
+            # `self.running` is false here (no live thread), so nothing reads it mid-swap.
+            self._engine = None
             self._last_error = ""
             self._last_error_tb = ""
             self._stop_requested = False

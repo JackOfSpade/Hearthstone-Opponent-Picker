@@ -166,9 +166,14 @@ def summarize_journal(journal_text: str) -> str:
         if k == "unknown_screen" and d.get("near_misses"):
             # the anchor an unknown screen came CLOSEST to: a near-miss below its
             # threshold usually means "known screen, new visual face" -- the single
-            # most actionable line for an unrecognised-screen halt.
+            # most actionable line for an unrecognised-screen halt. Guard the shape:
+            # a journal written before near_misses round-tripped as dicts holds strings
+            # here, and a malformed entry must not sink the whole report.
             top = d["near_misses"][0]
-            closest = f"{top.get('state')} {top.get('score')} (thr {top.get('thr')})"
+            if isinstance(top, dict):
+                closest = f"{top.get('state')} {top.get('score')} (thr {top.get('thr')})"
+            else:
+                closest = str(top)
         if k == "run_criteria":
             targets = d.get("target_classes") or []
             criteria = (f"targets={targets or 'ANY'} require_second={d.get('require_second')} "

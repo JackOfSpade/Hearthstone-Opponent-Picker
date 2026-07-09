@@ -33,6 +33,7 @@ from random import Random
 
 from ..config import MotorConfig
 from ..geometry import PanelGeometry
+from ..rng import ou_step
 from ..touchstream import Gesture, TouchSample
 from .contact import ContactModel
 from .state import HumanState
@@ -280,8 +281,8 @@ def synth_swipe(
         # correlated tremor, speed-scaled, tapered to 0 at the end (exact endpoint)
         speed_scale = math.sin(math.pi * s_time)  # 0 at ends, 1 mid
         taper = max(0.0, 1.0 - max(0.0, (s_time - 0.85) / 0.15))
-        ox = _ou(rng, ox, cfg.tremor_theta, tremor_px, dt)
-        oy = _ou(rng, oy, cfg.tremor_theta, tremor_px, dt)
+        ox = ou_step(rng, ox, cfg.tremor_theta, tremor_px, dt)
+        oy = ou_step(rng, oy, cfg.tremor_theta, tremor_px, dt)
         jx = ox * speed_scale * taper
         jy = oy * speed_scale * taper
 
@@ -325,10 +326,6 @@ def _velocity_warp(s: float, peak_frac: float) -> float:
         return s
     gamma = math.log(0.5) / math.log(peak_frac)
     return s ** gamma
-
-
-def _ou(rng: Random, prev: float, theta: float, sigma: float, dt: float) -> float:
-    return prev - theta * prev * dt + sigma * math.sqrt(max(dt, 0.0)) * rng.gauss(0.0, 1.0)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

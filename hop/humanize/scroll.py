@@ -21,6 +21,7 @@ from random import Random
 
 from ..config import MotorConfig, ScrollConfig
 from ..geometry import PanelGeometry
+from ..rng import ou_step
 from ..touchstream import Gesture, TouchSample
 from .contact import ContactModel
 from .state import HumanState
@@ -93,8 +94,8 @@ def synth_fling(
     for i in range(n + 1):
         u = i / n
         d = travel * (u ** p)
-        ox = ox - motor_cfg.tremor_theta * ox * dt + tremor_px * math.sqrt(dt) * rng.gauss(0, 1)
-        oy = oy - motor_cfg.tremor_theta * oy * dt + tremor_px * math.sqrt(dt) * rng.gauss(0, 1)
+        ox = ou_step(rng, ox, motor_cfg.tremor_theta, tremor_px, dt)
+        oy = ou_step(rng, oy, motor_cfg.tremor_theta, tremor_px, dt)
         # tremor perpendicular to travel, fades as speed rises
         perp = (-uy, ux)
         jitter = ox * (1.0 - u)

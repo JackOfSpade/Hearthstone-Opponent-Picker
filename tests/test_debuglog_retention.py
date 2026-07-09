@@ -128,6 +128,30 @@ def test_debuglog_journal_is_never_pruned(tmp_path):
     assert "gear" in (tmp_path / "journal.jsonl").read_text()
 
 
+def test_jsonable_preserves_nested_dicts_in_lists():
+    """A journalled list of dicts (e.g. unknown-screen near_misses) must round-trip as
+    dicts, not as Python-repr strings -- the summariser reads them as objects."""
+    import json
+
+    from hop.debuglog import _jsonable
+
+    out = _jsonable({"near_misses": [{"state": "in_game", "score": 0.53, "thr": 0.72}],
+                     "n": 3, "where": "dispatch"})
+    assert out["near_misses"][0] == {"state": "in_game", "score": 0.53, "thr": 0.72}
+    json.dumps(out)                        # and the whole thing stays JSON-serialisable
+
+
+def test_jsonable_stringifies_only_genuine_non_serialisable_leaves():
+    from hop.debuglog import _jsonable
+
+    class Weird:
+        def __repr__(self): return "<weird>"
+
+    out = _jsonable({"items": [Weird(), {"ok": 1}], "obj": Weird()})
+    assert out["items"] == ["<weird>", {"ok": 1}]
+    assert out["obj"] == "<weird>"
+
+
 def test_defaults_are_bounded():
     assert 0 < DEFAULT_MAX_ANOMALY_FRAMES < 100
     assert 0 < DEFAULT_KEEP_RUNS < 100

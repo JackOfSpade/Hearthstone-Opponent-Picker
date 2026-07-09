@@ -99,9 +99,8 @@ class Classification:
 
 
 class ScreenClassifier:
-    def __init__(self, anchors: list[Anchor], accept: float = 0.72):
+    def __init__(self, anchors: list[Anchor]):
         self.anchors = anchors
-        self.accept = accept
 
     def classify(self, frame: Frame) -> Classification:
         """Return the best-matching screen state and *its* confidence.

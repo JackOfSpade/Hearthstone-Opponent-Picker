@@ -27,6 +27,20 @@ def test_persist_criteria_writes_the_picks_to_config(tmp_path):
     assert srv.cfg.criteria.target_classes == (HeroClass.MAGE, HeroClass.PRIEST)
 
 
+def test_criteria_summary_reflects_config_changed_out_of_band(tmp_path):
+    """The criteria endpoint / risk meter must reflect the file, so a class the menu-bar
+    twin persisted shows on the dashboard. Both surfaces write the same config; the
+    server held its own in-memory copy, so without a reload the pick never appeared here.
+    """
+    from hop.config import save_criteria
+
+    srv, p = _server(tmp_path)                       # server's cfg starts empty
+    save_criteria(target_classes=(HeroClass.MAGE,), require_second=True, path=p)
+    summary = srv._criteria_summary()
+    assert "Mage" in summary["target_classes"]       # display name, reloaded from disk
+    assert summary["require_second"] is True
+
+
 def test_persist_criteria_ignores_a_missing_key(tmp_path):
     srv, p = _server(tmp_path, "[criteria]\ntarget_classes = [\"ROGUE\"]\nrequire_second = false\n")
     srv._persist_criteria({"require_second": True})           # no target_classes key

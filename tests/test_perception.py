@@ -129,7 +129,8 @@ def test_screen_classifier_custom_threshold():
     anchor = Anchor(ScreenState.MULLIGAN, anchor_tmpl)
     classifier = ScreenClassifier([anchor])
 
-    # Match score is 0.68 (greater than template's 0.65, but less than self.accept 0.72)
+    # Classification gates only on the per-anchor template threshold (0.65 here); a
+    # 0.68 match clears it, so the screen is MULLIGAN with that score as its confidence.
     with patch("hop.perception.screens.best_match") as mock_best:
         mock_best.return_value = Match("mulligan", 100, 100, 0.68)
         classification = classifier.classify(None)

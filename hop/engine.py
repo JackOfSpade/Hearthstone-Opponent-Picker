@@ -728,6 +728,13 @@ class Engine:
                 self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
                 continue
             if cls.state not in (ScreenState.RECONNECTING, ScreenState.RECONNECT_DIALOG):
+                # This disconnect episode is over. The cap bounds *consecutive* failed
+                # attempts within one episode (that is what "failed to reconnect after N
+                # attempts; needs a human" means), so a success must zero the counter -
+                # otherwise the lifetime tally of the idle disconnects this loop's own
+                # pacing provokes (each individually recovered) trips the cap and falsely
+                # halts a long, healthy hunt on its 4th reconnect.
+                self._reconnect_attempts = 0
                 if self.debug:
                     self.debug.record("reconnect_resolved", state=cls.state.value)
                 return

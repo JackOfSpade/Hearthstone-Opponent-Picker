@@ -135,6 +135,27 @@ def test_summarize_journal_shows_any_when_no_target_classes():
     assert "targets=ANY" in br.summarize_journal(text)
 
 
+def test_near_misses_survive_the_real_journal_write_into_the_report(tmp_path):
+    """Regression: near_misses (a list of dicts) went through DebugLog._jsonable, which
+    stringified each dict, so the journal held reprs and summarize_journal crashed on
+    top.get('state') -- the exact unknown-screen halt the report most needed to describe.
+
+    The older near-miss test hand-built the journal JSON and so never exercised the
+    lossy write path; this one writes through DebugLog and reads it back.
+    """
+    from hop.debuglog import DebugLog
+
+    dbg = DebugLog(tmp_path / "run", unknown_dir=tmp_path / "unknowns")
+    dbg.record("unknown_screen", where="dispatch",
+               near_misses=[{"state": "in_game", "score": 0.539, "thr": 0.72}])
+    journal = (tmp_path / "run" / "journal.jsonl").read_text()
+
+    summary = br.summarize_journal(journal)                 # must not raise
+    # the *formatted* form only appears if the dict round-tripped (a stringified repr
+    # would render as "{'state': 'in_game', ...}", not "in_game 0.539 (thr 0.72)")
+    assert "in_game 0.539 (thr 0.72)" in summary
+
+
 # ── collection (I/O) ─────────────────────────────────────────────────────────
 
 def _paths(tmp: Path) -> br.ReportPaths:

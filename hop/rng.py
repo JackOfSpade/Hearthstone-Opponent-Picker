@@ -17,18 +17,11 @@ import math
 from random import Random
 
 __all__ = [
-    "default_rng",
     "lognormal_multiplier",
     "shifted_lognormal",
     "clamp",
     "ou_step",
-    "beta_sample",
 ]
-
-
-def default_rng() -> Random:
-    """A fresh, entropy-seeded RNG for production use."""
-    return Random()
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -70,19 +63,3 @@ def ou_step(rng: Random, prev: float, theta: float, sigma: float, dt: float) -> 
         - theta * prev * dt
         + sigma * math.sqrt(max(dt, 0.0)) * rng.gauss(0.0, 1.0)
     )
-
-
-def beta_sample(rng: Random, alpha: float, beta: float) -> float:
-    """Sample from a Beta(alpha, beta) distribution on [0, 1].
-
-    ``random.Random`` has no ``betavariate`` that accepts our exact call shape
-    uniformly across versions, but it does - we wrap it so the humanize layer
-    depends only on this module. Falls back to a gamma-ratio construction if a
-    future Random lacks it.
-    """
-    try:
-        return rng.betavariate(alpha, beta)
-    except AttributeError:  # pragma: no cover - defensive
-        ga = rng.gammavariate(alpha, 1.0)
-        gb = rng.gammavariate(beta, 1.0)
-        return ga / (ga + gb) if (ga + gb) > 0 else 0.5

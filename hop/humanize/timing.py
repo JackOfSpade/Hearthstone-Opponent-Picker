@@ -25,23 +25,23 @@ sleeps, so this module stays pure and testable.
 
 from __future__ import annotations
 
-import math
 from random import Random
 
 from ..config import TimingConfig
+from ..rng import lognormal_multiplier, shifted_lognormal
 from .state import HumanState
 
 
 def human_delay(rng: Random, anchor_s: float, cfg: TimingConfig) -> float:
     """Ordinary pause: ``anchor * exp(N(0,sigma)*sigma)`` - may be shorter or
     longer, with an organic right-skewed tail. Never negative."""
-    return max(0.0, anchor_s * math.exp(rng.gauss(0.0, cfg.sigma) * cfg.sigma))
+    return max(0.0, anchor_s * lognormal_multiplier(rng, cfg.sigma))
 
 
 def human_cooldown(rng: Random, anchor_s: float, cfg: TimingConfig) -> float:
     """Minimum-wait/backoff pause: like :func:`human_delay` but clamped to never
     fall below the anchor (the anchor is a floor, e.g. a mandated cooldown)."""
-    return anchor_s * (1.0 + abs(math.exp(rng.gauss(0.0, cfg.sigma) * cfg.sigma) - 1.0))
+    return anchor_s * (1.0 + abs(lognormal_multiplier(rng, cfg.sigma) - 1.0))
 
 
 def between_actions(rng: Random, cfg: TimingConfig, state: HumanState) -> float:
@@ -82,7 +82,7 @@ def think_time(
     else:
         shift, mu, sigma = cfg.think_reject_shift, cfg.think_reject_mu, cfg.think_reject_sigma
 
-    base = shift + math.exp(rng.gauss(mu, sigma))
+    base = shifted_lognormal(rng, shift, mu, sigma)
     scale = state.think_time_scale()
     scale *= 1.0 + 0.5 * max(0.0, min(1.0, visual_complexity))
     scale *= 1.0 + 0.8 * max(0.0, min(1.0, novelty)) * (1.0 - state.familiarity)

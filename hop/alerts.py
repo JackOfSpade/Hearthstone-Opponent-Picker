@@ -69,6 +69,8 @@ class Alerter:
     # ── platform helpers ─────────────────────────────────────────────────────
 
     def _mac_notify(self, title: str, body: str) -> None:
+        if not self.cfg.mac_notification:
+            return                     # user turned Mac banners off; honour it
         if sys.platform != "darwin":
             return
         osa = shutil.which("osascript")

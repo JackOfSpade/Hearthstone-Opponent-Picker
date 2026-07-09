@@ -197,9 +197,7 @@ non_repetition_resamples = 8
 # constant can straddle both. Re-measure both rows if you change the number.
 state_change_threshold = 9.0
 dedupe_signature_size = 24         # NxN downsample for frame-advance detection
-ncc_match_threshold = 0.72         # normalized cross-correlation accept level
 ocr_max_edit_distance = 3          # snap-to-class fails closed beyond this
-weak_match_margin = 0.08           # match this-close to threshold => low confidence -> inspect
 # Hearthstone animates between screens, so a single unrecognized frame usually
 # means we looked mid-transition (e.g. the blurred board fade after a concede),
 # not that we are lost. Re-look this many times - never tapping - before failing

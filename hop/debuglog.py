@@ -227,14 +227,26 @@ class DebugLog:
 
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for k, v in d.items():
-        if is_dataclass(v):
-            out[k] = asdict(v)
-        elif isinstance(v, (str, int, float, bool)) or v is None:
-            out[k] = v
-        elif isinstance(v, (list, tuple)):
-            out[k] = [x if isinstance(x, (str, int, float, bool)) or x is None else str(x) for x in v]
-        else:
-            out[k] = str(v)
-    return out
+    return {str(k): _json_value(v) for k, v in d.items()}
+
+
+def _json_value(v: Any) -> Any:
+    """Coerce one value to a JSON-serialisable form, preserving nested structure.
+
+    The list branch used to ``str()`` every non-scalar element, which flattened a
+    list of dicts - e.g. an unknown screen's ``near_misses`` ``[{"state":..}, ...]`` -
+    into a list of Python reprs. The journal then held strings where the bug-report
+    summariser expected dicts (``near_misses[0].get("state")``), so a single
+    unknown-screen halt made ``hop bugreport`` raise ``AttributeError`` on the exact
+    run it most needed to describe. Recurse instead, and only stringify genuine
+    non-serialisable leaves.
+    """
+    if is_dataclass(v) and not isinstance(v, type):
+        return _json_value(asdict(v))
+    if isinstance(v, dict):
+        return {str(k): _json_value(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_value(x) for x in v]
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return str(v)
