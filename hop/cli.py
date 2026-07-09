@@ -206,6 +206,76 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 1
 
 
+def _device_summary(cfg: Config, pack_dir: Path) -> str:
+    """A compact, best-effort device/anchor summary string for a bug report.
+
+    Best-effort: each probe is guarded so an offline phone yields "(not connected)"
+    rather than an exception. Returns Markdown lines.
+    """
+    out: list[str] = [f"- hop {__version__}",
+                      f"- adb_address: `{cfg.device.adb_address or '(unset)'}`",
+                      f"- touch_backend: {cfg.device.touch_backend}  posture: {cfg.device.posture}  "
+                      f"risk: {cfg.risk_profile}",
+                      f"- OCR (pytesseract): {'available' if tesseract_available() else 'MISSING'}"]
+    clf = load_template_pack(pack_dir)
+    out.append(f"- anchors: {len(clf.anchors)} in {pack_dir}")
+    addr = cfg.device.adb_address
+    if addr:
+        try:
+            adb = Adb(addr)
+            adb.connect()
+            if adb.is_connected():
+                panel = adb.measure_panel()
+                out.append(f"- device: CONNECTED, panel {panel.width_px}x{panel.height_px} "
+                           f"@ {panel.dpi:.0f} dpi, UHID tool: {'yes' if adb.has_hid_tool() else 'no'}")
+                try:
+                    c = load_template_pack(pack_dir).classify(_capture_frame(adb))
+                    out.append(f"- current screen: {c.state.value} (confidence {c.confidence:.2f})")
+                except Exception:
+                    pass
+            else:
+                out.append("- device: NOT connected")
+        except Exception as e:
+            out.append(f"- device: probe failed ({e})")
+    return "\n".join(out)
+
+
+def _capture_frame(adb):
+    from .perception.capture import Capturer
+    return Capturer(adb).capture()
+
+
+def cmd_bugreport(args) -> int:
+    from . import bugreport as br
+
+    cfg = load_config(args.config)
+    pack_dir = Path(args.templates or _default_pack_dir())
+    description = args.description
+    if description is None:
+        # Interactive: read a description from stdin so `hop bugreport` alone works.
+        try:
+            print("Describe what went wrong (end with Ctrl-D):", file=sys.stderr)
+            description = sys.stdin.read()
+        except KeyboardInterrupt:
+            return 1
+
+    paths = br.ReportPaths(
+        config=Path(args.config) if args.config else (Path.home() / ".config" / "hop" / "config.toml"),
+        runs_root=_runs_root(),
+        unknowns_dir=_unknowns_dir(),
+        app_log=Path.home() / "Library" / "Logs" / "hop.log",
+        templates=pack_dir,
+    )
+    probe = None if args.no_device else (lambda: _device_summary(cfg, pack_dir))
+    markdown = br.collect(description, paths, version=__version__, device_probe=probe)
+
+    dest = Path(args.out) if args.out else (Path.home() / "Desktop")
+    path = br.write_report(markdown, dest)
+    print(f"bug report written -> {path}")
+    print("Attach or paste this file into Claude Code; it will self-improve the harness.")
+    return 0
+
+
 def cmd_connect(args) -> int:
     cfg = load_config(args.config)
     addr = args.address or cfg.device.adb_address
@@ -638,6 +708,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-browser", action="store_true")
     sp.add_argument("--seed", type=int, default=None)
     sp.set_defaults(func=cmd_dashboard)
+
+    sp = sub.add_parser("bugreport", help="bundle a self-improving bug report (logs + state) to the Desktop")
+    sp.add_argument("--description", "--desc", dest="description",
+                    help="what went wrong (omit to type it interactively)")
+    sp.add_argument("--out", help="destination directory (default: ~/Desktop)")
+    sp.add_argument("--no-device", action="store_true",
+                    help="skip the live device probe (faster; use when the phone is offline)")
+    sp.set_defaults(func=cmd_bugreport)
     return p
 
 
