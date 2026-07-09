@@ -15,6 +15,8 @@ it. Tests use a ``FakeAdb`` with the same surface (see tests/).
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import time
 
@@ -25,10 +27,36 @@ class AdbError(RuntimeError):
     pass
 
 
+#: Where `adb` commonly lives when it isn't on PATH. A .app launched from Finder gets a
+#: minimal PATH that excludes Homebrew and the Android SDK, so bare "adb" isn't found;
+#: we resolve an absolute path as a fallback (the launcher also augments PATH).
+_ADB_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/adb",
+    "/usr/local/bin/adb",
+    os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+    os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+)
+
+
+def resolve_adb() -> str:
+    """Absolute path to `adb`, or the bare name if nothing is found.
+
+    Prefers PATH (respects a user override), then the common install locations. Returning
+    "adb" when truly absent lets the call fail with a clear "adb not found" message.
+    """
+    found = shutil.which("adb")
+    if found:
+        return found
+    for cand in _ADB_FALLBACK_PATHS:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return "adb"
+
+
 class Adb:
-    def __init__(self, address: str, adb_bin: str = "adb", timeout: float = 20.0):
+    def __init__(self, address: str, adb_bin: str | None = None, timeout: float = 20.0):
         self.address = address
-        self.adb_bin = adb_bin
+        self.adb_bin = adb_bin or resolve_adb()
         self.timeout = timeout
 
     # ── raw invocation ──────────────────────────────────────────────────────
@@ -36,12 +64,19 @@ class Adb:
     def _base(self) -> list[str]:
         return [self.adb_bin, "-s", self.address] if self.address else [self.adb_bin]
 
+    def _missing_adb_msg(self) -> str:
+        return (f"adb not found (tried {self.adb_bin!r}). Install Android platform-tools "
+                "(brew install --cask android-platform-tools) or add adb to your PATH.")
+
     def _run(self, args: list[str], binary: bool = False) -> bytes:
-        proc = subprocess.run(
-            self._base() + args,
-            capture_output=True,
-            timeout=self.timeout,
-        )
+        try:
+            proc = subprocess.run(
+                self._base() + args,
+                capture_output=True,
+                timeout=self.timeout,
+            )
+        except FileNotFoundError:
+            raise AdbError(self._missing_adb_msg())
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise AdbError(f"adb {' '.join(args)} failed: {err.strip()}")
@@ -78,6 +113,10 @@ class Adb:
                 if "connected" in out or "already" in out:
                     return
                 last = out
+            except FileNotFoundError:
+                # a missing binary can never succeed - fail immediately instead of
+                # burning the whole 2+4+8+16 s backoff on a hopeless retry loop.
+                raise AdbError(self._missing_adb_msg())
             except Exception as e:  # pragma: no cover - network
                 last = str(e)
             if attempt < retries:

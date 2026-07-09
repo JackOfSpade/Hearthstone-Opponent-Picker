@@ -29,6 +29,13 @@ echo "[$(date)] Hearthstone Opponent Picker launching"
 
 notify() { osascript -e "display notification \"$1\" with title \"Hearthstone Opponent Picker\" sound name \"$2\"" >/dev/null 2>&1; }
 
+# A .app launched from Finder/LaunchServices gets a MINIMAL PATH (/usr/bin:/bin:...),
+# NOT your login shell's -- so the `adb` and `tesseract` binaries hop shells out to
+# (Homebrew / Android SDK) are invisible, and "Start Search" dies with
+# "No such file or directory: 'adb'". Prepend the usual tool locations so the whole
+# app (engine + OCR) can find them, exactly as it would from a terminal.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/Library/Android/sdk/platform-tools:$HOME/Android/Sdk/platform-tools:$PATH"
+
 # Pick the first python3 that can actually `import hop`, never just the first on PATH:
 # hop lives in one framework python (with numpy/Pillow/pyobjc); the login PATH's python3
 # may be a different one. Run the loop in THIS shell (not a $(...) subshell) so the
