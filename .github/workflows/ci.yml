@@ -1,0 +1,29 @@
+name: CI
+
+# No branch filter on push: the auto-merge-to-main workflow gates merges on
+# finding a green run of this exact workflow ("CI") for a given commit SHA,
+# on whatever branch that commit lives on — so this must run everywhere.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Real test suite (tests/, 60 tests) needs only the `dev` extra
+      # (pytest). The vision/web/hotkeys extras are optional at runtime —
+      # every module that imports them guards the import and falls back to
+      # a pure-Python path, so they add CI time without adding coverage.
+      - name: Install package with dev dependencies
+        run: pip install -e '.[dev]'
+
+      - name: Run test suite
+        run: pytest -q
