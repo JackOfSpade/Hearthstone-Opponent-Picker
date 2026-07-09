@@ -136,7 +136,12 @@ class DebugLog:
             else self.run_dir.parent.parent / "unknowns"
         self.max_unknown_frames = max_unknown_frames
 
-    def record(self, kind: str, **detail: Any) -> None:
+    def record(self, kind: str, /, **detail: Any) -> None:
+        # `kind` is positional-only (the `/`) on purpose: `anomaly`/`unknown_screen`
+        # forward caller **context into here, and a caller whose context happens to
+        # carry a `kind=` key would otherwise raise "got multiple values for argument
+        # 'kind'" and crash the recorder mid-anomaly. Positional-only makes that key
+        # land in `detail` instead of colliding with this parameter.
         entry = JournalEntry(t=self._clock(), kind=kind, detail=_jsonable(detail))
         with self._journal.open("a") as f:
             f.write(json.dumps(asdict(entry)) + "\n")

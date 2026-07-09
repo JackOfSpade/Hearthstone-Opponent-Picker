@@ -174,8 +174,11 @@ class Verifier:
               coherence: str = "", kind: str = Halt.UNEXPECTED,
               raise_on_fail: bool = True) -> VerifyResult:
         if self.debug is not None:
+            # Record the Halt fault code under `fault`, NOT `kind`: `anomaly` forwards
+            # this into `DebugLog.record(kind="anomaly", ...)`, and a `kind=` here used
+            # to collide with that positional argument and crash every verify failure.
             self.debug.anomaly(reason, before=before, after=after,
-                               change_kind=change_kind, coherence=coherence, kind=kind)
+                               change_kind=change_kind, coherence=coherence, fault=kind)
         if raise_on_fail:
             raise Halt(reason, kind)
         return VerifyResult(False, reason, change_kind, coherence, kind)
