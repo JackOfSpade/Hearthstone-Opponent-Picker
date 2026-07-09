@@ -1,7 +1,7 @@
 """EngineController - run the engine in a background thread with shared status.
 
 The dashboard (and any future controller) drives the engine through this small
-interface: :meth:`start`, :meth:`stop`, :meth:`ack_alarm`, :meth:`status`, and
+interface: :meth:`start`, :meth:`stop`, :meth:`status`, and
 :meth:`latest_png`. The engine's hunt loop is blocking, so it runs on a daemon
 thread; status is aggregated from the live ``HumanState``, limiter counters and
 :class:`~hop.engine.RunStats`.
@@ -91,10 +91,6 @@ class EngineController:
         if eng is not None:
             eng.request_stop()
 
-    def ack_alarm(self) -> None:
-        if self.alerter is not None:
-            self.alerter.stop_alarm()
-
     def latest_png(self) -> bytes | None:
         eng = self._engine
         if eng is None:
@@ -111,15 +107,21 @@ class EngineController:
             "phase": self._current_phase(),
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_tb,
-            # whether the target alarm is actively sounding, so the dashboard can enable
-            # "Silence alarm" only when there is something to silence.
-            "alarming": bool(getattr(self.alerter, "is_alarming", False)),
             "uptime_s": round(time.time() - self._started_at, 1) if self._started_at else 0,
         }
         if eng is None:
             return base
         s, st, lim = eng.stats, eng.state, eng.limiter
+        crit = eng.cfg.criteria
         base.update({
+            # the criteria THIS run is actually using (config + dashboard/menu overrides,
+            # merged at construction). Surfaced so a bug report shows what the run hunted
+            # for -- the config file alone can be stale when the dashboard overrides it.
+            "criteria": {
+                "target_classes": [c.name for c in crit.target_classes],
+                "require_second": crit.require_second,
+                "mode": crit.mode,
+            },
             "games": s.games,
             "concedes": s.concedes,
             "target_found": s.target_found,

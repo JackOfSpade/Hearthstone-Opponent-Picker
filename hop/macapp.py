@@ -134,6 +134,7 @@ class _AppState:
         self.AppKit = AppKit
         self.status_item = None
         self.menu = None
+        self.toggle_item = None          # the single Start/Stop menu item
         self.class_items: dict[HeroClass, object] = {}
         self.require_second_item = None
         self.status_line = None
@@ -246,9 +247,9 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s.risk_line = self._disabled(menu, s.risk_text())
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-            self._action(menu, "Start Search", "start_", key="s")
-            self._action(menu, "Stop", "stop_", key=".")
-            self._action(menu, "Silence alarm", "ack_", key="a")
+            # one item that toggles Start <-> Stop, matching the dashboard's single
+            # button; refresh_ keeps its title in step with the real engine state.
+            s.toggle_item = self._action(menu, "Start Search", "toggle_", key="s")
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
             # target classes: a checkable submenu; empty selection = accept any class
@@ -357,8 +358,14 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
         def stop_(self, sender):
             self._state.controller.stop()
 
-        def ack_(self, sender):
-            self._state.controller.ack_alarm()
+        def toggle_(self, sender):
+            # Start when idle, Stop when running -- the menu twin of the dashboard's
+            # single button. Reverts to Start on its own via refresh_ after any stop.
+            c = self._state.controller
+            if c.running:
+                c.stop()
+            else:
+                self.start_(sender)
 
         def toggleClass_(self, sender):
             s = self._state
@@ -386,17 +393,25 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s = self._state
             s.status_item.button().setTitle_(s.title())
             s.status_line.setTitle_(s.status_text())
+            if s.toggle_item is not None:
+                s.toggle_item.setTitle_("Stop" if s.controller.running else "Start Search")
 
-        # ── Dock behaviour ────────────────────────────────────────────────────
-        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_windows):
-            """Clicking the Dock icon with no window open reopens the hub window.
+        # ── quit behaviour ────────────────────────────────────────────────────
+        def applicationShouldTerminateAfterLastWindowClosed_(self, app):
+            """Closing the window (the red X) quits the whole app.
 
-            Closing the window only hides it (releasedWhenClosed=False), so this is
-            how you get it back from the Dock instead of quitting and relaunching.
+            The dashboard window IS the app to the user, so closing it should fully quit
+            -- menu-bar item and all -- not leave a headless process behind. Returning
+            True makes AppKit terminate once the last window closes.
             """
-            if not has_windows:
-                _open_dashboard_window(self._state)
             return True
+
+        def applicationWillTerminate_(self, note):
+            """Stop the hunt cleanly on the way out (release ADB), same as Quit."""
+            try:
+                self._state.controller.stop()
+            except Exception:
+                pass
 
 
 def _ensure_dashboard(state: _AppState) -> threading.Thread:
@@ -410,7 +425,8 @@ def _ensure_dashboard(state: _AppState) -> threading.Thread:
     from .webui import DashboardServer
 
     def _serve():
-        DashboardServer(state.controller, state.cfg, port=DASHBOARD_PORT).serve_forever()
+        DashboardServer(state.controller, state.cfg, port=DASHBOARD_PORT,
+                        config_path=state.config_path).serve_forever()
 
     t = threading.Thread(target=_serve, daemon=True)
     t.start()

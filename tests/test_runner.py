@@ -90,23 +90,6 @@ def test_start_clears_a_stale_stop_request():
     assert engines[1].stops == 0
 
 
-def test_status_reports_alarming_from_the_alerter():
-    """The dashboard gates 'Silence alarm' on this, so it must reflect the alerter."""
-    class FakeAlerter:
-        is_alarming = False
-
-    alerter = FakeAlerter()
-    c = EngineController(lambda overrides: _FakeEngine(), alerter=alerter)
-    assert c.status()["alarming"] is False
-    alerter.is_alarming = True
-    assert c.status()["alarming"] is True
-
-
-def test_status_alarming_is_false_without_an_alerter():
-    c = EngineController(lambda overrides: _FakeEngine())   # alerter=None
-    assert c.status()["alarming"] is False
-
-
 def test_status_captures_a_traceback_when_construction_crashes():
     """A crash must leave a full traceback in status so a bug report pinpoints the line."""
     def boom(overrides):

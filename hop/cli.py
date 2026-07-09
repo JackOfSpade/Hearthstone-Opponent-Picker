@@ -506,7 +506,8 @@ def cmd_dashboard(args) -> int:
                             alerter=alerter, seed=args.seed)
 
     controller = EngineController(factory, alerter=alerter)
-    server = DashboardServer(controller, cfg, host=args.host, port=args.port)
+    server = DashboardServer(controller, cfg, host=args.host, port=args.port,
+                             config_path=args.config)
     url = f"http://{args.host}:{args.port}/"
     print(f"dashboard: {url}  (Ctrl-C to quit)")
     if not args.no_browser:

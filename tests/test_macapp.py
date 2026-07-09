@@ -27,9 +27,11 @@ def test_delegate_class_constructs_when_pyobjc_is_present():
     assert macapp._HopMenuDelegate is not None, (
         "the pyobjc delegate failed to build; the import guard is hiding a real error"
     )
-    for selector in ("start_", "stop_", "ack_", "toggleClass_",
+    for selector in ("start_", "stop_", "toggle_", "toggleClass_",
                      "toggleSecond_", "dashboard_", "quit_", "refresh_"):
         assert hasattr(macapp._HopMenuDelegate, selector)
+    # closing the window (red X) must quit the whole app, not leave it headless
+    assert hasattr(macapp._HopMenuDelegate, "applicationShouldTerminateAfterLastWindowClosed_")
 
 
 def test_missing_pyobjc_raises_a_helpful_error(monkeypatch):

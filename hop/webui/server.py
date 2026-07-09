@@ -6,7 +6,6 @@ Endpoints:
 * ``GET  /screen.png``  - latest phone screencap (throttled by the client)
 * ``POST /start``       - start the hunt (optional JSON criteria overrides)
 * ``POST /stop``        - request a clean stop
-* ``POST /ack``         - acknowledge / silence the target alarm
 * ``GET  /criteria``    - current criteria + risk summary (for the risk meter)
 
 The server holds an :class:`~hop.runner.EngineController` and a snapshot of the
@@ -29,11 +28,15 @@ def _index_html() -> bytes:
 
 
 class DashboardServer:
-    def __init__(self, controller: EngineController, cfg: Config, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(self, controller: EngineController, cfg: Config, host: str = "127.0.0.1",
+                 port: int = 8765, config_path=None):
         self.controller = controller
         self.cfg = cfg
         self.host = host
         self.port = port
+        #: where to persist class picks made in the dashboard, so a selection survives a
+        #: restart (the menu bar already does this) and shows up in a bug report's config.
+        self.config_path = config_path
         self._httpd: ThreadingHTTPServer | None = None
 
     def serve_forever(self) -> None:
@@ -81,14 +84,14 @@ class DashboardServer:
             def do_POST(self):
                 body = self._read_body()
                 if self.path.startswith("/start"):
+                    # persist the class picks BEFORE starting, so they survive a restart
+                    # and a bug report's config shows what this run actually hunted for.
+                    server._persist_criteria(body)
                     started = server.controller.start(body)
                     self._json(200, {"started": started})
                 elif self.path.startswith("/stop"):
                     server.controller.stop()
                     self._json(200, {"stopped": True})
-                elif self.path.startswith("/ack"):
-                    server.controller.ack_alarm()
-                    self._json(200, {"acked": True})
                 elif self.path.startswith("/bugreport"):
                     try:
                         n = server._bugreport(body.get("description", ""))
@@ -131,6 +134,31 @@ class DashboardServer:
         if not br.copy_to_clipboard(md):
             raise RuntimeError("could not copy the report to the clipboard (pbcopy failed)")
         return len(md.encode("utf-8"))
+
+    def _persist_criteria(self, body: dict) -> None:
+        """Save the dashboard's class picks / go-2nd toggle to the user config.
+
+        The menu bar already persists on every toggle; the dashboard's Start used to
+        apply the picks to the run as ephemeral overrides but never write them, so a
+        restart lost them and a bug report's config showed stale classes. Best-effort:
+        a bad class name or unwritable config must not stop the hunt from starting.
+        """
+        from dataclasses import replace
+        from ..config import save_criteria
+
+        names = body.get("target_classes")
+        if names is None:
+            return
+        try:
+            classes = tuple(parse_class(c) for c in names)
+            require_second = bool(body.get("require_second", self.cfg.criteria.require_second))
+            save_criteria(target_classes=classes, require_second=require_second,
+                          path=self.config_path)
+            # keep our in-memory cfg (the risk meter / criteria endpoint) in step
+            self.cfg = replace(self.cfg, criteria=replace(
+                self.cfg.criteria, target_classes=classes, require_second=require_second))
+        except (ValueError, OSError):
+            pass
 
     def _criteria_summary(self) -> dict:
         crit = self.cfg.criteria
@@ -203,9 +231,7 @@ _INDEX_HTML = """<!doctype html>
         <label class="chk"><input type="checkbox" id="second"> Only when going 2nd</label>
       </div>
       <div class="row">
-        <button id="startBtn">Start Search</button>
-        <button id="stopBtn" class="sec" disabled>Stop</button>
-        <button id="ackBtn" class="warn" disabled>Silence alarm</button>
+        <button id="toggleBtn">Start Search</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -286,10 +312,15 @@ function updateRiskFromForm(){
 }
 async function start(){ await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(chosenCriteria())}); }
 async function stop(){ await fetch('/stop',{method:'POST'}); }
-async function ack(){ await fetch('/ack',{method:'POST'}); document.getElementById('banner').style.display='none'; }
-document.getElementById('startBtn').onclick=start;
-document.getElementById('stopBtn').onclick=stop;
-document.getElementById('ackBtn').onclick=ack;
+// One button that is Start when idle and Stop when running. poll() keeps its label in
+// sync with the real engine state, so it flips back to "Start Search" by itself on a
+// stop, a crash, or a halt -- no separate Stop button to leave stranded.
+let RUNNING=false;
+document.getElementById('toggleBtn').onclick=async()=>{
+  const btn=document.getElementById('toggleBtn'); btn.disabled=true;
+  try{ if(RUNNING) await stop(); else await start(); }
+  finally{ btn.disabled=false; poll(); }
+};
 async function poll(){
   try{
     const s=await (await fetch('/status')).json();
@@ -299,22 +330,22 @@ async function poll(){
     if(s.running) connEl.textContent=s.phase||'running';
     else if(s.last_error) connEl.textContent='error';
     else connEl.textContent=(s.phase&&!['running','idle'].includes(s.phase))?s.phase:'idle';
-    // Only enable a button when its action is actually available: Start when idle,
-    // Stop when a hunt is live, Silence alarm only while the alarm is sounding (or a
-    // target is up). This stops "clicking Silence alarm does nothing before a search".
-    document.getElementById('startBtn').disabled=s.running;
-    document.getElementById('stopBtn').disabled=!s.running;
-    document.getElementById('ackBtn').disabled=!(s.alarming||s.target_found);
+    // The single toggle button mirrors the real engine state, so it reverts to "Start
+    // Search" on its own after a stop, a crash, or a halt.
+    RUNNING=!!s.running;
+    const tb=document.getElementById('toggleBtn');
+    tb.textContent=RUNNING?'Stop':'Start Search';
+    tb.className=RUNNING?'warn':'';
     // Surface a Search that died on arrival (e.g. missing vision deps) rather than let it
     // read as "nothing happened": a failed start leaves last_error set and running=false.
     const b=document.getElementById('banner');
     if(s.target_found){
       b.className=''; b.style.display='block';
-      b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn! (Silence alarm to dismiss)';
+      b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn!';
     }else if(s.last_error && !s.running){
       b.className='err'; b.style.display='block';
       b.textContent='⚠ Search stopped — '+s.last_error;
-    }else if(b.className==='err'){
+    }else{
       b.className=''; b.style.display='none';
     }
     if(s.games!==undefined){
