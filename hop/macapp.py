@@ -55,16 +55,59 @@ def _require_appkit():
     return __import__("AppKit"), __import__("objc")
 
 
+def _brand_process(app_name: str = "Hearthstone Opponent Picker") -> None:
+    """Make the menu bar and Dock read our name, not "Python".
+
+    A framework-Python GUI app re-execs through ``Python.app``, whose bundle name is
+    "Python"; AppKit reads ``CFBundleName`` from the main bundle's info dictionary for
+    the app menu (and it seeds the Dock tile's label). Mutating that in-memory dict
+    before ``NSApplication`` is built relabels it -- the same trick rumps/matplotlib
+    use. Best-effort: a failure just leaves the default name.
+    """
+    try:
+        from Foundation import NSBundle
+        b = NSBundle.mainBundle()
+        info = b.localizedInfoDictionary() or b.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = app_name
+    except Exception:
+        pass
+
+
+def _apply_dock_icon(app, AppKit) -> None:
+    """Set the Dock icon to the .app's AppIcon.icns (path passed via ``HOP_APP_ICON``).
+
+    The re-exec'd ``Python.app`` owns the Dock tile, so its default is the generic
+    Python rocket; ``setApplicationIconImage_`` overrides it at runtime with ours. The
+    launcher exports ``HOP_APP_ICON`` because this Python process can't otherwise locate
+    the surrounding .app bundle. Best-effort; a missing file just leaves the default.
+    """
+    import os
+    path = os.environ.get("HOP_APP_ICON", "")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        img = AppKit.NSImage.alloc().initWithContentsOfFile_(path)
+        if img is not None:
+            app.setApplicationIconImage_(img)
+    except Exception:
+        pass
+
+
 def run_menubar(cfg: Config, engine_factory, alerter=None,
                 config_path: str | Path | None = None) -> int:
     """Run the menu-bar control panel. Blocks until the user quits."""
     AppKit, objc = _require_appkit()
     from .runner import EngineController
 
+    _brand_process()   # relabel "Python" -> our name BEFORE NSApplication reads it
     controller = EngineController(engine_factory, alerter=alerter)
     app = AppKit.NSApplication.sharedApplication()
-    # Accessory: a menu-bar item with no Dock icon and no main window.
-    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    # Regular app: a Dock icon and a Cmd-Tab entry, PLUS the menu-bar item. The Dock
+    # icon lets the hub window be reopened after it's closed (see the reopen handler);
+    # the menu bar keeps the glanceable state and the loud target alert.
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+    _apply_dock_icon(app, AppKit)   # our AppIcon.icns over the generic Python rocket
 
     delegate = _HopMenuDelegate.alloc().initWithState_(
         _AppState(cfg=cfg, controller=controller, config_path=config_path, AppKit=AppKit)
@@ -234,8 +277,35 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s.status_item.setMenu_(menu)
             s.menu = menu
 
+            self._install_main_menu()
+
             AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 1.0, self, b"refresh:", None, True)
+
+        @_objc.python_method
+        def _install_main_menu(self):
+            """A minimal main menu so the Dock app behaves like one: the app menu
+            gives a working Cmd-Q that routes through our clean stop, and the Window
+            menu lets the closed hub window be reopened. Accessory apps don't need
+            this; a Regular (Dock) app looks broken without it (no Cmd-Q, no app menu).
+            """
+            AppKit = self._state.AppKit
+            app = AppKit.NSApplication.sharedApplication()
+            main = AppKit.NSMenu.alloc().init()
+
+            app_item = AppKit.NSMenuItem.alloc().init()
+            main.addItem_(app_item)
+            app_menu = AppKit.NSMenu.alloc().init()
+            show = app_menu.addItemWithTitle_action_keyEquivalent_(
+                "Open hop Window", b"dashboard:", "0")
+            show.setTarget_(self)
+            app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            quit_item = app_menu.addItemWithTitle_action_keyEquivalent_(
+                "Quit Hearthstone Opponent Picker", b"quit:", "q")
+            quit_item.setTarget_(self)
+            app_item.setSubmenu_(app_menu)
+
+            app.setMainMenu_(main)
 
         @_objc.python_method
         def _disabled(self, menu, title):
@@ -297,6 +367,17 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s.status_item.button().setTitle_(s.title())
             s.status_line.setTitle_(s.status_text())
 
+        # ── Dock behaviour ────────────────────────────────────────────────────
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_windows):
+            """Clicking the Dock icon with no window open reopens the hub window.
+
+            Closing the window only hides it (releasedWhenClosed=False), so this is
+            how you get it back from the Dock instead of quitting and relaunching.
+            """
+            if not has_windows:
+                _open_dashboard_window(self._state)
+            return True
+
 
 def _ensure_dashboard(state: _AppState) -> threading.Thread:
     """Start the stdlib dashboard on a daemon thread, once.
@@ -324,8 +405,9 @@ def _open_dashboard_window(state: _AppState) -> None:
     Chrome - it's the system WebKit view, hosted inside the same Python process, so the
     settings/stats hub is a native window with zero extra runtime.
 
-    Re-opening reuses the existing window. The app is an accessory (no Dock icon), so we
-    activate it to bring the window to the front.
+    Re-opening reuses the existing window (closing only hides it). We activate the app so
+    the window comes to the front whether it was launched, reopened from the Dock, or
+    summoned from the menu bar.
     """
     AppKit = state.AppKit
     _ensure_dashboard(state)

@@ -10,10 +10,11 @@
   <key>CFBundleShortVersionString</key> <string>2.0.0</string>
   <key>CFBundleVersion</key>         <string>2.0.0</string>
   <key>LSMinimumSystemVersion</key>  <string>11.0</string>
-  <!-- Menu-bar agent: no Dock icon, no cmd-tab entry. The app also sets
-       NSApplicationActivationPolicyAccessory itself; this just avoids a
-       launch-time Dock bounce. Quit from the menu-bar menu. -->
-  <key>LSUIElement</key>             <true/>
+  <!-- Regular Dock app: shows a Dock icon and a Cmd-Tab entry AND keeps the
+       menu-bar item. The app sets NSApplicationActivationPolicyRegular itself;
+       omitting LSUIElement (vs. setting it true) is what lets the Dock icon
+       appear at launch. Quit from the Dock, Cmd-Q, or the menu-bar menu. -->
+  <key>CFBundleIconFile</key>        <string>AppIcon</string>
   <!-- hop's source lives under ~/Desktop, a TCC-protected folder; this is the
        reason string shown if macOS prompts for Desktop access. -->
   <key>NSDesktopFolderUsageDescription</key>

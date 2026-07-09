@@ -97,8 +97,14 @@ if ! deperr="$("$PY" -c 'import PIL, numpy' 2>&1)"; then
     || { echo "x vision install failed -- Start Search will not work until deps are present."; notify "Vision dependency install failed. See ~/Library/Logs/hop.log" "Basso"; }
 fi
 
+# The re-exec'd Python.app can't locate this .app bundle on its own, so hand it the
+# path to our icon; hop.macapp sets it as the Dock icon at runtime (${0:A:h} is this
+# script's real directory, .../Contents/MacOS, so the icon is one level up in Resources).
+export HOP_APP_ICON="${0:A:h}/../Resources/AppIcon.icns"
+[ -f "$HOP_APP_ICON" ] && echo "> Dock icon: $HOP_APP_ICON" || echo "x Dock icon not found: $HOP_APP_ICON"
+
 if "$PY" -c 'import AppKit' >/dev/null 2>&1; then
-  echo "> Launching the menu-bar app (accessory: no Dock icon; quit from its menu)."
+  echo "> Launching the app (Dock icon + menu-bar item; quit from the Dock, Cmd-Q, or the menu)."
   exec "$PY" -m hop.cli app
 else
   echo "x pyobjc missing; opening the web dashboard instead (pip install 'hop[mac]')."
