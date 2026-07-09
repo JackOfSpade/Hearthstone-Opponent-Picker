@@ -206,9 +206,8 @@ def test_error_dialog_is_dismissed_not_halted(cfg):
     assert eng.limiter.commits_this_run == 0
 
 
-def test_deck_select_reopens_the_deck(cfg):
-    eng, backend = _dispatch_once(cfg, ScreenState.DECK_SELECT)
-    assert len(backend.gestures) == 1          # tapped the deck slot
+# deck-select behaviour lives in tests/test_deck_select.py (the cycler needs a
+# scripted classifier, not the single-state _dispatch_once helper).
 
 
 def test_collection_is_backed_out_of_not_halted(cfg):

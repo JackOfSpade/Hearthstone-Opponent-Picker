@@ -307,6 +307,21 @@ max_anomaly_frames = 8            # 2 frames (before/after) per anomaly => 4 ano
 # This bound is a runaway backstop, not a retention policy. 0 = never prune.
 max_unknown_frames = 30
 
+[deck]
+# COMPLETE decks the hunt may queue from, as 1-indexed positions in the deck-select
+# grid (reading order, left-to-right then top-to-bottom, 1..9). Used ONLY on the rare
+# recovery path where an error drops hop back to the deck list; it reopens the first of
+# these that lands on a Play screen. Empty = hop will not guess a deck (it halts with
+# guidance) rather than risk opening an incomplete deck. hop NEVER auto-completes a deck
+# regardless (it taps "No" on "Complete deck automatically?").
+#
+# Why not detect the "27/30 - Missing Cards" badge automatically: measured on a real
+# grid, deck ART fakes the red/gold colour cues (a dragon's fire, gold armour), so a
+# colour test misreads ~2 of 9 decks -- and a false "complete" would queue an unplayable
+# deck. Naming your complete decks here is deterministic and safe. In normal use hop
+# runs from a Play screen you already opened, so this recovery is rarely hit.
+recovery_slots = []
+
 [calibration]
 # Filled in by `hop calibrate`. device/date/tester provenance for the values
 # actually measured on your phone. Empty = running on unverified priors.

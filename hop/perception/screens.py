@@ -56,6 +56,13 @@ class ScreenState(str, Enum):
     # out to the deck list. Anchored on the "My Decks" banner, which is chrome (present
     # whatever cards or class filter are showing), not content.
     COLLECTION = "collection"
+    # "Incomplete Deck - You are N cards short of a full deck. Complete deck
+    # automatically? [Yes] [No]" - a modal over the deck list, thrown when you select a
+    # deck missing cards. hop must NEVER auto-complete (tap No, never Yes) and instead
+    # pick a complete deck. A modal, so it needs a higher priority than DECK_SELECT,
+    # which still matches through it. Anchored on the invariant "Incomplete Deck" title
+    # (the card-count in the body varies by deck).
+    INCOMPLETE_DECK = "incomplete_deck"
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs
     VICTORY = "victory"

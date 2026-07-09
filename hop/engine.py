@@ -469,9 +469,13 @@ class Engine:
             # Wait it out; _reconnect() owns the bounded polling.
             self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
         elif st == ScreenState.DECK_SELECT:
-            # dropped back to the deck list (e.g. after an error); reopen the deck
-            self._tap(self.layout.deck_slot, committing=False, decision_type="commit",
-                      expected_change="full_transition", what="deck_slot")
+            # dropped back to the deck list (e.g. after an error); reopen a deck
+            self._handle_deck_select()
+        elif st == ScreenState.INCOMPLETE_DECK:
+            # The "Complete deck automatically?" dialog, seen at the top level (hop
+            # started on it, say). NEVER auto-complete: decline, and the deck cycler
+            # takes over on the next DECK_SELECT dispatch.
+            self._decline_incomplete_deck()
         elif st == ScreenState.PLAY_SCREEN:
             # the loop's home state: the deck's Play button queues a game
             self._tap(self.layout.play_button, committing=False, decision_type="commit",
@@ -551,6 +555,59 @@ class Engine:
         conceded = self._concede()
         self._clear_end_screens()
         self._book_game(conceded)
+
+    def _handle_deck_select(self) -> None:
+        """Reopen a deck from the deck list - only a deck the user named as complete.
+
+        hop reaches the deck list only on recovery (an error dropped it back here), and
+        must reopen a deck to get a Play screen. It cannot safely GUESS which deck: on a
+        real account the first slots are often incomplete ("27/30 - Missing Cards"), and
+        two automatic oracles both failed on the real device -
+          * the "Complete deck automatically?" dialog is SESSION-SUPPRESSED after the
+            first decline, so a later incomplete deck opens silently (measured);
+          * the badge's red/gold colour is faked by deck ART (a dragon's fire, gold
+            armour), so a colour test misreads ~2 of 9 decks (measured).
+        A wrong guess would queue an unplayable deck, so hop does not guess. It taps only
+        the COMPLETE decks named in ``[deck] recovery_slots`` (1-indexed reading order),
+        taking the first that opens to a Play screen. If none are configured, or none
+        open, it fails closed with guidance rather than pick a deck it cannot vouch for.
+
+        It NEVER auto-completes a deck: if a configured slot is somehow incomplete, the
+        dialog is declined (No), never confirmed.
+        """
+        slots = self.layout.deck_slots()
+        chosen = [n for n in self.cfg.deck.recovery_slots if 1 <= n <= len(slots)]
+        if not chosen:
+            raise Halt("dropped back to the deck list, and no complete deck is configured "
+                       "to recover with. Reopen your deck and press Play to resume, or set "
+                       "[deck] recovery_slots to your complete deck's position(s) (1-9).")
+        for n in chosen:
+            self._tap(slots[n - 1], committing=False, decision_type="commit",
+                      expected_change=None, allow_correction=False, what=f"deck_slot[{n}]")
+            cls, _frame = self._classify_settled()
+            if cls.state == ScreenState.PLAY_SCREEN:
+                return  # a complete deck opened; the next dispatch taps Play
+            if cls.state == ScreenState.INCOMPLETE_DECK:
+                self._decline_incomplete_deck()
+                continue  # a configured deck turned out incomplete; try the next
+            if cls.state == ScreenState.DECK_SELECT:
+                continue  # tap didn't take (or hit a gap); try the next
+            raise Halt(f"unexpected screen {cls.state.value!r} after selecting a deck")
+        raise Halt("none of the configured recovery decks opened a Play screen; "
+                   "check [deck] recovery_slots against your deck list")
+
+    def _decline_incomplete_deck(self) -> None:
+        """Tap 'No' on 'Complete deck automatically?' - never 'Yes'.
+
+        Auto-completing a deck spends the user's dust/cards on cards Hearthstone picks;
+        hop must never do that. Tap No and wait for the dialog to leave (an UNKNOWN frame
+        is never proof it left - see :meth:`_wait_until_screen_leaves`).
+        """
+        self._tap(self.layout.deck_decline, committing=False, decision_type="commit",
+                  expected_change=None, allow_correction=False, what="deck_decline")
+        self._wait_until_screen_leaves(
+            ScreenState.INCOMPLETE_DECK, where="deck_decline",
+            stuck="the 'Complete deck automatically?' dialog did not close after No")
 
     def _book_game(self, conceded: bool) -> None:
         """Count a finished game, take any mandatory break, then pace the requeue."""

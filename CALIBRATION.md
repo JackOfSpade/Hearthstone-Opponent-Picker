@@ -71,6 +71,7 @@ hop capture --state reconnect_dialog --glyph 0.4200,0.1000,0.1600,0.0560 --prior
 hop capture --state reconnecting     --glyph 0.4088,0.6500,0.1821,0.0620 --priority 20
 hop capture --state collection       --glyph 0.7542,0.0148,0.1063,0.0444
 hop capture --state rewards --variant banner --glyph 0.4029,0.6528,0.1817,0.1074
+hop capture --state incomplete_deck  --glyph 0.4229,0.3380,0.1458,0.0481 --priority 10
 ```
 
 **One state can have several faces.** `--variant` adds a second anchor for a state
@@ -329,6 +330,34 @@ delivered on this device** (`input tap 1200 1020` navigated fine). That inset re
 the home-swipe *gesture*, not taps — which is why `collection_back` at y≈1012 is safe
 even though `end_dismiss`'s *spread* into that band was not (the latter also spilled
 off-screen and wasn't on a control).
+
+### Never auto-complete a deck, and don't guess which deck is complete
+
+Live-verified. The deck-select recovery (an error dropped hop back to the deck list)
+used to blind-tap the first slot. On a real account the first decks are often incomplete
+("27/30 - Missing Cards"), and selecting one pops **"Complete deck automatically? [Yes]
+[No]"**. Auto-completing spends the user's dust/cards, so hop must never tap Yes. The
+`incomplete_deck` anchor (the "Incomplete Deck" title, invariant; the card count varies)
+classifies the modal at **0.91**, priority 10 over the `deck_select` still showing
+through it, and `_decline_incomplete_deck` taps **No**.
+
+Two automatic ways to pick a *complete* deck were tried on-device and **both failed**:
+
+* **The dialog as a completeness oracle.** After you decline it once, Hearthstone
+  **session-suppresses** it: the next incomplete deck opens straight to its Play screen
+  (verified - tapping a second 28/30 deck opened it with no dialog). So the dialog only
+  catches the first incomplete deck.
+* **Detecting the "X/30 Missing Cards" badge by colour.** Measured on a real 9-deck grid:
+  the red badge/frame colour is faked by deck **art** (a dragon's fire, gold armour) and
+  the gold "Missing Cards" text sits too near the deck name to threshold cleanly - a
+  colour test misread ~2 of 9 decks, including a *false "complete"* that would queue an
+  unplayable deck. Same "art fakes the cue" trap as the mana-gem/brightness card counters.
+
+So hop does **not** guess. `[deck] recovery_slots` names the complete decks (1-indexed,
+reading order); recovery reopens the first that lands on a Play screen, and halts with
+guidance if none are configured. LIVE-VERIFIED: with `recovery_slots = [4, 6, 8, 9]`,
+recovery tapped slot 4 and opened the (complete) Freeze deck, no dialog. In normal use
+hop runs from a Play screen you already opened, so this recovery is rarely hit.
 
 ### Two dead ends the loop could never leave
 
