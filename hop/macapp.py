@@ -284,10 +284,11 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
 
         @_objc.python_method
         def _install_main_menu(self):
-            """A minimal main menu so the Dock app behaves like one: the app menu
-            gives a working Cmd-Q that routes through our clean stop, and the Window
-            menu lets the closed hub window be reopened. Accessory apps don't need
-            this; a Regular (Dock) app looks broken without it (no Cmd-Q, no app menu).
+            """A minimal main menu so the Dock app behaves like one: an app menu with a
+            working Cmd-Q (routed through our clean stop) and "Open hop Window", plus a
+            standard Edit menu so Cmd-C/V/X/A work in the WKWebView. Accessory apps don't
+            need this; a Regular (Dock) app looks broken without it (no Cmd-Q, no app
+            menu, and no working copy/paste in text fields).
             """
             AppKit = self._state.AppKit
             app = AppKit.NSApplication.sharedApplication()
@@ -304,6 +305,25 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
                 "Quit Hearthstone Opponent Picker", b"quit:", "q")
             quit_item.setTarget_(self)
             app_item.setSubmenu_(app_menu)
+
+            # Edit menu. Its items keep the default nil target so Cmd-C/V/X/A dispatch
+            # down the responder chain to the focused WKWebView / text field. Without
+            # these menu items nothing maps those keys to copy:/paste:/cut:/selectAll:,
+            # which is why keyboard editing did nothing in the window.
+            edit_item = AppKit.NSMenuItem.alloc().init()
+            edit_item.setTitle_("Edit")
+            main.addItem_(edit_item)
+            edit_menu = AppKit.NSMenu.alloc().initWithTitle_("Edit")
+            edit_menu.addItemWithTitle_action_keyEquivalent_("Undo", b"undo:", "z")
+            redo = edit_menu.addItemWithTitle_action_keyEquivalent_("Redo", b"redo:", "z")
+            redo.setKeyEquivalentModifierMask_(
+                AppKit.NSEventModifierFlagCommand | AppKit.NSEventModifierFlagShift)
+            edit_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            edit_menu.addItemWithTitle_action_keyEquivalent_("Cut", b"cut:", "x")
+            edit_menu.addItemWithTitle_action_keyEquivalent_("Copy", b"copy:", "c")
+            edit_menu.addItemWithTitle_action_keyEquivalent_("Paste", b"paste:", "v")
+            edit_menu.addItemWithTitle_action_keyEquivalent_("Select All", b"selectAll:", "a")
+            edit_item.setSubmenu_(edit_menu)
 
             app.setMainMenu_(main)
 
