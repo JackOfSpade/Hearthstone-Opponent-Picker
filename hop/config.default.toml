@@ -49,8 +49,23 @@ device_name = "synaptics_dsx"     # LIVE-VERIFY: your panel's reported name
 vendor_id = 0x0596                 # LIVE-VERIFY
 product_id = 0x0501                # LIVE-VERIFY
 bus = "usb"                        # usb | bluetooth
-fifo_path = "/data/local/tmp/hop_hid"   # on-device named pipe for streaming
 min_report_interval_ms = 2         # floor between HID reports (avoid flooding)
+# The session's ONE `hid` process reads a stream of bare JSON objects on stdin
+# (no on-device FIFO: mkfifo is SELinux-denied for shell on modern Android).
+# After `register` we wait this long for the framework to enumerate the virtual
+# InputDevice before the first gesture, so early reports aren't dropped.
+register_settle_ms = 150           # LIVE-VERIFY: enumeration settle after register
+# Contact-channel logical maxima. 0 = clone them from the real panel at startup.
+# This is NOT optional polish: Android loads the panel's calibration by device
+# NAME and applies it to our reports, so cloning the name while declaring
+# different axis ranges makes the framework size our contact against the wrong
+# scale. Measured on a Pixel 7a (panel TOUCH_MAJOR max 2399): with the old 255
+# ceiling, Hearthstone silently ignored every tap on a mulligan card while still
+# honouring taps on buttons.
+touch_major_max = 0
+touch_minor_max = 0
+pressure_max = 0
+orientation_max = 0
 
 [alerts]
 mac_notification = true
@@ -97,7 +112,7 @@ tremor_theta = 40.0                # OU reversion rate
 report_rate_hz = 180               # LIVE-VERIFY: modern panels run 240/720/1200/2000
 tap_dwell_median_s = 0.13          # lognormal down->up
 tap_dwell_sigma = 0.25
-tap_dwell_min_s = 0.04
+tap_dwell_min_s = 0.06             # LIVE-VERIFIED: no real contact was under 65ms
 tap_dwell_max_s = 0.35
 tap_micro_slip_px = 2.5            # finger-pad settle-and-slide on impact
 
@@ -108,10 +123,18 @@ tap_micro_slip_px = 2.5            # finger-pad settle-and-slide on impact
 pressure_semantics = "ramp"
 pressure_alpha = 1.25              # beta ramp u^a (1-u)^b
 pressure_beta = 0.85
-pressure_peak = 0.95
-pressure_floor = 0.22              # ~detection threshold; NEVER 0 while in contact
-contact_major_peak = 0.55          # normalized ABS_MT_TOUCH_MAJOR; co-evolves
-contact_minor_ratio = 0.82         # minor/major at peak
+# All four below are FRACTIONS OF THE PANEL'S OWN AXIS MAXIMA (see [uhid] axes),
+# so they transfer across devices. LIVE-VERIFIED against a human swipe captured
+# with `getevent -lt` on a Pixel 7a / goodix_ts0 (n=24 gestures):
+#   ABS_MT_PRESSURE     in-contact p10 0.52, median 0.80, peak 1.00 (of 255)
+#   ABS_MT_TOUCH_MAJOR  0.029 - 0.122 of 2399, median 0.090
+#   minor/major raw ratio 0.758
+# The old defaults (floor 0.22, major_peak 0.55) were less than half the real
+# touch-down pressure and ~6x the real contact size.
+pressure_peak = 0.98
+pressure_floor = 0.52              # ~detection threshold; NEVER 0 while in contact
+contact_major_peak = 0.12          # fraction of ABS_MT_TOUCH_MAJOR max
+contact_minor_ratio = 0.76         # minor/major, in raw panel units
 orientation_bias_rad = 0.0         # grip/handedness bias; LIVE-VERIFY
 
 [scroll]
@@ -142,13 +165,151 @@ mandatory_break_every_games = 12   # take a randomized break after N games
 break_min_minutes = 5
 break_max_minutes = 20
 non_repetition_threshold = 0.06    # reject trajectories that near-duplicate a prior run
+# ...and, when one is rejected, DRAW ANOTHER rather than halt. Non-repetition is a
+# pre-action gate: the point is never to emit a duplicate, not to notice afterwards
+# that we did. (Same remedy `_endpoint_inside` already uses for the FFitts endpoint:
+# resample, don't clamp.) Only when this many independent draws all near-duplicate a
+# prior trajectory is the generator genuinely degenerate -- then Halt, fail closed.
+# LIVE-MEASURED 2026-07-08 over the real per-game tap sequence (play, 2 card taps,
+# confirm, gear, concede, 2x end_dismiss), 300 seeded runs x max_actions_per_run=30:
+#   resamples   emitted duplicates   runs that would Halt
+#       1            14.21%              293/300      <- the shipped behaviour
+#       2             2.40%              150/300
+#       4             0.12%               11/300
+#       6             0.01%                1/300
+#      10             0.00%                0/300
+# 86% of taps are accepted on the first draw, so this costs ~0.16 extra synth_tap
+# calls per tap (pure CPU, no I/O). Note the flag rate is NOT a fingerprint defect to
+# be tuned away: dropping the collinear `dur` feature RAISES it to 15.50%.
+non_repetition_resamples = 8
 
 [vision]
-state_change_threshold = 9.0       # mean grayscale delta (0..255, 24x24) = "changed"
+# Mean grayscale delta (0..255) that counts as "the screen changed". ONE number serves
+# two scales: `FrameDeduper` applies it to a 24x24 signature, `Verifier` (via
+# classify_change) to full-resolution per-third means. That is sound, and measured --
+# not assumed. LIVE-MEASURED 2026-07-08 (Pixel 7a, 2400x1080):
+#   noise (two consecutive captures of a static screen):  thirds 0.88-0.93 | sig 0.34-0.44
+#   real transitions (in_game->victory, victory->rewards,
+#                     deck_select->play_screen, mulligan->in_game): thirds 26.8-50.0 | sig 19.4-30.9
+# So 9.0 sits ~29x above the noise and ~3x below the weakest signal at full resolution,
+# and ~20x/~2x at signature scale. Downsampling suppresses uncorrelated noise (~sqrt(N))
+# far more than it suppresses a structured, whole-screen change, which is why one
+# constant can straddle both. Re-measure both rows if you change the number.
+state_change_threshold = 9.0
 dedupe_signature_size = 24         # NxN downsample for frame-advance detection
 ncc_match_threshold = 0.72         # normalized cross-correlation accept level
 ocr_max_edit_distance = 3          # snap-to-class fails closed beyond this
 weak_match_margin = 0.08           # match this-close to threshold => low confidence -> inspect
+# Hearthstone animates between screens, so a single unrecognized frame usually
+# means we looked mid-transition (e.g. the blurred board fade after a concede),
+# not that we are lost. Re-look this many times - never tapping - before failing
+# closed on UNKNOWN.
+unknown_settle_attempts = 4
+# Waiting for a screen to change is done by LOOKING, never by sleeping a fixed
+# amount: screencap costs ~1.0 s over USB and ~1.4 s over Wi-Fi on this phone, and
+# Hearthstone's own transitions stretch with the network. A fixed delay is a guess
+# that is either wasted time or a blind tap. `wait_until` polls the classifier under
+# BOTH bounds below - whichever trips first - and never taps while waiting.
+screen_wait_attempts = 8           # max polls (a frozen-clock test needs this bound)
+screen_wait_timeout_s = 20.0       # wall-clock cut, for when captures are slow
+screen_wait_poll_s = 1.0           # nominal gap between polls (humanized per draw)
+# How finely a wait is sliced so a Stop request interrupts it promptly. A running hunt
+# can be mid-wait (a 12 s requeue delay, a match-start poll); without slicing, Stop is
+# not seen until that wait ends. 0.15 s is imperceptible next to a ~1.4 s screencap.
+stop_poll_s = 0.15
+# After a tap, "the screen has not moved" and "the screen has not moved YET" look
+# identical in one frame. The old code settled a fixed 0.6 s and then declared a missed
+# tap -- and the remedy for a missed tap is another tap. Looking again is strictly
+# better than tapping again, so poll for motion this many extra times before giving up.
+# Applies only to WHOLE-SCREEN taps: a scoped card tap is verified inside the card's
+# own rectangle, where the whole-frame signature this uses cannot see the change (a
+# real toggle moves the whole frame by 4.80 against this 9.0 threshold), and the card
+# tap already has its own measured retry budget in mulligan_card_tap_attempts.
+motion_wait_attempts = 3
+# A live board at the TOP of the hunt loop means we lost the mulligan window -- a slow
+# capture, a reconnect, an app restart. The mulligan is the only place `_execute_reject`
+# can start from, so the loop's old answer to a board was to sleep, forever, while a
+# game it queued roped out. Poll this many times (the board may just be the tail of a
+# concede animation), then abandon the game the way we abandon any reject: the gear sits
+# in the top-right corner of every board, so the concede is not special to the mulligan.
+# hop only concedes a game IT started; a board it did not queue into is a Halt.
+in_game_wait_attempts = 6
+# Tapping while Hearthstone searches for an opponent CANCELS the queue, so the only
+# safe move there is to wait. That made QUEUE the loop's one reachable infinite spin: a
+# matchmaking soft-lock keeps the anchor matching a static screen forever, and because
+# every cap was only ever checked inside `_tap`, a loop that never taps never trips one.
+# Silent: no tap, no cap, no Halt, no alert. Bound it. At ~1.5 s a poll this is ~2 min,
+# far beyond any real queue.
+queue_wait_attempts = 60
+# Hearthstone shuts down idle connections ("You are currently offline"), which the
+# hunt loop's own anti-barcode pacing provokes. Tapping Reconnect starts an
+# ASYNCHRONOUS reconnect: the body becomes "Reconnecting..." and both buttons are
+# removed, so the loop must WAIT rather than re-tap. Poll this many times - never
+# tapping - for the attempt to resolve...
+reconnecting_wait_attempts = 12
+# ...and make at most this many Reconnect taps per run. A reconnect that keeps
+# failing means the network or the account needs a human, so fail closed.
+reconnect_attempt_cap = 3
+# Hearthstone accepts a mulligan card tap only intermittently -- ~1 time in 3, while
+# accepting every button tap. Cause UNKNOWN; see CALIBRATION.md. Ruled out by
+# measurement: contact scale, position, dwell, micro-slip, event delivery, and (via a
+# screenrecord of the deal-in) both "the cards are still animating" and "the latched
+# centres are stale" -- the hand is at rest 0.2s after the banner matches and the
+# centres are good to 8px against a 176px card half-width.
+# Retry a bounded number of times, then KEEP the card: a card that won't toggle is not
+# an unknown state (we are still on the mulligan), so halting the hunt over it would be
+# fail-closed applied where nothing is closed.
+mulligan_card_tap_attempts = 3
+# Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
+# The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
+# which this replaced - card artwork cannot fake it. A strip must span most of the
+# band's HEIGHT: the glow runs a card's full height, a patch of green art does not.
+glow_green_bias = 30               # green must exceed red AND blue by this much
+glow_min_green = 90                # ...and be at least this bright
+glow_col_min_frac = 0.50           # a column counts if >=this fraction of band rows glow
+glow_min_strip_frac = 0.0033       # ignore strips narrower than this (~8px @ 2400)
+# We count CARD INTERIORS between the strips, not the strips themselves: glows merge
+# when cards sit close, so 3 cards make 6 strips while 4 cards make 5. An interior
+# is a span that is both card-WIDE and card-BRIGHT; the background gap between two
+# cards is ~2.7x narrower and ~3x darker, so the two tests are orthogonal with a
+# wide margin. A total that isn't 3 or 4 -> unreadable -> the engine fails closed
+# rather than guess, because a wrong count inverts `require_second`.
+card_width_tolerance = 0.15        # accept interiors within +/- this fraction of card_inner_w_f
+card_min_gray = 60.0               # mean gray of a card interior (gaps measure 33-35)
+# A card MARKED FOR REPLACEMENT loses its keep-glow, so its interior disappears. On
+# a 4-card hand that leaves 3 -- a plausible reading that silently inverts
+# `require_second`. Two structural facts about a real hand catch it:
+#   contiguity: adjacent cards are separated by 0.014-0.082 W; a missing INNER card
+#               leaves a hole a whole card wide (measured 0.197 W)
+#   symmetry:   the hand is centred; a missing OUTER card keeps the survivors evenly
+#               spaced but shifts their mean centre by ~0.085 W
+card_max_separation_f = 0.12       # max gap between adjacent card interiors
+hand_center_tolerance_f = 0.02     # mean interior centre must be this close to hand_center_xf
+# Below this frame width a keep-glow strip (~1.2% of the screen) drops under
+# `glow_min_strip_frac` and disappears, which merges two card interiors and
+# UNDERCOUNTS instead of failing. Refuse outright. Measured: correct down to
+# 400px; at 300px a 4-card hand reads 3. Real screencaps are 2400px wide.
+min_count_frame_width = 400
+
+[debug]
+# Capture is for analysis; once analysed the pixels are dead weight. A 2400x1080
+# grayscale anomaly PNG is ~1 MB and an unattended hunt can throw many (a single
+# debugging session left 10 MB behind), so both the per-run frame count and the
+# number of retained runs are bounded. The journal - append-only JSONL, a few KB -
+# is what a halt is actually diagnosed from, and it rides along with its run dir.
+# Oldest is pruned first: a halt is explained by the anomaly that stopped it, and
+# that is the newest one. Set max_anomaly_frames = 0 to keep no pixels at all.
+keep_runs = 5
+max_anomaly_frames = 8            # 2 frames (before/after) per anomaly => 4 anomalies
+# UNKNOWN screens are the one capture hop KEEPS. Every other frame can be re-taken;
+# a screen the classifier could not name cannot -- it is a screen nobody anticipated
+# (a "Ban Notice" modal, the Collection), it HALTS the loop, and those exact pixels
+# are what the next anchor is built from (`hop capture --from-file`). They are saved
+# in COLOUR to ~/.config/hop/unknowns/, a sibling of runs/ that `keep_runs` never
+# touches, and that folder is EMPTY WHEN THE HUNT IS HEALTHY -- its non-emptiness is
+# the signal. Empty it by hand once each frame has become an anchor.
+# This bound is a runaway backstop, not a retention policy. 0 = never prune.
+max_unknown_frames = 30
 
 [calibration]
 # Filled in by `hop calibrate`. device/date/tester provenance for the values

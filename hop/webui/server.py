@@ -6,7 +6,6 @@ Endpoints:
 * ``GET  /screen.png``  - latest phone screencap (throttled by the client)
 * ``POST /start``       - start the hunt (optional JSON criteria overrides)
 * ``POST /stop``        - request a clean stop
-* ``POST /ack``         - acknowledge / silence the target alarm
 * ``GET  /criteria``    - current criteria + risk summary (for the risk meter)
 
 The server holds an :class:`~hop.runner.EngineController` and a snapshot of the
@@ -29,11 +28,15 @@ def _index_html() -> bytes:
 
 
 class DashboardServer:
-    def __init__(self, controller: EngineController, cfg: Config, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(self, controller: EngineController, cfg: Config, host: str = "127.0.0.1",
+                 port: int = 8765, config_path=None):
         self.controller = controller
         self.cfg = cfg
         self.host = host
         self.port = port
+        #: where to persist class picks made in the dashboard, so a selection survives a
+        #: restart (the menu bar already does this) and shows up in a bug report's config.
+        self.config_path = config_path
         self._httpd: ThreadingHTTPServer | None = None
 
     def serve_forever(self) -> None:
@@ -81,14 +84,20 @@ class DashboardServer:
             def do_POST(self):
                 body = self._read_body()
                 if self.path.startswith("/start"):
+                    # persist the class picks BEFORE starting, so they survive a restart
+                    # and a bug report's config shows what this run actually hunted for.
+                    server._persist_criteria(body)
                     started = server.controller.start(body)
                     self._json(200, {"started": started})
                 elif self.path.startswith("/stop"):
                     server.controller.stop()
                     self._json(200, {"stopped": True})
-                elif self.path.startswith("/ack"):
-                    server.controller.ack_alarm()
-                    self._json(200, {"acked": True})
+                elif self.path.startswith("/bugreport"):
+                    try:
+                        n = server._bugreport(body.get("description", ""))
+                        self._json(200, {"copied": True, "bytes": n})
+                    except Exception as e:
+                        self._json(500, {"error": str(e)})
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -98,6 +107,58 @@ class DashboardServer:
     def shutdown(self) -> None:
         if self._httpd:
             self._httpd.shutdown()
+
+    def _bugreport(self, description: str) -> int:
+        """Assemble a self-improving bug report and put it on the clipboard; return the
+        report size in bytes so the UI can confirm something landed.
+
+        Skips the live device probe (a fresh adb connection could contend with the
+        hunt's running transport), but DOES attach a live engine-status snapshot from
+        the controller (cheap, in-process) so the report says what the hunt was doing.
+        The journal, config and logs carry the rest of the diagnosis.
+        """
+        from pathlib import Path
+        from .. import __version__
+        from .. import bugreport as br
+
+        home = Path.home()
+        paths = br.ReportPaths(
+            config=home / ".config" / "hop" / "config.toml",
+            runs_root=home / ".config" / "hop" / "runs",
+            unknowns_dir=home / ".config" / "hop" / "unknowns",
+            app_log=home / "Library" / "Logs" / "hop.log",
+            templates=home / ".config" / "hop" / "templates",
+        )
+        md = br.collect(description, paths, version=__version__, device_probe=None,
+                        status_probe=lambda: br.format_status(self.controller.status()))
+        if not br.copy_to_clipboard(md):
+            raise RuntimeError("could not copy the report to the clipboard (pbcopy failed)")
+        return len(md.encode("utf-8"))
+
+    def _persist_criteria(self, body: dict) -> None:
+        """Save the dashboard's class picks / go-2nd toggle to the user config.
+
+        The menu bar already persists on every toggle; the dashboard's Start used to
+        apply the picks to the run as ephemeral overrides but never write them, so a
+        restart lost them and a bug report's config showed stale classes. Best-effort:
+        a bad class name or unwritable config must not stop the hunt from starting.
+        """
+        from dataclasses import replace
+        from ..config import save_criteria
+
+        names = body.get("target_classes")
+        if names is None:
+            return
+        try:
+            classes = tuple(parse_class(c) for c in names)
+            require_second = bool(body.get("require_second", self.cfg.criteria.require_second))
+            save_criteria(target_classes=classes, require_second=require_second,
+                          path=self.config_path)
+            # keep our in-memory cfg (the risk meter / criteria endpoint) in step
+            self.cfg = replace(self.cfg, criteria=replace(
+                self.cfg.criteria, target_classes=classes, require_second=require_second))
+        except (ValueError, OSError):
+            pass
 
     def _criteria_summary(self) -> dict:
         crit = self.cfg.criteria
@@ -129,7 +190,7 @@ def serve(controller: EngineController, cfg: Config, host: str = "127.0.0.1", po
 
 
 _INDEX_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>hop dashboard</title>
+<html lang="en"><head><meta charset="utf-8"><title>Hearthstone Opponent Picker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root{color-scheme:dark light;--bg:#12141a;--card:#1c1f28;--fg:#e6e8ee;--mut:#9aa0ad;--acc:#4da3ff;--warn:#ffb454;--bad:#ff5c6c;--ok:#5cd6a0}
@@ -155,9 +216,10 @@ _INDEX_HTML = """<!doctype html>
   img#screen{width:100%;border-radius:8px;background:#000;min-height:120px;object-fit:contain}
   .mut{color:var(--mut);font-size:12px}
   #banner{display:none;padding:12px 16px;background:var(--ok);color:#04231a;font-weight:700;border-radius:10px;margin-bottom:12px}
+  #banner.err{background:var(--bad);color:#2a0508}
 </style></head>
 <body>
-<header><h1>hop</h1><span class="pill" id="conn">connecting…</span><span class="pill" id="prof"></span></header>
+<header><h1>Hearthstone Opponent Picker</h1><span class="pill" id="conn">connecting…</span><span class="pill" id="prof"></span></header>
 <main>
   <section>
     <div id="banner"></div>
@@ -169,9 +231,7 @@ _INDEX_HTML = """<!doctype html>
         <label class="chk"><input type="checkbox" id="second"> Only when going 2nd</label>
       </div>
       <div class="row">
-        <button id="startBtn">Start hunt</button>
-        <button id="stopBtn" class="sec">Stop</button>
-        <button id="ackBtn" class="warn">Silence alarm</button>
+        <button id="toggleBtn">Start Search</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -181,21 +241,30 @@ _INDEX_HTML = """<!doctype html>
       <div class="stat"><span>Risk shape</span><b id="risk">–</b></div>
       <div class="mut" style="margin-top:8px">Fewer target classes + require-2nd → higher concede rate → more barcode-like. Widen criteria to reduce risk and hit targets faster.</div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Report a bug</h2>
+      <div class="mut">Copies a self-improving report (logs + live state) to your clipboard. Paste it straight into Claude Code.</div>
+      <textarea id="bugdesc" rows="3" placeholder="What went wrong?" style="width:100%;margin-top:8px;background:#22262f;color:var(--fg);border:1px solid #2a2e38;border-radius:8px;padding:8px;font:inherit;box-sizing:border-box"></textarea>
+      <div class="row"><button id="bugBtn" class="sec">Copy report to clipboard</button><span class="mut" id="bugout"></span></div>
+    </div>
   </section>
   <section>
     <div class="card">
-      <h2>Live phone view</h2>
-      <img id="screen" alt="waiting for frame…">
-      <div class="mut" id="lastopp"></div>
+      <h2>Observed class distribution</h2>
+      <svg id="dist" viewBox="0 0 320 200" width="100%" role="img" aria-label="opponent class distribution"></svg>
+      <div class="mut" id="disttot">no games yet this session</div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Session</h2>
       <div class="stat"><span>Games</span><b id="games">0</b></div>
       <div class="stat"><span>Concedes</span><b id="concedes">0</b></div>
+      <div class="stat"><span>Concedes until target</span><b id="untiltarget">–</b></div>
+      <div class="stat"><span>Coin split (1st / 2nd)</span><b id="coin">0 / 0</b></div>
       <div class="stat"><span>Committing ratio</span><b id="ratio">0</b></div>
       <div class="stat"><span>Actions this run</span><b id="actions">0</b></div>
       <div class="bar"><i id="actbar" style="width:0%"></i></div>
       <div class="stat"><span>Session minutes</span><b id="mins">0</b></div>
+      <div class="stat"><span>Last opponent</span><b id="lastopp">–</b></div>
       <div class="stat"><span>Stop reason</span><b id="stopreason">–</b></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -220,30 +289,73 @@ async function loadCriteria(){
     box.appendChild(l);
   });
   document.getElementById('second').checked=CRIT.require_second;
-  document.getElementById('passrate').textContent=(CRIT.pass_rate*100).toFixed(0)+'%';
-  document.getElementById('concederate').textContent=(CRIT.concede_rate*100).toFixed(0)+'%';
-  const r=document.getElementById('risk'); r.textContent=CRIT.barcode_risk; r.className='risk-'+CRIT.barcode_risk;
+  box.onchange=updateRiskFromForm;
+  document.getElementById('second').onchange=updateRiskFromForm;
+  updateRiskFromForm();
 }
 function chosenCriteria(){
   const classes=[...document.querySelectorAll('#classes input:checked')].map(i=>i.value);
   return {target_classes:classes, require_second:document.getElementById('second').checked};
 }
+function updateRiskFromForm(){
+  if(!CRIT) return;
+  const chosen=chosenCriteria();
+  let pass=chosen.target_classes.length?chosen.target_classes.length/Math.max(1,CRIT.all_classes.length):1;
+  if(chosen.require_second) pass*=0.5;
+  const concede=1-pass;
+  let risk='moderate';
+  if(concede>=0.9) risk='high';
+  else if(concede>=0.7) risk='elevated';
+  document.getElementById('passrate').textContent=(pass*100).toFixed(0)+'%';
+  document.getElementById('concederate').textContent=(concede*100).toFixed(0)+'%';
+  const r=document.getElementById('risk'); r.textContent=risk; r.className='risk-'+risk;
+}
 async function start(){ await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(chosenCriteria())}); }
 async function stop(){ await fetch('/stop',{method:'POST'}); }
-async function ack(){ await fetch('/ack',{method:'POST'}); document.getElementById('banner').style.display='none'; }
-document.getElementById('startBtn').onclick=start;
-document.getElementById('stopBtn').onclick=stop;
-document.getElementById('ackBtn').onclick=ack;
+// One button that is Start when idle and Stop when running. poll() keeps its label in
+// sync with the real engine state, so it flips back to "Start Search" by itself on a
+// stop, a crash, or a halt -- no separate Stop button to leave stranded.
+let RUNNING=false;
+document.getElementById('toggleBtn').onclick=async()=>{
+  const btn=document.getElementById('toggleBtn'); btn.disabled=true;
+  try{ if(RUNNING) await stop(); else await start(); }
+  finally{ btn.disabled=false; poll(); }
+};
 async function poll(){
   try{
     const s=await (await fetch('/status')).json();
-    document.getElementById('conn').textContent=s.running?'running':'idle';
-    document.getElementById('startBtn').disabled=s.running;
+    // Show the live phase, not a bare "running": the slow, silent connect/enumerate
+    // window now reads as "connecting to phone…" so it never looks stuck.
+    const connEl=document.getElementById('conn');
+    if(s.running) connEl.textContent=s.phase||'running';
+    else if(s.last_error) connEl.textContent='error';
+    else connEl.textContent=(s.phase&&!['running','idle'].includes(s.phase))?s.phase:'idle';
+    // The single toggle button mirrors the real engine state, so it reverts to "Start
+    // Search" on its own after a stop, a crash, or a halt.
+    RUNNING=!!s.running;
+    const tb=document.getElementById('toggleBtn');
+    tb.textContent=RUNNING?'Stop':'Start Search';
+    tb.className=RUNNING?'warn':'';
+    // Surface a Search that died on arrival (e.g. missing vision deps) rather than let it
+    // read as "nothing happened": a failed start leaves last_error set and running=false.
+    const b=document.getElementById('banner');
+    if(s.target_found){
+      b.className=''; b.style.display='block';
+      b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn!';
+    }else if(s.last_error && !s.running){
+      b.className='err'; b.style.display='block';
+      b.textContent='⚠ Search stopped — '+s.last_error;
+    }else{
+      b.className=''; b.style.display='none';
+    }
     if(s.games!==undefined){
       document.getElementById('games').textContent=s.games;
       document.getElementById('concedes').textContent=s.concedes;
+      document.getElementById('untiltarget').textContent=(s.concedes_until_target!=null)?s.concedes_until_target:'–';
+      document.getElementById('coin').textContent=(s.going_first||0)+' / '+(s.going_second||0);
       document.getElementById('stopreason').textContent=s.stop_reason||(s.last_error||'–');
-      document.getElementById('lastopp').textContent=s.last_opponent?('last opponent: '+s.last_opponent):'';
+      document.getElementById('lastopp').textContent=s.last_opponent||'–';
+      drawDistribution(s.class_distribution||{});
       if(s.budget){
         document.getElementById('ratio').textContent=s.budget.committing_ratio;
         document.getElementById('actions').textContent=s.budget.actions_run+' / '+s.budget.actions_run_cap;
@@ -257,18 +369,41 @@ async function poll(){
         document.getElementById('fatigue').textContent=s.human_state.fatigue;
         document.getElementById('familiarity').textContent=s.human_state.familiarity;
       }
-      if(s.target_found){
-        const b=document.getElementById('banner');
-        b.style.display='block'; b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn! (Silence alarm to dismiss)';
-      }
     }
   }catch(e){ document.getElementById('conn').textContent='offline'; }
 }
-function refreshScreen(){ document.getElementById('screen').src='/screen.png?t='+Date.now(); }
+// Dependency-free horizontal bar chart of the opponent class distribution, built from
+// SVG <rect>/<text> so it needs no charting library and no CDN (the server is local).
+function drawDistribution(dist){
+  const svg=document.getElementById('dist');
+  const entries=Object.entries(dist).sort((a,b)=>b[1]-a[1]);
+  const total=entries.reduce((n,[,v])=>n+v,0);
+  document.getElementById('disttot').textContent=total?(total+' game'+(total==1?'':'s')+' this session'):'no games yet this session';
+  const W=320, rowH=22, gap=6, labelW=96, x0=labelW+6, maxW=W-x0-34;
+  const max=Math.max(1,...entries.map(([,v])=>v));
+  const H=Math.max(40, entries.length*(rowH+gap));
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  let out='';
+  entries.forEach(([cls,v],i)=>{
+    const y=i*(rowH+gap), w=Math.max(2,maxW*v/max);
+    out+=`<text x="0" y="${y+rowH*0.7}" fill="#9aa0ad" font-size="12">${cls}</text>`;
+    out+=`<rect x="${x0}" y="${y}" width="${w}" height="${rowH}" rx="4" fill="#4da3ff"/>`;
+    out+=`<text x="${x0+w+5}" y="${y+rowH*0.7}" fill="#e6e8ee" font-size="12">${v}</text>`;
+  });
+  svg.innerHTML=out || '<text x="0" y="20" fill="#9aa0ad" font-size="12">no games yet</text>';
+}
+document.getElementById('bugBtn').onclick=async()=>{
+  const out=document.getElementById('bugout'), btn=document.getElementById('bugBtn');
+  btn.disabled=true; out.textContent='copying…';
+  try{
+    const r=await (await fetch('/bugreport',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({description:document.getElementById('bugdesc').value})})).json();
+    out.textContent=r.copied?('✓ copied '+(r.bytes?'('+Math.round(r.bytes/1024)+' KB) ':'')+'— paste into Claude Code'):('error: '+(r.error||'?'));
+  }catch(e){ out.textContent='failed: '+e; }
+  btn.disabled=false;
+};
 loadCriteria();
 setInterval(poll,1000);
-setInterval(refreshScreen,1500);
-refreshScreen();
 </script>
 </body></html>
 """

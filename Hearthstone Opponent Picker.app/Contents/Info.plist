@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>            <string>Hearthstone Opponent Picker</string>
+  <key>CFBundleDisplayName</key>     <string>Hearthstone Opponent Picker</string>
+  <key>CFBundleIdentifier</key>      <string>com.jack.hop</string>
+  <key>CFBundleExecutable</key>      <string>hop-launch</string>
+  <key>CFBundlePackageType</key>     <string>APPL</string>
+  <key>CFBundleShortVersionString</key> <string>2.0.0</string>
+  <key>CFBundleVersion</key>         <string>2.0.0</string>
+  <key>LSMinimumSystemVersion</key>  <string>11.0</string>
+  <!-- Regular Dock app: shows a Dock icon and a Cmd-Tab entry AND keeps the
+       menu-bar item. The app sets NSApplicationActivationPolicyRegular itself;
+       omitting LSUIElement (vs. setting it true) is what lets the Dock icon
+       appear at launch. Quit from the Dock, Cmd-Q, or the menu-bar menu. -->
+  <key>CFBundleIconFile</key>        <string>AppIcon</string>
+  <!-- hop's source lives under ~/Desktop, a TCC-protected folder; this is the
+       reason string shown if macOS prompts for Desktop access. -->
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Hop runs the Hearthstone Opponent Picker from its project folder on your Desktop.</string>
+</dict>
+</plist>

@@ -50,12 +50,12 @@ class Match:
     score: float
 
 
-def best_match(frame: Frame, template: Template, stride: int = 2) -> Match | None:
-    """Best NCC match of ``template`` within its region, or None below threshold.
+def _scan_best(frame: Frame, template: Template, stride: int = 2) -> Match | None:
+    """Best NCC match of ``template`` in its region, ignoring the threshold gate.
 
-    ``stride`` trades speed for precision; a coarse stride then a local refine
-    would be faster still, but the region filter already bounds the cost. Uses
-    the numpy path in :func:`hop.perception.image.ncc` when available.
+    None only when the template is larger than its region. ``stride`` trades speed
+    for precision; the region filter already bounds the cost. Uses the numpy path
+    in :func:`hop.perception.image.ncc` when available.
     """
     rx, ry, rw, rh = template.region.to_px(frame)
     tw, th = template.image.width, template.image.height
@@ -72,9 +72,22 @@ def best_match(frame: Frame, template: Template, stride: int = 2) -> Match | Non
                 best = Match(template.name, x + tw // 2, y + th // 2, score)
             x += stride
         y += stride
+    return best
+
+
+def best_match(frame: Frame, template: Template, stride: int = 2) -> Match | None:
+    """Best NCC match of ``template`` within its region, or None below threshold."""
+    best = _scan_best(frame, template, stride)
     if best is None or best.score < template.threshold:
         return None
     return best
+
+
+def best_score(frame: Frame, template: Template, stride: int = 2) -> Match | None:
+    """The best match *ignoring* the threshold (None only if the template is bigger
+    than its region). For diagnostics: how CLOSE a sub-threshold anchor actually came,
+    which ``best_match`` deliberately hides by returning None below threshold."""
+    return _scan_best(frame, template, stride)
 
 
 def match_all(frame: Frame, template: Template, stride: int = 2, min_sep: int | None = None) -> list[Match]:

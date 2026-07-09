@@ -21,6 +21,12 @@ def cfg():
     return load_config()
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(monkeypatch, tmp_path):
+    """Keep default load_config() calls from reading the developer's real config."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 @pytest.fixture
 def panel():
     return PanelGeometry(width_px=2400, height_px=1080, dpi=400.0)

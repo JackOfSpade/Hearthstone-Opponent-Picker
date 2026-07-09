@@ -15,6 +15,8 @@ it. Tests use a ``FakeAdb`` with the same surface (see tests/).
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import time
 
@@ -25,10 +27,36 @@ class AdbError(RuntimeError):
     pass
 
 
+#: Where `adb` commonly lives when it isn't on PATH. A .app launched from Finder gets a
+#: minimal PATH that excludes Homebrew and the Android SDK, so bare "adb" isn't found;
+#: we resolve an absolute path as a fallback (the launcher also augments PATH).
+_ADB_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/adb",
+    "/usr/local/bin/adb",
+    os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+    os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+)
+
+
+def resolve_adb() -> str:
+    """Absolute path to `adb`, or the bare name if nothing is found.
+
+    Prefers PATH (respects a user override), then the common install locations. Returning
+    "adb" when truly absent lets the call fail with a clear "adb not found" message.
+    """
+    found = shutil.which("adb")
+    if found:
+        return found
+    for cand in _ADB_FALLBACK_PATHS:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return "adb"
+
+
 class Adb:
-    def __init__(self, address: str, adb_bin: str = "adb", timeout: float = 20.0):
+    def __init__(self, address: str, adb_bin: str | None = None, timeout: float = 20.0):
         self.address = address
-        self.adb_bin = adb_bin
+        self.adb_bin = adb_bin or resolve_adb()
         self.timeout = timeout
 
     # ── raw invocation ──────────────────────────────────────────────────────
@@ -36,12 +64,19 @@ class Adb:
     def _base(self) -> list[str]:
         return [self.adb_bin, "-s", self.address] if self.address else [self.adb_bin]
 
+    def _missing_adb_msg(self) -> str:
+        return (f"adb not found (tried {self.adb_bin!r}). Install Android platform-tools "
+                "(brew install --cask android-platform-tools) or add adb to your PATH.")
+
     def _run(self, args: list[str], binary: bool = False) -> bytes:
-        proc = subprocess.run(
-            self._base() + args,
-            capture_output=True,
-            timeout=self.timeout,
-        )
+        try:
+            proc = subprocess.run(
+                self._base() + args,
+                capture_output=True,
+                timeout=self.timeout,
+            )
+        except FileNotFoundError:
+            raise AdbError(self._missing_adb_msg())
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise AdbError(f"adb {' '.join(args)} failed: {err.strip()}")
@@ -78,6 +113,10 @@ class Adb:
                 if "connected" in out or "already" in out:
                     return
                 last = out
+            except FileNotFoundError:
+                # a missing binary can never succeed - fail immediately instead of
+                # burning the whole 2+4+8+16 s backoff on a hopeless retry loop.
+                raise AdbError(self._missing_adb_msg())
             except Exception as e:  # pragma: no cover - network
                 last = str(e)
             if attempt < retries:
@@ -112,6 +151,37 @@ class Adb:
         dpi = _parse_density(density)
         return PanelGeometry(width_px=w, height_px=h, dpi=dpi)
 
+    def get_rotation(self) -> int:
+        """Current display rotation (0,1,2,3 == 0/90/180/270) of the internal
+        display, as the input system sees it - this is the rotation the
+        framework applies to our virtual touchscreen's raw coordinates.
+
+        Primary source is the INTERNAL viewport in ``dumpsys input`` (the input
+        system's own source of truth), which on modern Android prints
+        ``Viewport INTERNAL: ... orientation=3``. Falls back to older viewport
+        formatting and then to ``dumpsys window``'s ``mDisplayRotation``.
+        Defaults to 0 if nothing parses.
+        """
+        import re
+        try:
+            out = self.shell("dumpsys input")
+            for pat in (r"Viewport INTERNAL:[^\n]*?orientation=(\d)",
+                        r"DisplayViewport\{type=INTERNAL.*?orientation=(\d)"):
+                m = re.search(pat, out, re.DOTALL)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        try:
+            win = self.shell("dumpsys window")
+            m = re.search(r"mDisplayRotation=ROTATION_(\d+)", win) or \
+                re.search(r"\bmRotation=ROTATION_(\d+)", win)
+            if m:
+                return {0: 0, 90: 1, 180: 2, 270: 3}.get(int(m.group(1)), 0)
+        except Exception:
+            pass
+        return 0
+
     def screencap_png(self) -> bytes:
         """Raw PNG bytes of the current screen (works while backgrounded)."""
         return self.exec_out("screencap -p")
@@ -130,10 +200,13 @@ class Adb:
 
 
 def _parse_size(text: str) -> tuple[int, int]:
-    for token in text.replace("Override size", "Physical size").split():
-        if "x" in token and token.replace("x", "").isdigit():
-            w, h = token.split("x")
-            return int(w), int(h)
+    for prefix in ("Override size", "Physical size"):
+        for line in text.splitlines():
+            if prefix in line:
+                for token in line.split():
+                    if "x" in token and token.replace("x", "").isdigit():
+                        w, h = token.split("x")
+                        return int(w), int(h)
     raise AdbError(f"could not parse `wm size`: {text!r}")
 
 

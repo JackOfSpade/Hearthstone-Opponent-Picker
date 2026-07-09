@@ -21,18 +21,56 @@ from enum import Enum
 from pathlib import Path
 
 from .image import Frame
-from .templates import Region, Template, best_match
+from .templates import Region, Template, best_match, best_score
 
 
 class ScreenState(str, Enum):
-    MENU = "menu"                 # main menu / mode select
-    QUEUE = "queue"               # searching for opponent
-    VS_SPLASH = "vs_splash"       # the VS intro
+    MENU = "menu"                 # main menu / mode wheel (NOT where we queue from)
+    DECK_SELECT = "deck_select"   # the deck list; tap a deck to reach PLAY_SCREEN
+    # The deck-detail screen carrying the big Play button. This is where the hunt
+    # loop queues from, and where Hearthstone returns to after a game ends, so it
+    # is the loop's home state (verified on-device).
+    PLAY_SCREEN = "play_screen"
+    QUEUE = "queue"               # searching for opponent (do NOT tap: cancels)
+    # "There was an error starting your game." A transient server/network blip
+    # that Hearthstone throws often; dismissing it and requeueing works.
+    ERROR_DIALOG = "error_dialog"
+    # "You are currently offline / It's been a while since your last Hearthstone
+    # action and your connection was shut down." Hearthstone drops idle sessions,
+    # which the hunt loop can trigger while it waits. Tap Reconnect, not Cancel:
+    # Cancel leaves the client offline and every later tap is a no-op.
+    RECONNECT_DIALOG = "reconnect_dialog"
+    # The same dialog *mid-reconnect*: body reads "Reconnecting..." and both
+    # buttons are REMOVED (verified: zero gold-button pixels). Tapping here hits
+    # dead space, so this must be a distinct, wait-only state - and it must outrank
+    # RECONNECT_DIALOG, whose title-banner anchor still matches during it.
+    RECONNECTING = "reconnecting"
+    # The VS intro. **No anchor is shipped for it**: this client fades queue->black->
+    # mulligan with no distinct splash frame, and `_classify_settled` absorbs the
+    # black frames as a transient UNKNOWN. The state and its wait-branch remain for
+    # clients that do show one; if yours does, capture an anchor and it just works.
+    VS_SPLASH = "vs_splash"
+    # The card Collection / deck manager. hop is never *supposed* to be here - the
+    # end_dismiss geometry + END_SCREENS whitelist keep it from tapping "My Collection"
+    # on the deck list - but a stray navigation must be recoverable, not a halt: back
+    # out to the deck list. Anchored on the "My Decks" banner, which is chrome (present
+    # whatever cards or class filter are showing), not content.
+    COLLECTION = "collection"
+    # "Incomplete Deck - You are N cards short of a full deck. Complete deck
+    # automatically? [Yes] [No]" - a modal over the deck list, thrown when you select a
+    # deck missing cards. hop must NEVER auto-complete (tap No, never Yes) and instead
+    # pick a complete deck. A modal, so it needs a higher priority than DECK_SELECT,
+    # which still matches through it. Anchored on the invariant "Incomplete Deck" title
+    # (the card-count in the body varies by deck).
+    INCOMPLETE_DECK = "incomplete_deck"
     MULLIGAN = "mulligan"         # starting hand / keep or replace
     IN_GAME = "in_game"           # board visible, our turn or theirs
     VICTORY = "victory"
     DEFEAT = "defeat"
-    REWARDS = "rewards"           # post-game rewards/quest popups
+    REWARDS = "rewards"           # post-game rewards popups
+    # "Your Quests" - Hearthstone throws this over the play screen after a game.
+    # An overlay, so the screen beneath still matches: it needs a higher priority.
+    QUEST_POPUP = "quest_popup"
     CONCEDE_MENU = "concede_menu" # the settings/gear overlay with Concede
     UNKNOWN = "unknown"
 
@@ -41,12 +79,23 @@ class ScreenState(str, Enum):
 class Anchor:
     state: ScreenState
     template: Template
+    #: Higher wins when several anchors match. A modal dialog does not hide the
+    #: screen beneath it, so both anchors can clear their thresholds at once; the
+    #: dialog must take precedence or we would act on the occluded screen.
+    priority: int = 0
 
 
 @dataclass(frozen=True)
 class Classification:
     state: ScreenState
-    confidence: float             # NCC score of the winning anchor (0..1)
+    #: NCC score of the **winning** anchor, i.e. of ``state`` - not of whichever
+    #: anchor happened to score highest. ``0.0`` when ``state`` is UNKNOWN, because
+    #: :func:`best_match` returns ``None`` below an anchor's threshold and so a
+    #: sub-threshold score is never observed at all.
+    confidence: float
+    #: Centre of the winning anchor's match, in device px, or ``None`` for UNKNOWN.
+    #: The glyph is on the thing it identifies, so this is where that screen *is*.
+    at: tuple[int, int] | None = None
 
 
 class ScreenClassifier:
@@ -55,21 +104,60 @@ class ScreenClassifier:
         self.accept = accept
 
     def classify(self, frame: Frame) -> Classification:
-        """Return the best-matching screen state and its confidence.
+        """Return the best-matching screen state and *its* confidence.
 
-        Ties are broken by score. If nothing clears the accept threshold the
-        state is UNKNOWN with the best score seen - the engine treats UNKNOWN as
-        a halt-and-alert condition, never as a cue to keep tapping.
+        Among anchors that clear their own threshold, the winner is the highest
+        ``priority`` and then the highest score - so a modal dialog beats the
+        screen it is drawn over. If nothing clears its threshold the state is
+        UNKNOWN; the engine re-looks a bounded number of times and then halts,
+        never blind-tapping.
+
+        The confidence is the **winner's** score. It used to be ``max`` over every
+        anchor that cleared, which is the same number only when priority does not
+        decide the winner - and priority deciding the winner is exactly the
+        interesting case. A concede menu (priority 10, score 0.75) drawn over a
+        board whose ``in_game`` anchor still matches at 0.95 reported
+        ``Classification(CONCEDE_MENU, 0.95)``: the confidence of a *different*
+        screen. It is read by the halt message, the debug journal and the dashboard
+        (:mod:`hop.runner`), i.e. by everything a human uses to decide whether the
+        classifier is trustworthy - so it had better describe the screen we picked.
+
+        (The module docstring above promises this number feeds ``HumanState``. It
+        does not, yet: only the OCR's ``class_confidence`` does. Fixing that is only
+        safe now that this reports the right anchor's score.)
         """
         best_state = ScreenState.UNKNOWN
-        best_score = 0.0
+        best_rank: tuple[int, float] | None = None
+        winner = None
         for anchor in self.anchors:
             m = best_match(frame, anchor.template)
-            if m and m.score > best_score:
-                best_score = m.score
-                if m.score >= self.accept:
-                    best_state = anchor.state
-        return Classification(best_state, best_score)
+            if not m:
+                continue
+            rank = (anchor.priority, m.score)
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_state = anchor.state
+                winner = m
+        if winner is None:
+            return Classification(ScreenState.UNKNOWN, 0.0, None)
+        return Classification(best_state, winner.score, (winner.x, winner.y))
+
+    def rank(self, frame: Frame) -> list[tuple[ScreenState, float, float]]:
+        """Every anchor's best score *ignoring its threshold*, highest first, as
+        ``(state, score, threshold)`` triples.
+
+        Recorded when a frame comes back UNKNOWN so the journal says which known screen
+        it was CLOSEST to. A near-miss ("in_game 0.539, threshold 0.72") points straight
+        at the fix -- that state needs another visual face, or a looser threshold --
+        where a bare "unknown, confidence 0.0" said nothing at all.
+        """
+        out: list[tuple[ScreenState, float, float]] = []
+        for anchor in self.anchors:
+            m = best_score(frame, anchor.template)
+            if m is not None:
+                out.append((anchor.state, m.score, anchor.template.threshold))
+        out.sort(key=lambda r: -r[1])
+        return out
 
     @property
     def has_templates(self) -> bool:
@@ -99,5 +187,6 @@ def load_template_pack(directory: str | Path) -> ScreenClassifier:
             region=Region(*r),
             threshold=float(entry.get("threshold", 0.72)),
         )
-        anchors.append(Anchor(ScreenState(entry["state"]), tmpl))
+        anchors.append(Anchor(ScreenState(entry["state"]), tmpl,
+                              int(entry.get("priority", 0))))
     return ScreenClassifier(anchors)

@@ -86,8 +86,14 @@ class UhidConfig:
     vendor_id: int
     product_id: int
     bus: str
-    fifo_path: str
     min_report_interval_ms: int
+    register_settle_ms: int
+    #: Contact-channel logical maxima; 0 = clone them from the real panel at open().
+    #: See :class:`hop.transport.hid_descriptor.PanelAxes` for why this matters.
+    touch_major_max: int = 0
+    touch_minor_max: int = 0
+    pressure_max: int = 0
+    orientation_max: int = 0
 
 
 @dataclass(frozen=True)
@@ -170,6 +176,9 @@ class CapsConfig:
     break_min_minutes: int
     break_max_minutes: int
     non_repetition_threshold: float
+    #: Independent gesture draws before a near-duplicate becomes a Halt. The gate is
+    #: pre-action: resample rather than emit-then-notice. See config.default.toml.
+    non_repetition_resamples: int = 8
 
 
 @dataclass(frozen=True)
@@ -179,6 +188,47 @@ class VisionConfig:
     ncc_match_threshold: float
     ocr_max_edit_distance: int
     weak_match_margin: float
+    unknown_settle_attempts: int
+    #: `wait_until` bounds. Both apply; whichever trips first ends the wait. The
+    #: attempt count is what keeps a frozen-clock unit test terminating.
+    screen_wait_attempts: int
+    screen_wait_timeout_s: float
+    screen_wait_poll_s: float
+    #: Slice length for the stop-aware sleep. A stop request is honoured within about
+    #: one slice instead of after the full (up to 12 s) delay, so "Stop" feels instant.
+    stop_poll_s: float
+    #: Extra looks for motion after an unscoped tap, before calling it a missed tap.
+    motion_wait_attempts: int
+    #: Polls of a live board at the top of the loop before abandoning the game.
+    in_game_wait_attempts: int
+    #: Polls of the matchmaking queue before declaring it soft-locked.
+    queue_wait_attempts: int
+    reconnecting_wait_attempts: int
+    reconnect_attempt_cap: int
+    mulligan_card_tap_attempts: int
+    glow_green_bias: int
+    glow_min_green: int
+    glow_col_min_frac: float
+    glow_min_strip_frac: float
+    card_width_tolerance: float
+    card_min_gray: float
+    card_max_separation_f: float
+    hand_center_tolerance_f: float
+    min_count_frame_width: int
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    #: Bounded so a long unattended hunt cannot fill the disk with anomaly frames.
+    #: The journal (a few KB) is what diagnoses a halt; the PNGs are ~1 MB apiece.
+    keep_runs: int
+    max_anomaly_frames: int
+    #: UNKNOWN-screen frames are the exception: they are the only capture that
+    #: cannot be re-taken (nobody knows how to get back to a screen nobody named),
+    #: and they are what the next anchor is built from. Kept outside the run dirs,
+    #: in a folder that is empty when the hunt is healthy. This is a runaway
+    #: backstop, not a retention policy; <= 0 disables pruning entirely.
+    max_unknown_frames: int = 30
 
 
 @dataclass(frozen=True)
@@ -194,6 +244,7 @@ class Config:
     sensor: SensorConfig
     caps: CapsConfig
     vision: VisionConfig
+    debug: DebugConfig
     risk_profile: str
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -233,6 +284,7 @@ def load_config(path: str | Path | None = None) -> Config:
     sn = merged["sensor"]
     cp = merged["caps"]
     v = merged["vision"]
+    dbg = merged["debug"]
 
     profile = merged["risk"]["profile"]
     if profile not in RISK_PROFILES:
@@ -256,8 +308,12 @@ def load_config(path: str | Path | None = None) -> Config:
             vendor_id=int(u["vendor_id"]),
             product_id=int(u["product_id"]),
             bus=str(u["bus"]),
-            fifo_path=str(u["fifo_path"]),
             min_report_interval_ms=int(u["min_report_interval_ms"]),
+            register_settle_ms=int(u["register_settle_ms"]),
+            touch_major_max=int(u.get("touch_major_max", 0)),
+            touch_minor_max=int(u.get("touch_minor_max", 0)),
+            pressure_max=int(u.get("pressure_max", 0)),
+            orientation_max=int(u.get("orientation_max", 0)),
         ),
         alerts=AlertConfig(
             mac_notification=bool(a["mac_notification"]),
@@ -274,6 +330,7 @@ def load_config(path: str | Path | None = None) -> Config:
         sensor=SensorConfig(**{k: sn[k] for k in SensorConfig.__annotations__}),
         caps=CapsConfig(**{k: cp[k] for k in CapsConfig.__annotations__}),
         vision=VisionConfig(**{k: v[k] for k in VisionConfig.__annotations__}),
+        debug=DebugConfig(**{k: dbg[k] for k in DebugConfig.__annotations__}),
         risk_profile=profile,
         raw=merged,
     )
@@ -285,3 +342,40 @@ def _default_user_path() -> Path:
 
 def profile_multipliers(cfg: Config) -> dict[str, float]:
     return RISK_PROFILES[cfg.risk_profile]
+
+
+def save_criteria(
+    *,
+    target_classes: tuple[HeroClass, ...] | list[HeroClass],
+    require_second: bool,
+    mode: str | None = None,
+    risk_profile: str | None = None,
+    path: str | Path | None = None,
+) -> Path:
+    """Persist the user-facing criteria to the user config, in place.
+
+    The control app and the dashboard both set these, and a setting that vanishes on
+    restart is worse than no setting at all. Writes through
+    :func:`hop.tomledit.upsert_toml_scalar`, so the file's comments - including every
+    LIVE-VERIFIED provenance note - survive, which a tomllib parse/re-emit would not.
+    """
+    from .tomledit import upsert_toml_scalar
+
+    user_path = Path(path) if path else _default_user_path()
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    text = user_path.read_text() if user_path.exists() else ""
+
+    names = ", ".join(f'"{c.name}"' for c in target_classes)
+    text = upsert_toml_scalar(text, "criteria", "target_classes", f"[{names}]")
+    text = upsert_toml_scalar(text, "criteria", "avoid_classes", "[]")
+    text = upsert_toml_scalar(text, "criteria", "require_second",
+                              "true" if require_second else "false")
+    if mode is not None:
+        text = upsert_toml_scalar(text, "criteria", "mode", f'"{mode}"')
+    if risk_profile is not None:
+        if risk_profile not in RISK_PROFILES:
+            raise ValueError(f"unknown risk profile: {risk_profile!r}")
+        text = upsert_toml_scalar(text, "risk", "profile", f'"{risk_profile}"')
+
+    user_path.write_text(text)
+    return user_path

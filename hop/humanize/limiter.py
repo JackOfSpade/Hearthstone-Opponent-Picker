@@ -83,16 +83,27 @@ class Limiter:
 
     # checks ------------------------------------------------------------------
 
+    def check_elapsed_caps(self) -> None:
+        """Raise :class:`CapReached` on the caps that time alone can breach.
+
+        Separate from :meth:`check_before_action` because *every* cap used to be
+        checked only there - i.e. only inside a tap. A loop that never taps could
+        therefore never trip a cap, however long it ran, which is exactly what a
+        soft-locked matchmaking queue produces. The hunt loop calls this once per
+        iteration, tap or no tap.
+        """
+        if self.session_seconds >= self.caps.max_session_minutes * 60 * self.scale:
+            raise CapReached("session_minutes", "Session time limit reached; stopping.")
+        if self.games_this_session >= self.max_games_per_session:
+            raise CapReached("games_session", "Per-session game cap reached; stopping.")
+
     def check_before_action(self, committing: bool) -> None:
         """Raise :class:`CapReached` if the next action would breach a cap.
 
         Called before every autonomous tap. ``committing`` marks a concede (or
         other conversion-like action) so its dedicated, tighter cap applies.
         """
-        if self.session_seconds >= self.caps.max_session_minutes * 60 * self.scale:
-            raise CapReached("session_minutes", "Session time limit reached; stopping.")
-        if self.games_this_session >= self.max_games_per_session:
-            raise CapReached("games_session", "Per-session game cap reached; stopping.")
+        self.check_elapsed_caps()
         if self.actions_this_run >= self.max_actions_per_run:
             raise CapReached("actions_run", "Per-run action cap reached; stopping.")
         if self.actions_today >= self.max_actions_per_day:

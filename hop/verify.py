@@ -7,7 +7,14 @@ preserving evidence, not retry blindly."*
 
 Concretely this module checks, after each action:
 
-1. **Generic progress** - the screen advanced (mean-abs-diff over threshold).
+0. **Comparability** - the two frames are the same size. A different size means the
+   display rotated or the app restarted, so no pixel comparison between them means
+   anything and every screen fraction the engine holds is stale. Fail closed.
+1. **Generic progress** - the screen advanced. Operationally this is
+   ``classify_change() != "none"``, i.e. *some* third of the screen moved by more
+   than ``change_threshold``. (The whole-frame ``mad`` is journaled, not gated on -
+   a tap that redraws one card moves the whole frame by 4.80 against a 9.0
+   threshold, which is why scoped verification exists.)
 2. **Semantic end-state** - the *specific* expected change kind occurred (a bare
    change is spoofable by an unrelated animation).
 3. **Coherence gates** - sensorimotor coherence for the declared posture,
@@ -33,11 +40,34 @@ from .touchstream import Gesture
 
 
 class Halt(RuntimeError):
-    """Unexpected halt: unknown state / missed tap / incoherence. Fail closed."""
+    """Unexpected halt: unknown state / missed tap / incoherence. Fail closed.
 
-    def __init__(self, reason: str):
+    ``kind`` names *why*, because one caller legitimately tolerates exactly one of
+    these and must not tolerate the rest. ``_replace_card`` retries a mulligan card
+    the game ignored (``no_change``) - we are still on the mulligan, we know where we
+    are, and Hearthstone drops ~2 card taps in 3 for reasons nobody has found. But a
+    coherence failure or a non-repetition failure on that same tap says the
+    *automation* is wrong, not the game, and swallowing those as "ignored tap" both
+    hides them and inflates ``stats.ignored_card_taps``.
+    """
+
+    #: the screen did not move: a missed tap, or an input the app dropped
+    NO_CHANGE = "no_change"
+    #: it moved, but not into the end-state we demanded
+    WRONG_CHANGE = "wrong_change"
+    #: touch/IMU incoherence for the declared posture
+    INCOHERENT = "incoherent"
+    #: this gesture near-duplicates a prior trajectory
+    NEAR_DUPLICATE = "near_duplicate"
+    #: the display geometry changed under us; frames are not comparable
+    SIZE_MISMATCH = "size_mismatch"
+    #: anything raised by the engine rather than by a verification check
+    UNEXPECTED = "unexpected"
+
+    def __init__(self, reason: str, kind: str = UNEXPECTED):
         super().__init__(reason)
         self.reason = reason
+        self.kind = kind
 
 
 class CleanStop(RuntimeError):
@@ -50,6 +80,8 @@ class VerifyResult:
     reason: str
     change_kind: str = ""
     coherence: str = ""
+    #: which check failed; see :class:`Halt`. Empty on success.
+    kind: str = ""
 
 
 class Verifier:
@@ -80,18 +112,42 @@ class Verifier:
         is the semantic end-state, e.g. ``"full_transition"`` after tapping Play.
         ``near_duplicate`` comes from the limiter's non-repetition check.
         """
+        # 0. the two frames must be comparable at all.
+        #
+        # A frame-size change means the DISPLAY changed underneath us: the phone
+        # rotated, or Hearthstone restarted into portrait. Every screen fraction the
+        # engine is about to act on was resolved against the old geometry, so the one
+        # thing we must not do here is call it a successful transition and tap on.
+        #
+        # It used to do exactly that. When the widths differed it set `mad = 999.0`
+        # and *fabricated* `change_kind = "full_transition"` - which is precisely the
+        # kind every navigation tap expects (Play, the gear, Concede, end_dismiss), so
+        # a rotation verified OK and the engine carried on aiming at coordinates from
+        # a screen that no longer existed. A height-only mismatch was worse: the width
+        # guard passed it through to `classify_change`, which compares each frame's
+        # own thirds and so silently correlated misaligned pixels.
+        if before.width != after.width or before.height != after.height:
+            return self._fail(
+                f"frame size changed under us ({before.width}x{before.height} -> "
+                f"{after.width}x{after.height}); the display rotated or the app "
+                "restarted - refusing to verify across a geometry change",
+                before, after, change_kind="size_mismatch", kind=Halt.SIZE_MISMATCH,
+                raise_on_fail=raise_on_fail)
+
         # 1. generic progress
-        mad = mean_abs_diff(_match(before, after), after) if before.width == after.width else 999.0
-        change_kind = classify_change(before, after, self.change_threshold) if before.width == after.width else "full_transition"
+        mad = mean_abs_diff(before, after)
+        change_kind = classify_change(before, after, self.change_threshold)
         if change_kind == "none":
             return self._fail("no screen change after action (missed tap / stuck)", before, after,
-                              change_kind=change_kind, raise_on_fail=raise_on_fail)
+                              change_kind=change_kind, kind=Halt.NO_CHANGE,
+                              raise_on_fail=raise_on_fail)
 
         # 2. semantic end-state
         if expected_change is not None and change_kind != expected_change and not _compatible(expected_change, change_kind):
             return self._fail(
                 f"screen changed but not as expected (want {expected_change}, saw {change_kind})",
-                before, after, change_kind=change_kind, raise_on_fail=raise_on_fail,
+                before, after, change_kind=change_kind, kind=Halt.WRONG_CHANGE,
+                raise_on_fail=raise_on_fail,
             )
 
         # 3a. sensorimotor coherence
@@ -102,33 +158,30 @@ class Verifier:
             if verdict == CoherenceVerdict.INCOHERENT:
                 return self._fail("touch/IMU incoherence on a handheld run (flat sensors)",
                                   before, after, change_kind=change_kind, coherence=coherence,
-                                  raise_on_fail=raise_on_fail)
+                                  kind=Halt.INCOHERENT, raise_on_fail=raise_on_fail)
 
         # 3b. non-repetition
         if near_duplicate:
             return self._fail("gesture near-duplicates a prior trajectory (non-repetition)",
                               before, after, change_kind=change_kind, coherence=coherence,
-                              raise_on_fail=raise_on_fail)
+                              kind=Halt.NEAR_DUPLICATE, raise_on_fail=raise_on_fail)
 
         if self.debug is not None:
             self.debug.record("verify_ok", change_kind=change_kind, coherence=coherence, mad=round(mad, 2))
         return VerifyResult(True, "ok", change_kind, coherence)
 
     def _fail(self, reason: str, before: Frame, after: Frame, *, change_kind: str = "",
-              coherence: str = "", raise_on_fail: bool = True) -> VerifyResult:
+              coherence: str = "", kind: str = Halt.UNEXPECTED,
+              raise_on_fail: bool = True) -> VerifyResult:
         if self.debug is not None:
+            # Record the Halt fault code under `fault`, NOT `kind`: `anomaly` forwards
+            # this into `DebugLog.record(kind="anomaly", ...)`, and a `kind=` here used
+            # to collide with that positional argument and crash every verify failure.
             self.debug.anomaly(reason, before=before, after=after,
-                               change_kind=change_kind, coherence=coherence)
+                               change_kind=change_kind, coherence=coherence, fault=kind)
         if raise_on_fail:
-            raise Halt(reason)
-        return VerifyResult(False, reason, change_kind, coherence)
-
-
-def _match(a: Frame, b: Frame) -> Frame:
-    """Crop ``a`` to ``b``'s size if they differ slightly (defensive)."""
-    if a.width == b.width and a.height == b.height:
-        return a
-    return a.crop(0, 0, b.width, b.height)
+            raise Halt(reason, kind)
+        return VerifyResult(False, reason, change_kind, coherence, kind)
 
 
 def _compatible(expected: str, actual: str) -> bool:

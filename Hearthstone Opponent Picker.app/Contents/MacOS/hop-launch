@@ -1,0 +1,119 @@
+#!/bin/zsh
+# Hearthstone Opponent Picker.app — launches the menu-bar control panel (`hop app`).
+#
+# hop is pure Python installed EDITABLE (`pip install -e .`), so its source is always
+# live: there is nothing to build and no staleness window for code changes -- this app
+# always runs the latest source. The only thing an editable install freezes is package
+# METADATA, so we re-run `pip install -e .` just when pyproject.toml is newer than the
+# install marker; every other launch is instant.
+#
+# There is no Terminal window (this is a real .app), so all output goes to the log at
+# ~/Library/Logs/hop.log -- read it if the menu-bar icon never appears.
+
+# Run under the Mac's NATIVE architecture. LaunchServices can start a universal .app
+# under the x86_64 (Rosetta) slice; a translated x86_64 Python then cannot dlopen the
+# arm64 numpy/Pillow wheels installed for native Python ("incompatible architecture"),
+# so the vision import breaks and Start Search dies the instant it runs. Re-exec once
+# under arm64 when we are on Apple Silicon hardware but running translated. (Guarded by
+# HOP_ARCH_FIXED so the re-exec can never loop; a no-op on Intel, where x86_64 IS native.)
+if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] \
+   && [ "$(/usr/bin/uname -m)" != "arm64" ] && [ -z "$HOP_ARCH_FIXED" ]; then
+  export HOP_ARCH_FIXED=1
+  exec /usr/bin/arch -arm64 /bin/zsh "$0" "$@"
+fi
+
+LOG="$HOME/Library/Logs/hop.log"
+mkdir -p "$(dirname "$LOG")"
+exec >"$LOG" 2>&1                        # truncate each launch; keeps the log bounded
+echo "[$(date)] Hearthstone Opponent Picker launching"
+
+notify() { osascript -e "display notification \"$1\" with title \"Hearthstone Opponent Picker\" sound name \"$2\"" >/dev/null 2>&1; }
+
+# A .app launched from Finder/LaunchServices gets a MINIMAL PATH (/usr/bin:/bin:...),
+# NOT your login shell's -- so the `adb` and `tesseract` binaries hop shells out to
+# (Homebrew / Android SDK) are invisible, and "Start Search" dies with
+# "No such file or directory: 'adb'". Prepend the usual tool locations so the whole
+# app (engine + OCR) can find them, exactly as it would from a terminal.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/Library/Android/sdk/platform-tools:$HOME/Android/Sdk/platform-tools:$PATH"
+
+# Pick the first python3 that can actually `import hop`, never just the first on PATH:
+# hop lives in one framework python (with numpy/Pillow/pyobjc); the login PATH's python3
+# may be a different one. Run the loop in THIS shell (not a $(...) subshell) so the
+# permission-vs-missing distinction survives -- the two failures need opposite fixes.
+PY=""
+saw_perm_denied=0
+for cand in \
+    python3 \
+    /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
+    /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+  command -v "$cand" >/dev/null 2>&1 || continue
+  if err="$("$cand" -c 'import hop' 2>&1)"; then PY="$cand"; break; fi
+  echo "  ($cand: ${err##*$'\n'})"
+  case "$err" in *"Operation not permitted"*|*PermissionError*) saw_perm_denied=1 ;; esac
+done
+
+if [ -z "$PY" ]; then
+  if [ "$saw_perm_denied" -eq 1 ]; then
+    echo "x macOS blocked reading hop's source (it lives under ~/Desktop, a protected folder)."
+    echo "  Grant Full Disk Access to the PYTHON that reads it -- NOT this app. Python is"
+    echo "  separately signed, so it is its own permission subject; granting the .app does"
+    echo "  nothing. In Finder, open this folder and DRAG python3.14 onto the Full Disk"
+    echo "  Access list (the picker greys out CLI binaries, so dragging is the only way):"
+    echo "    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14"
+    echo "  Toggle it on, then relaunch. (Or move the project out of ~/Desktop entirely.)"
+    notify "Grant Full Disk Access to python3.14 (drag it in), then relaunch. See ~/Library/Logs/hop.log" "Basso"
+  else
+    echo "x No python3 can import hop. Install it once from the project dir with: pip install -e ."
+    notify "hop is not installed. See ~/Library/Logs/hop.log" "Basso"
+  fi
+  exit 1
+fi
+echo "> Using $PY"
+
+# Self-locate the project from the editable install itself (no hardcoded or
+# bundle-relative paths): hop.__file__ is <project>/hop/__init__.py.
+PROJECT_DIR="$("$PY" -c 'import hop, os; print(os.path.dirname(os.path.dirname(os.path.realpath(hop.__file__))))')"
+echo "> Project: $PROJECT_DIR"
+cd "$PROJECT_DIR" || { echo "x project dir vanished: $PROJECT_DIR"; notify "hop project not found." "Basso"; exit 1; }
+
+# Refresh only when project metadata changed (deps/entry points). Code edits are live.
+MARKER="hop.egg-info/PKG-INFO"
+if [ ! -e "$MARKER" ] || [ pyproject.toml -nt "$MARKER" ]; then
+  echo "> pyproject.toml changed since the last install -- refreshing dependencies..."
+  "$PY" -m pip install -e '.[vision,mac,hotkeys]' --quiet \
+    && notify "hop dependencies refreshed." "Glass" \
+    || { echo "x pip install failed -- launching on the existing install."; notify "Dependency refresh failed." "Basso"; }
+else
+  echo "> Up to date."
+fi
+
+# The hunt needs the optional VISION extra (Pillow/numpy) to decode screencaps, but
+# hop's core deps are intentionally empty -- an editable install alone does NOT pull it
+# in. Without Pillow the engine dies the instant you press Start Search, and because
+# perception/image.py caches the missing import at load time, that failure reads as
+# "Start does nothing" in the window. So verify the extras are importable every launch
+# (one cheap import) and install them if missing, independent of the metadata refresh.
+if ! deperr="$("$PY" -c 'import PIL, numpy' 2>&1)"; then
+  echo "> Vision deps not importable by $PY:"
+  echo "    $("$PY" -c 'import sys; print(sys.executable)')"
+  echo "    ${deperr##*$'\n'}"
+  echo "> installing hop[vision,mac,hotkeys]..."
+  "$PY" -m pip install -e '.[vision,mac,hotkeys]' --quiet \
+    && notify "hop vision dependencies installed." "Glass" \
+    || { echo "x vision install failed -- Start Search will not work until deps are present."; notify "Vision dependency install failed. See ~/Library/Logs/hop.log" "Basso"; }
+fi
+
+# The re-exec'd Python.app can't locate this .app bundle on its own, so hand it the
+# path to our icon; hop.macapp sets it as the Dock icon at runtime (${0:A:h} is this
+# script's real directory, .../Contents/MacOS, so the icon is one level up in Resources).
+export HOP_APP_ICON="${0:A:h}/../Resources/AppIcon.icns"
+[ -f "$HOP_APP_ICON" ] && echo "> Dock icon: $HOP_APP_ICON" || echo "x Dock icon not found: $HOP_APP_ICON"
+
+if "$PY" -c 'import AppKit' >/dev/null 2>&1; then
+  echo "> Launching the app (Dock icon + menu-bar item; quit from the Dock, Cmd-Q, or the menu)."
+  exec "$PY" -m hop.cli app
+else
+  echo "x pyobjc missing; opening the web dashboard instead (pip install 'hop[mac]')."
+  exec "$PY" -m hop.cli dashboard
+fi

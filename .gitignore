@@ -11,3 +11,7 @@ venv/
 runs/
 *.run/
 .DS_Store
+# The .app's ad-hoc code signature is local (breaks on any edit; re-create with
+# `codesign --force --deep --sign - "Hearthstone Opponent Picker.app"`). Track the
+# launcher + Info.plist, not the signature.
+_CodeSignature/

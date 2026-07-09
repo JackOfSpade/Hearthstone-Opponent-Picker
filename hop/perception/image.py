@@ -37,11 +37,20 @@ def pil_available() -> bool:
 
 @dataclass
 class Frame:
-    """A grayscale image. ``data`` is an ndarray (numpy) or flat bytearray."""
+    """A grayscale image. ``data`` is an ndarray (numpy) or flat bytearray.
+
+    ``rgb`` optionally carries the original colour pixels as an ``uint8`` ndarray
+    of shape ``[h, w, 3]``. Everything in the vision layer works on grayscale;
+    colour is retained only because a few cues are *defined* by hue and are
+    destroyed by the grayscale conversion - notably Hearthstone's blue mana gems,
+    which are how we count mulligan cards (see :mod:`hop.hearthstone`). It is
+    ``None`` when numpy/Pillow are unavailable or the frame came from gray bytes.
+    """
 
     width: int
     height: int
-    data: object  # ndarray[h,w] uint8 OR bytearray length w*h
+    data: object            # ndarray[h,w] uint8 OR bytearray length w*h
+    rgb: object = None      # ndarray[h,w,3] uint8, or None
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -55,16 +64,22 @@ class Frame:
         return cls(width, height, bytearray(gray))
 
     @classmethod
-    def from_png(cls, png_bytes: bytes) -> "Frame":
-        """Decode PNG -> grayscale Frame (requires Pillow in production)."""
+    def from_png(cls, png_bytes: bytes, keep_rgb: bool = True) -> "Frame":
+        """Decode PNG -> grayscale Frame (requires Pillow in production).
+
+        Also retains the RGB pixels when possible (``keep_rgb``), for the hue-
+        dependent cues that grayscale destroys.
+        """
         if _PILImage is None:
             raise RuntimeError("Pillow not installed; cannot decode screencap PNG. "
                                "pip install 'hop[vision]'")
-        img = _PILImage.open(_bytes_io(png_bytes)).convert("L")
-        w, h = img.size
-        if _np is not None:
-            return cls(w, h, _np.asarray(img, dtype=_np.uint8).copy())
-        return cls(w, h, bytearray(img.tobytes()))
+        img = _PILImage.open(_bytes_io(png_bytes))
+        gray = img.convert("L")
+        w, h = gray.size
+        if _np is None:
+            return cls(w, h, bytearray(gray.tobytes()))
+        rgb = _np.asarray(img.convert("RGB"), dtype=_np.uint8).copy() if keep_rgb else None
+        return cls(w, h, _np.asarray(gray, dtype=_np.uint8).copy(), rgb)
 
     # ── access ───────────────────────────────────────────────────────────────
 
@@ -77,7 +92,8 @@ class Frame:
         x = max(0, min(self.width, x)); y = max(0, min(self.height, y))
         w = max(1, min(self.width - x, w)); h = max(1, min(self.height - y, h))
         if _np is not None:
-            return Frame(w, h, self.data[y:y + h, x:x + w].copy())
+            sub_rgb = self.rgb[y:y + h, x:x + w].copy() if self.rgb is not None else None
+            return Frame(w, h, self.data[y:y + h, x:x + w].copy(), sub_rgb)
         out = bytearray(w * h)
         for j in range(h):
             base = (y + j) * self.width + x

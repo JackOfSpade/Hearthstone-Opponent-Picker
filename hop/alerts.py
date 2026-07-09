@@ -1,17 +1,16 @@
-"""Alerts: Mac notification + looping sound + optional phone push.
+"""Alerts: a single Mac sound on target; Mac notifications for halts/info.
 
-When a target matchup is found the engine stops touching the game and fires
-these. Two destinations:
+When a target matchup is found the engine stops touching the game and alerts. Per the
+user's setup (sitting at the Mac, earbuds on, watching YouTube) the target alert is
+deliberately minimal: **play the configured Mac sound exactly once** - no looping alarm,
+no acknowledge/silence step, no phone push, no spoken announcement. One sound they'll
+hear over their audio, and the dashboard/menu-bar show which class.
 
-* **Mac** (where you're sitting): a native notification (``osascript``), a
-  looping sound (``afplay``) that keeps going until acknowledged, and an
-  optional spoken announcement (``say``).
-* **Phone** (since the point is to walk away): a push via ntfy.sh - one HTTP
-  POST, no account, plays a loud custom sound on the phone. Never interacts with
-  Hearthstone. Uses only the standard library (urllib), so no extra deps.
+Halts and info still post a silent Mac notification (and a halt also pings the phone),
+since those are error conditions worth surfacing even if the window isn't focused.
 
-All of it degrades gracefully off macOS / without network to plain prints, so
-the tool never crashes because an alert channel is unavailable.
+All of it degrades gracefully off macOS / without network to plain prints, so the tool
+never crashes because an alert channel is unavailable.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-import threading
 import urllib.request
 
 from .config import AlertConfig
@@ -28,22 +26,15 @@ from .config import AlertConfig
 class Alerter:
     def __init__(self, cfg: AlertConfig):
         self.cfg = cfg
-        self._alarm_stop: threading.Event | None = None
-        self._alarm_thread: threading.Thread | None = None
 
     # ── public API used by the engine ────────────────────────────────────────
 
     def target_found(self, class_name: str, we_go_second: bool) -> None:
+        """The whole target alert: one Mac sound. Nothing else, by design."""
         second = "going 2nd" if we_go_second else "going 1st"
-        title = "Hearthstone target found"
-        body = f"{class_name} ({second}) - your turn!"
-        self._mac_notify(title, body)
-        if self.cfg.mac_speak:
-            self._mac_say(f"{class_name} found")
         if self.cfg.mac_sound:
-            self.start_alarm()
-        self._ntfy(title, body, priority="urgent", tags="tada")
-        print(f"*** {title}: {body} ***")
+            self._mac_play_sound_once()
+        print(f"*** target found: {class_name} ({second}) - your turn! ***")
 
     def info(self, message: str) -> None:
         self._mac_notify("hop", message)
@@ -54,35 +45,26 @@ class Alerter:
         self._ntfy("hop HALTED", message, priority="high", tags="warning")
         print(f"[hop][HALT] {message}")
 
-    # ── looping alarm (until acknowledged) ───────────────────────────────────
+    # ── the single target sound ──────────────────────────────────────────────
 
-    def start_alarm(self) -> None:
-        """Loop the alert sound in a background thread until :meth:`stop_alarm`."""
-        if self._alarm_thread and self._alarm_thread.is_alive():
+    def _mac_play_sound_once(self) -> None:
+        """Play the configured system sound exactly once, non-blocking.
+
+        ``Popen`` (not ``run``) so the one ~1s playback never blocks the caller; off
+        macOS it falls back to a single terminal bell. Best-effort: a missing player
+        just prints (the caller already logged the find).
+        """
+        if sys.platform != "darwin":
+            sys.stdout.write("\a")
+            sys.stdout.flush()
             return
-        self._alarm_stop = threading.Event()
-
-        def loop():
-            path = f"/System/Library/Sounds/{self.cfg.sound_name}.aiff"
-            afplay = shutil.which("afplay")
-            while self._alarm_stop and not self._alarm_stop.is_set():
-                if afplay:
-                    try:
-                        subprocess.run([afplay, path], timeout=10)
-                    except Exception:
-                        self._alarm_stop.wait(1.0)
-                else:  # non-mac: terminal bell + wait
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
-                    self._alarm_stop.wait(1.5)
-
-        self._alarm_thread = threading.Thread(target=loop, daemon=True)
-        self._alarm_thread.start()
-
-    def stop_alarm(self) -> None:
-        if self._alarm_stop:
-            self._alarm_stop.set()
-        self._alarm_thread = None
+        afplay = shutil.which("afplay")
+        if not afplay:
+            return
+        try:
+            subprocess.Popen([afplay, f"/System/Library/Sounds/{self.cfg.sound_name}.aiff"])
+        except Exception:
+            pass
 
     # ── platform helpers ─────────────────────────────────────────────────────
 
