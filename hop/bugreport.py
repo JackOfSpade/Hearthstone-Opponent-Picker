@@ -190,21 +190,66 @@ def latest_run_dir(runs_root: Path) -> Path | None:
     return dirs[-1] if dirs else None
 
 
+def format_status(status: dict) -> str:
+    """Render a controller ``status()`` snapshot into report lines.
+
+    This is the "what was the hunt actually doing?" section: running/idle, how long,
+    how many actions and games in, the budget, the human-state, the class distribution.
+    Added because a "Stop takes forever" report couldn't say whether the engine was
+    mid-wait or how far in - the journal shows taps, not the live loop state. Best-effort
+    over a plain dict so this module never imports the runner.
+    """
+    if not status:
+        return ""
+    g = status.get
+    lines = [f"- running: {g('running')}   uptime_s: {g('uptime_s')}"]
+    if g("stop_reason"):
+        lines.append(f"- stop_reason: {g('stop_reason')}")
+    if g("last_error"):
+        lines.append(f"- last_error: {g('last_error')}")
+    if "games" in status:
+        lines.append(f"- games: {g('games')}   concedes: {g('concedes')}   "
+                     f"target_found: {g('target_found')}   last_opponent: {g('last_opponent')}")
+    b = g("budget") or {}
+    if b:
+        lines.append(f"- actions: {b.get('actions_run')}/{b.get('actions_run_cap')}   "
+                     f"concedes: {b.get('concedes_run')}/{b.get('concedes_cap')}   "
+                     f"games: {b.get('games_session')}/{b.get('games_cap')}   "
+                     f"session_min: {b.get('session_minutes')}")
+    hs = g("human_state") or {}
+    if hs:
+        lines.append(f"- human_state: attention={hs.get('attention')} confidence={hs.get('confidence')} "
+                     f"fatigue={hs.get('fatigue')} familiarity={hs.get('familiarity')} actions={hs.get('actions')}")
+    dist = g("class_distribution") or {}
+    if dist:
+        lines.append("- class_distribution: " + ", ".join(f"{k}×{v}" for k, v in dist.items()))
+    return "\n".join(lines)
+
+
 def collect(description: str, paths: ReportPaths, *, version: str,
             journal_tail_lines: int = 120, log_tail_lines: int = 120,
-            clock=time.time, device_probe=None) -> str:
+            clock=time.time, device_probe=None, status_probe=None) -> str:
     """Gather every artifact and assemble the report. Best-effort: a missing or
     unreadable file drops its section rather than failing the whole report.
 
     ``device_probe`` is an optional callable returning a device-summary string (adb /
     panel / pack); injected so the report can include live device state without this
     module importing the transport, and so tests can run without a phone.
+    ``status_probe`` is an optional callable returning a live engine-status string (see
+    :func:`format_status`); the dashboard supplies it since it holds the controller.
     """
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(clock()))
     meta = {"version": version, "when": when,
             "platform": f"{platform.system()} {platform.release()} ({platform.machine()})"}
 
     sections: list[Section] = []
+
+    if status_probe is not None:
+        try:
+            live = status_probe() or ""
+        except Exception as e:  # never let a status probe break the report
+            live = f"(status probe failed: {e})"
+        sections.append(Section("Live engine status", live))
 
     if device_probe is not None:
         try:
@@ -245,8 +290,29 @@ def collect(description: str, paths: ReportPaths, *, version: str,
     return assemble(description, sections, meta=meta)
 
 
+def copy_to_clipboard(markdown: str, *, runner=None) -> bool:
+    """Put the report on the macOS clipboard via ``pbcopy``. Returns True on success.
+
+    This is the default delivery: the user pastes the report straight into Claude Code
+    instead of hunting for a file. ``runner`` is injectable for tests; it defaults to
+    :func:`subprocess.run`. Any failure (not macOS, ``pbcopy`` absent) returns False
+    rather than raising, so a caller can fall back (print it, or write a file).
+    """
+    import subprocess
+    run = runner or subprocess.run
+    try:
+        proc = run(["pbcopy"], input=markdown.encode("utf-8"))
+        return getattr(proc, "returncode", 0) == 0
+    except (OSError, ValueError):
+        return False
+
+
 def write_report(markdown: str, dest_dir: Path, *, clock=time.time) -> Path:
-    """Write the report to ``dest_dir/hop_bug_report_<timestamp>.md``. Returns the path."""
+    """Write the report to ``dest_dir/hop_bug_report_<timestamp>.md``. Returns the path.
+
+    Kept for the explicit ``hop bugreport --out DIR`` opt-in; the default path is
+    :func:`copy_to_clipboard`.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(clock()))
     path = dest_dir / f"hop_bug_report_{stamp}.md"

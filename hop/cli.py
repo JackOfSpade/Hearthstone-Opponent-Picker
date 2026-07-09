@@ -269,10 +269,16 @@ def cmd_bugreport(args) -> int:
     probe = None if args.no_device else (lambda: _device_summary(cfg, pack_dir))
     markdown = br.collect(description, paths, version=__version__, device_probe=probe)
 
-    dest = Path(args.out) if args.out else (Path.home() / "Desktop")
-    path = br.write_report(markdown, dest)
-    print(f"bug report written -> {path}")
-    print("Attach or paste this file into Claude Code; it will self-improve the harness.")
+    if args.out:                       # explicit file opt-in
+        path = br.write_report(markdown, Path(args.out))
+        print(f"bug report written -> {path}")
+        print("Paste this file into Claude Code; it will self-improve the harness.")
+    elif br.copy_to_clipboard(markdown):
+        print("bug report copied to clipboard — paste it into Claude Code; it will self-improve the harness.")
+    else:
+        # no clipboard (e.g. over SSH): print it so the report is never lost
+        print(markdown)
+        print("(could not reach the clipboard; report printed above — copy it manually)", file=sys.stderr)
     return 0
 
 
@@ -709,10 +715,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seed", type=int, default=None)
     sp.set_defaults(func=cmd_dashboard)
 
-    sp = sub.add_parser("bugreport", help="bundle a self-improving bug report (logs + state) to the Desktop")
+    sp = sub.add_parser("bugreport", help="copy a self-improving bug report (logs + state) to the clipboard")
     sp.add_argument("--description", "--desc", dest="description",
                     help="what went wrong (omit to type it interactively)")
-    sp.add_argument("--out", help="destination directory (default: ~/Desktop)")
+    sp.add_argument("--out", help="write to this directory instead of copying to the clipboard")
     sp.add_argument("--no-device", action="store_true",
                     help="skip the live device probe (faster; use when the phone is offline)")
     sp.set_defaults(func=cmd_bugreport)

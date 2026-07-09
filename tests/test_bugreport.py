@@ -152,3 +152,65 @@ def test_write_report_names_by_timestamp(tmp_path):
     p = br.write_report("# report\n", tmp_path / "out", clock=lambda: 0.0)
     assert p.exists() and p.name.startswith("hop_bug_report_") and p.suffix == ".md"
     assert p.read_text() == "# report\n"
+
+
+# ── clipboard delivery ────────────────────────────────────────────────────────
+
+def test_copy_to_clipboard_pipes_markdown_to_pbcopy():
+    seen = {}
+
+    class Done:
+        returncode = 0
+
+    def fake_run(argv, input=None):
+        seen["argv"] = argv
+        seen["input"] = input
+        return Done()
+
+    assert br.copy_to_clipboard("# report\n", runner=fake_run) is True
+    assert seen["argv"] == ["pbcopy"]
+    assert seen["input"] == b"# report\n"      # bytes, on stdin
+
+
+def test_copy_to_clipboard_returns_false_on_failure():
+    def boom(argv, input=None):
+        raise OSError("pbcopy not found")
+    assert br.copy_to_clipboard("x", runner=boom) is False
+
+    class Fail:
+        returncode = 1
+    assert br.copy_to_clipboard("x", runner=lambda *a, **k: Fail()) is False
+
+
+# ── live status snapshot ──────────────────────────────────────────────────────
+
+def test_format_status_surfaces_running_actions_and_distribution():
+    s = {
+        "running": True, "uptime_s": 12.3, "stop_reason": "", "last_error": "",
+        "games": 2, "concedes": 1, "target_found": False, "last_opponent": "Mage",
+        "budget": {"actions_run": 5, "actions_run_cap": 100, "concedes_run": 1,
+                   "concedes_cap": 10, "games_session": 2, "games_cap": 50,
+                   "session_minutes": 0.4},
+        "class_distribution": {"Mage": 2, "Rogue": 1},
+    }
+    out = br.format_status(s)
+    assert "running: True" in out
+    assert "actions: 5/100" in out
+    assert "Mage×2" in out and "Rogue×1" in out
+
+
+def test_format_status_empty_is_empty():
+    assert br.format_status({}) == ""
+
+
+def test_collect_attaches_live_status_when_probed(tmp_path):
+    md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0,
+                    status_probe=lambda: "- running: True")
+    assert "## Live engine status" in md and "running: True" in md
+
+
+def test_a_failing_status_probe_never_breaks_the_report(tmp_path):
+    def boom():
+        raise RuntimeError("kaboom")
+    md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0, status_probe=boom)
+    assert "status probe failed" in md and "kaboom" in md

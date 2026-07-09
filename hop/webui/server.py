@@ -91,8 +91,8 @@ class DashboardServer:
                     self._json(200, {"acked": True})
                 elif self.path.startswith("/bugreport"):
                     try:
-                        path = server._bugreport(body.get("description", ""))
-                        self._json(200, {"path": str(path)})
+                        n = server._bugreport(body.get("description", ""))
+                        self._json(200, {"copied": True, "bytes": n})
                     except Exception as e:
                         self._json(500, {"error": str(e)})
                 else:
@@ -105,11 +105,14 @@ class DashboardServer:
         if self._httpd:
             self._httpd.shutdown()
 
-    def _bugreport(self, description: str):
-        """Write a self-improving bug report to the Desktop; return its path.
+    def _bugreport(self, description: str) -> int:
+        """Assemble a self-improving bug report and put it on the clipboard; return the
+        report size in bytes so the UI can confirm something landed.
 
         Skips the live device probe (a fresh adb connection could contend with the
-        hunt's running transport); the journal, config and logs carry the diagnosis.
+        hunt's running transport), but DOES attach a live engine-status snapshot from
+        the controller (cheap, in-process) so the report says what the hunt was doing.
+        The journal, config and logs carry the rest of the diagnosis.
         """
         from pathlib import Path
         from .. import __version__
@@ -123,8 +126,11 @@ class DashboardServer:
             app_log=home / "Library" / "Logs" / "hop.log",
             templates=home / ".config" / "hop" / "templates",
         )
-        md = br.collect(description, paths, version=__version__, device_probe=None)
-        return br.write_report(md, home / "Desktop")
+        md = br.collect(description, paths, version=__version__, device_probe=None,
+                        status_probe=lambda: br.format_status(self.controller.status()))
+        if not br.copy_to_clipboard(md):
+            raise RuntimeError("could not copy the report to the clipboard (pbcopy failed)")
+        return len(md.encode("utf-8"))
 
     def _criteria_summary(self) -> dict:
         crit = self.cfg.criteria
@@ -211,9 +217,9 @@ _INDEX_HTML = """<!doctype html>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Report a bug</h2>
-      <div class="mut">Bundles this session's logs + state into a self-improving report on your Desktop. Paste it into Claude Code.</div>
+      <div class="mut">Copies a self-improving report (logs + live state) to your clipboard. Paste it straight into Claude Code.</div>
       <textarea id="bugdesc" rows="3" placeholder="What went wrong?" style="width:100%;margin-top:8px;background:#22262f;color:var(--fg);border:1px solid #2a2e38;border-radius:8px;padding:8px;font:inherit;box-sizing:border-box"></textarea>
-      <div class="row"><button id="bugBtn" class="sec">Create report</button><span class="mut" id="bugout"></span></div>
+      <div class="row"><button id="bugBtn" class="sec">Copy report to clipboard</button><span class="mut" id="bugout"></span></div>
     </div>
   </section>
   <section>
@@ -347,11 +353,11 @@ function drawDistribution(dist){
 }
 document.getElementById('bugBtn').onclick=async()=>{
   const out=document.getElementById('bugout'), btn=document.getElementById('bugBtn');
-  btn.disabled=true; out.textContent='writing…';
+  btn.disabled=true; out.textContent='copying…';
   try{
     const r=await (await fetch('/bugreport',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({description:document.getElementById('bugdesc').value})})).json();
-    out.textContent=r.path?('saved → '+r.path):('error: '+(r.error||'?'));
+    out.textContent=r.copied?('✓ copied '+(r.bytes?'('+Math.round(r.bytes/1024)+' KB) ':'')+'— paste into Claude Code'):('error: '+(r.error||'?'));
   }catch(e){ out.textContent='failed: '+e; }
   btn.disabled=false;
 };
