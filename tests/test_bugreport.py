@@ -99,6 +99,27 @@ def test_summarize_empty_journal_is_empty():
     assert br.summarize_journal("not json\n{bad") == ""
 
 
+def test_summarize_journal_surfaces_the_runs_active_criteria():
+    """A run journal's first line records what it hunted for; the summary must show it."""
+    import json
+    events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["PALADIN"],
+                                            "require_second": False, "mode": "casual"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Priest"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    summary = br.summarize_journal(text)
+    assert "criteria (this run): targets=['PALADIN']" in summary
+    assert "require_second=False" in summary
+
+
+def test_summarize_journal_shows_any_when_no_target_classes():
+    import json
+    text = json.dumps({"kind": "run_criteria",
+                       "detail": {"target_classes": [], "require_second": True, "mode": "casual"}})
+    assert "targets=ANY" in br.summarize_journal(text)
+
+
 # ── collection (I/O) ─────────────────────────────────────────────────────────
 
 def _paths(tmp: Path) -> br.ReportPaths:
@@ -201,6 +222,23 @@ def test_format_status_surfaces_running_actions_and_distribution():
 
 def test_format_status_empty_is_empty():
     assert br.format_status({}) == ""
+
+
+def test_format_status_shows_the_active_run_criteria():
+    out = br.format_status({
+        "running": True, "uptime_s": 5,
+        "criteria": {"target_classes": ["MAGE"], "require_second": True, "mode": "ranked"},
+    })
+    assert "criteria: targets=['MAGE']" in out
+    assert "require_second=True" in out and "mode=ranked" in out
+
+
+def test_format_status_criteria_reads_any_when_empty():
+    out = br.format_status({
+        "running": True, "uptime_s": 5,
+        "criteria": {"target_classes": [], "require_second": False, "mode": "casual"},
+    })
+    assert "targets=ANY" in out
 
 
 def test_collect_attaches_live_status_when_probed(tmp_path):

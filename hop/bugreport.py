@@ -151,6 +151,7 @@ def summarize_journal(journal_text: str) -> str:
     classes: dict[str, int] = {}
     anomalies: list[str] = []
     last_halt = ""
+    criteria = ""
     for e in events:
         k = e.get("kind", "?")
         kinds[k] = kinds.get(k, 0) + 1
@@ -161,8 +162,14 @@ def summarize_journal(journal_text: str) -> str:
             anomalies.append(str(d.get("reason", "?")))
         if k in ("stop", "halt") and d.get("message"):
             last_halt = d["message"]
+        if k == "run_criteria":
+            targets = d.get("target_classes") or []
+            criteria = (f"targets={targets or 'ANY'} require_second={d.get('require_second')} "
+                        f"mode={d.get('mode')}")
 
     out = [f"- events: {len(events)}"]
+    if criteria:
+        out.append(f"- criteria (this run): {criteria}")
     out.append("- kinds: " + ", ".join(f"{k}={n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
     if classes:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
@@ -214,6 +221,13 @@ def format_status(status: dict) -> str:
         return ""
     g = status.get
     lines = [f"- running: {g('running')}   uptime_s: {g('uptime_s')}"]
+    crit = g("criteria") or {}
+    if crit:
+        # the criteria the run ACTUALLY used (dashboard/menu overrides included), so a
+        # report shows what it hunted for even when the config file on disk is stale.
+        targets = crit.get("target_classes") or []
+        lines.append(f"- criteria: targets={targets or 'ANY'}   "
+                     f"require_second={crit.get('require_second')}   mode={crit.get('mode')}")
     if g("stop_reason"):
         lines.append(f"- stop_reason: {g('stop_reason')}")
     if g("last_error"):

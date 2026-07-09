@@ -483,6 +483,14 @@ class Engine:
         iters = 0
         last = self.clock()
         try:
+            if self.debug is not None:
+                # First line of every run journal: exactly what THIS run was told to hunt
+                # for. Ties the criteria to the run dir, so a bug report is never left
+                # guessing whether the config file matches the run's real selection.
+                c = self.cfg.criteria
+                self.debug.record("run_criteria",
+                                  target_classes=[hc.name for hc in c.target_classes],
+                                  require_second=c.require_second, mode=c.mode)
             if not self.classifier.has_templates:
                 raise Halt("no screen templates loaded; run `hop capture` first (refusing to run blind)")
             while not self._stop:
