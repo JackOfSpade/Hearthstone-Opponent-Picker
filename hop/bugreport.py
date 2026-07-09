@@ -39,6 +39,16 @@ SELF_IMPROVE_PROMPT = """\
 """
 
 
+#: Hard ceiling on the whole report's line count. A report is pasted straight into
+#: Claude Code, so it must not balloon: past this, the oldest lines of the biggest log
+#: sections (app log first, then the run journal) are dropped — the newest lines are the
+#: most diagnostic. Generous enough that a normal report is never touched.
+MAX_REPORT_LINES = 50_000
+
+#: Sections trimmed (in this order, oldest-line-first) when a report exceeds the cap.
+_TRIMMABLE_TITLES = ("App log (~/Library/Logs/hop.log)", "Latest run journal (tail)")
+
+
 @dataclass(frozen=True)
 class Section:
     """One titled block of the report. ``fenced`` wraps the body in a code fence."""
@@ -224,6 +234,12 @@ def format_status(status: dict) -> str:
     dist = g("class_distribution") or {}
     if dist:
         lines.append("- class_distribution: " + ", ".join(f"{k}×{v}" for k, v in dist.items()))
+    tb = g("last_error_traceback")
+    if tb:
+        # The full traceback of the last crash, fenced so it renders as a code block
+        # inside this section. Without it, a bare "TypeError: ..." message is a grep
+        # hunt; with it, the report points straight at the failing line.
+        lines += ["", "Last error traceback:", "```text", str(tb).rstrip(), "```"]
     return "\n".join(lines)
 
 
@@ -247,8 +263,46 @@ def tooling_summary(*, which=None, env=None) -> str:
     return "\n".join(lines)
 
 
+def _fit_line_budget(description: str, sections: list[Section], *, meta: dict,
+                     max_lines: int | None = None) -> str:
+    """Assemble, and if the report exceeds ``max_lines``, drop the oldest lines of the
+    biggest log sections (see :data:`_TRIMMABLE_TITLES`) until it fits.
+
+    Oldest-first because the newest log/journal lines are the ones nearest the failure.
+    Everything else (the self-improve prompt, description, live status, config) is
+    preserved. Idempotent for a report already under budget. ``max_lines`` defaults to
+    :data:`MAX_REPORT_LINES`, resolved at call time so it stays overridable.
+    """
+    if max_lines is None:
+        max_lines = MAX_REPORT_LINES
+    report = assemble(description, sections, meta=meta)
+    over = len(report.splitlines()) - max_lines
+    if over <= 0:
+        return report
+
+    sections = list(sections)  # don't mutate the caller's list
+    for title in _TRIMMABLE_TITLES:
+        if over <= 0:
+            break
+        for i, sec in enumerate(sections):
+            if sec.title != title:
+                continue
+            body_lines = sec.body.splitlines()
+            # +1: the omission note we add back is itself a line, so to shed `over`
+            # net lines we must drop `over + 1` of the body's oldest lines.
+            drop = min(over + 1, max(0, len(body_lines) - 10))  # keep the last few lines
+            if drop > 0:
+                note = (f"... ({drop} more oldest lines dropped to fit the "
+                        f"{max_lines:,}-line report cap) ...")
+                sections[i] = Section(sec.title, note + "\n" + "\n".join(body_lines[drop:]),
+                                      fenced=sec.fenced, lang=sec.lang)
+                over -= drop
+            break
+    return assemble(description, sections, meta=meta)
+
+
 def collect(description: str, paths: ReportPaths, *, version: str,
-            journal_tail_lines: int = 120, log_tail_lines: int = 120,
+            journal_tail_lines: int = 500, log_tail_lines: int = 2000,
             clock=time.time, device_probe=None, status_probe=None) -> str:
     """Gather every artifact and assemble the report. Best-effort: a missing or
     unreadable file drops its section rather than failing the whole report.
@@ -310,7 +364,7 @@ def collect(description: str, paths: ReportPaths, *, version: str,
             "anchors (`hop capture --from-file`); their existence means something is "
             "unhandled:\n\n" + "\n".join(f"- {n}" for n in unknown_files)))
 
-    return assemble(description, sections, meta=meta)
+    return _fit_line_budget(description, sections, meta=meta)
 
 
 def copy_to_clipboard(markdown: str, *, runner=None) -> bool:

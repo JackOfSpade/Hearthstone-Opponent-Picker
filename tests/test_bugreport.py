@@ -234,3 +234,48 @@ def test_tooling_summary_reports_resolved_paths():
 def test_collect_includes_the_tooling_section(tmp_path):
     md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0)
     assert "## Tooling / environment" in md
+
+
+# ── last-error traceback ──────────────────────────────────────────────────────
+
+def test_format_status_renders_the_traceback_when_present():
+    tb = "Traceback (most recent call last):\n  File ...\nTypeError: boom"
+    out = br.format_status({"running": False, "uptime_s": 1, "last_error": "TypeError: boom",
+                            "last_error_traceback": tb})
+    assert "Last error traceback:" in out
+    assert "```text" in out and "TypeError: boom" in out
+
+
+def test_format_status_omits_the_traceback_block_when_absent():
+    out = br.format_status({"running": True, "uptime_s": 1})
+    assert "Last error traceback" not in out
+
+
+# ── 50k-line cap ──────────────────────────────────────────────────────────────
+
+def test_fit_line_budget_trims_oldest_log_lines_first():
+    big = "\n".join(f"log{i}" for i in range(200))
+    secs = [br.Section("Live engine status", "- running: False"),
+            br.Section("App log (~/Library/Logs/hop.log)", big, fenced=True, lang="text")]
+    out = br._fit_line_budget("desc", secs, meta={"version": "1"}, max_lines=40)
+    assert len(out.splitlines()) <= 40
+    assert "log199" in out                    # newest log line survives
+    assert "\nlog0\n" not in out              # oldest log line is dropped
+    assert "- running: False" in out          # non-log sections are untouched
+    assert "oldest lines dropped" in out
+
+
+def test_fit_line_budget_is_a_noop_under_the_cap():
+    secs = [br.Section("App log (~/Library/Logs/hop.log)", "a\nb\nc", fenced=True, lang="text")]
+    out = br._fit_line_budget("d", secs, meta={"version": "1"}, max_lines=1000)
+    assert "oldest lines dropped" not in out and "a\nb\nc" in out
+
+
+def test_collect_never_exceeds_the_line_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "MAX_REPORT_LINES", 60)
+    (tmp_path / "hop.log").write_text("\n".join(f"line{i}" for i in range(500)) + "\n")
+    md = br.collect("halp", _paths(tmp_path), version="2.0.0", clock=lambda: 0.0,
+                    log_tail_lines=500)
+    assert len(md.splitlines()) <= 60
+    assert "line499" in md                    # the most recent log line is kept
+    assert md.startswith(br.SELF_IMPROVE_PROMPT)
