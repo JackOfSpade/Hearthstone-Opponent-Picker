@@ -229,18 +229,6 @@ class DebugConfig:
 
 
 @dataclass(frozen=True)
-class DeckConfig:
-    #: 1-indexed positions (reading order, 1..9) of the COMPLETE decks the hunt may
-    #: queue from. Used only on the rare recovery path where an error drops hop back to
-    #: the deck list: it reopens the first of these that opens to a Play screen. Empty
-    #: (the default) means hop will not guess a deck - it halts with guidance rather than
-    #: risk selecting an incomplete deck. It NEVER auto-completes a deck regardless (see
-    #: ScreenState.INCOMPLETE_DECK). Reliable visual detection of the "X/30 Missing Cards"
-    #: badge was ruled out: deck art fakes the colour cues (measured).
-    recovery_slots: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
 class Config:
     criteria: Criteria
     device: DeviceConfig
@@ -254,7 +242,6 @@ class Config:
     caps: CapsConfig
     vision: VisionConfig
     debug: DebugConfig
-    deck: DeckConfig
     risk_profile: str
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -341,9 +328,6 @@ def load_config(path: str | Path | None = None) -> Config:
         caps=CapsConfig(**{k: cp[k] for k in CapsConfig.__annotations__}),
         vision=VisionConfig(**{k: v[k] for k in VisionConfig.__annotations__}),
         debug=DebugConfig(**{k: dbg[k] for k in DebugConfig.__annotations__}),
-        deck=DeckConfig(
-            recovery_slots=tuple(int(s) for s in merged.get("deck", {}).get("recovery_slots", [])),
-        ),
         risk_profile=profile,
         raw=merged,
     )

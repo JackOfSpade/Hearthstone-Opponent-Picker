@@ -109,16 +109,6 @@ class GameLayout:
     # Android's y=996 gesture inset, but discrete taps there are delivered on this
     # device (measured: `input tap 1200 1020` navigated fine).
     collection_back: Point = Point(0.846, 0.9370, 0.0154)
-    # The deck-select grid: 9 decks per page in a 3x3 layout. hop reaches this only on
-    # recovery (an error dropped it back to the deck list) and must reopen a deck to get
-    # a Play screen. It CANNOT blind-tap the first slot: on a real account the first deck
-    # is often incomplete ("27/30 - Missing Cards"), and selecting it pops the
-    # INCOMPLETE_DECK dialog. So the engine tries slots in order and takes the first that
-    # opens to a Play screen (see engine._handle_deck_select). LIVE-MEASURED (Pixel 7a,
-    # 2400x1080): column centres 0.275/0.492/0.708, row centres 0.259/0.514/0.718.
-    deck_cols: tuple = (0.275, 0.492, 0.708)
-    deck_rows: tuple = (0.259, 0.514, 0.718)
-    deck_slot_radius_f: float = 0.02
     # The "No" button of the INCOMPLETE_DECK dialog ("Complete deck automatically?").
     # hop taps this, NEVER "Yes" - auto-completing a deck spends the user's dust/cards.
     # LIVE-MEASURED: the gold No button spans x 1200-1540, y 645-715; radius from its
@@ -155,14 +145,6 @@ class GameLayout:
         return Region(max(0.0, center_xf - half), self.card_row.yf,
                       self.card_inner_w_f, self.card_row.hf)
 
-    def deck_slots(self) -> list[Point]:
-        """The deck-select grid's tap targets, in reading order (row-major).
-
-        Row-major because the engine tries them in order and takes the first deck that
-        opens to a Play screen - and a human reads a grid left-to-right, top-to-bottom.
-        """
-        return [Point(c, r, self.deck_slot_radius_f)
-                for r in self.deck_rows for c in self.deck_cols]
 
 
 @dataclass(frozen=True)

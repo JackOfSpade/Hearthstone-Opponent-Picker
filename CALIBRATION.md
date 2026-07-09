@@ -331,33 +331,38 @@ the home-swipe *gesture*, not taps — which is why `collection_back` at y≈101
 even though `end_dismiss`'s *spread* into that band was not (the latter also spilled
 off-screen and wasn't on a control).
 
-### Never auto-complete a deck, and don't guess which deck is complete
+### The deck list: pause, and never auto-complete
 
-Live-verified. The deck-select recovery (an error dropped hop back to the deck list)
-used to blind-tap the first slot. On a real account the first decks are often incomplete
-("27/30 - Missing Cards"), and selecting one pops **"Complete deck automatically? [Yes]
-[No]"**. Auto-completing spends the user's dust/cards, so hop must never tap Yes. The
-`incomplete_deck` anchor (the "Incomplete Deck" title, invariant; the card count varies)
-classifies the modal at **0.91**, priority 10 over the `deck_select` still showing
-through it, and `_decline_incomplete_deck` taps **No**.
+hop reaches the deck grid only on recovery (an error dropped it back there). It does
+**not** reopen a deck - it **pauses** (halts + alerts) and the user re-selects. The
+requirement is to re-open *the same deck that was in play*, and nothing on-device lets
+hop do that reliably; opening a *different* deck than the user chose is worse than
+stopping. Everything tried, and why each was dropped:
 
-Two automatic ways to pick a *complete* deck were tried on-device and **both failed**:
+* **Blind-tap the first slot.** The first decks are often incomplete ("27/30 - Missing
+  Cards"); selecting one pops **"Complete deck automatically? [Yes] [No]"**, and it is
+  the *wrong* deck anyway.
+* **Use the dialog as a completeness oracle** (tap decks until one opens with no dialog).
+  Refuted: the prompt is **per-deck and inconsistent** - some incomplete decks open with
+  *no* dialog at all (a 28/30 deck opened straight to its Play screen, verified), so "no
+  dialog" does not mean "complete", and Play on that deck queued it.
+* **Detect the "X/30 Missing Cards" badge by colour.** Refuted: deck **art** fakes the
+  red/gold cue (a dragon's fire, gold armour); a colour test misread ~2 of 9 decks,
+  including a false "complete". Same trap as the mana-gem/brightness card counters.
+* **OCR the deck name off the Play screen and match it in the grid** (the ideal - it
+  identifies *the* deck). Refuted: the grid renders deck names **soft, small and
+  stylised** (Belwe font, low contrast, over blurred art); OCR returns pure garbage
+  through raw, sparse-text, and 5x-upscaled+binarised passes alike. The class *label*
+  OCRs cleanly only because it is flat uppercase on a plain background.
 
-* **The dialog as a completeness oracle.** After you decline it once, Hearthstone
-  **session-suppresses** it: the next incomplete deck opens straight to its Play screen
-  (verified - tapping a second 28/30 deck opened it with no dialog). So the dialog only
-  catches the first incomplete deck.
-* **Detecting the "X/30 Missing Cards" badge by colour.** Measured on a real 9-deck grid:
-  the red badge/frame colour is faked by deck **art** (a dragon's fire, gold armour) and
-  the gold "Missing Cards" text sits too near the deck name to threshold cleanly - a
-  colour test misread ~2 of 9 decks, including a *false "complete"* that would queue an
-  unplayable deck. Same "art fakes the cue" trap as the mana-gem/brightness card counters.
+So `_dispatch` on `DECK_SELECT` raises a Halt with guidance ("re-select your deck"). In
+normal use hop runs from a Play screen the user already opened and never sees the grid.
 
-So hop does **not** guess. `[deck] recovery_slots` names the complete decks (1-indexed,
-reading order); recovery reopens the first that lands on a Play screen, and halts with
-guidance if none are configured. LIVE-VERIFIED: with `recovery_slots = [4, 6, 8, 9]`,
-recovery tapped slot 4 and opened the (complete) Freeze deck, no dialog. In normal use
-hop runs from a Play screen you already opened, so this recovery is rarely hit.
+The one thing hop still does on the deck screens is **refuse to auto-complete**: the
+`incomplete_deck` anchor (the invariant "Incomplete Deck" title; the card count varies)
+classifies the modal at **0.91**, priority 10 over the `deck_select` showing through it,
+and `_decline_incomplete_deck` taps **No**, never Yes (auto-completing spends the user's
+dust/cards). LIVE-VERIFIED: the modal declines to No and returns to the deck list.
 
 ### Two dead ends the loop could never leave
 
