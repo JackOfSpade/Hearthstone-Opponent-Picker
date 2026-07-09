@@ -25,6 +25,10 @@ class EngineController:
         self._lock = threading.Lock()
         self._last_error: str = ""
         self._started_at: float = 0.0
+        #: a stop asked for before the engine exists (during construction) must not be
+        #: lost -- see start()/stop(). Building an engine (ADB connect + UHID enumerate)
+        #: takes a beat, and a stop in that window used to no-op and let the hunt begin.
+        self._stop_requested: bool = False
 
     @property
     def running(self) -> bool:
@@ -35,12 +39,18 @@ class EngineController:
             if self.running:
                 return False
             self._last_error = ""
+            self._stop_requested = False
             self._started_at = time.time()
 
             def _run():
                 try:
-                    self._engine = self.engine_factory(overrides or {})
-                    self._engine.run()
+                    eng = self.engine_factory(overrides or {})
+                    self._engine = eng
+                    # a stop that arrived while we were constructing: honour it now, so
+                    # the hunt exits at the first loop check instead of booking a game.
+                    if self._stop_requested:
+                        eng.request_stop()
+                    eng.run()
                 except Exception as e:  # surface, don't crash the dashboard
                     self._last_error = f"{type(e).__name__}: {e}"
 
@@ -49,6 +59,10 @@ class EngineController:
             return True
 
     def stop(self) -> None:
+        # set the flag BEFORE checking _engine so a stop can't slip through the window
+        # where the engine is being constructed (see _run): whichever order the two
+        # threads interleave, the stop lands.
+        self._stop_requested = True
         eng = self._engine
         if eng is not None:
             eng.request_stop()

@@ -28,6 +28,26 @@ def _engine(cfg, states, *, target_read=None, capturer=None, alerter=None):
     return eng, backend
 
 
+def test_interruptible_sleep_raises_when_stopped(cfg):
+    from hop.engine import StopRequested
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+    eng.request_stop()
+    with pytest.raises(StopRequested):
+        eng.sleep(5.0)          # a long wait is abandoned immediately, not after 5 s
+
+
+def test_interruptible_sleep_is_a_noop_when_not_stopped(cfg):
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+    eng.sleep(0.01)             # returns normally; no raise
+
+
+def test_run_exits_with_user_stop_when_stopped(cfg):
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+    eng.request_stop()
+    stats = eng.run()
+    assert stats.stop_reason == "user_stop"
+
+
 def test_evaluate_matchup_pure(cfg):
     keep = MulliganRead(HeroClass.MAGE, True, 4, 1.0, "MAGE", "tesseract")
     assert evaluate_matchup(keep, cfg) == "keep"  # no filter -> keep

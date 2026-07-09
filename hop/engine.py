@@ -52,6 +52,12 @@ from .touchstream import Gesture
 from .verify import CleanStop, Halt, Verifier
 
 
+class StopRequested(Exception):
+    """The operator asked the hunt to stop (Stop button / hotkey). Raised from the
+    stop-aware sleep so a stop interrupts a wait immediately; caught in :meth:`Engine.run`.
+    """
+
+
 @dataclass
 class RunStats:
     games: int = 0
@@ -110,7 +116,9 @@ class Engine:
         self.reader = reader
         self.alerts = alerts
         self.debug = debug
-        self.sleep = sleep
+        #: raw injected sleep; callers use self.sleep, the stop-aware wrapper below
+        self._raw_sleep = sleep
+        self.sleep = self._interruptible_sleep
         self.clock = clock
         self.rng = rng or Random()
         self.layout = layout or GameLayout()
@@ -144,6 +152,30 @@ class Engine:
 
     def request_stop(self) -> None:
         self._stop = True
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep, but honour a stop request within ~one slice rather than after the
+        full delay. A single hunt iteration can wait through a 12 s requeue delay or a
+        match-start poll; without this, pressing Stop is not noticed until that wait
+        ends, so "immediate stop" felt like it hung. Raising unwinds any wait loop or
+        dispatch handler straight to :meth:`run`, which stops cleanly.
+
+        Sliced by arithmetic, never by the clock, so it still terminates under the
+        frozen clock the unit tests inject.
+        """
+        if self._stop:
+            raise StopRequested()
+        slice_s = self.cfg.vision.stop_poll_s
+        remaining = float(seconds)
+        while remaining > slice_s:
+            self._raw_sleep(slice_s)
+            if self._stop:
+                raise StopRequested()
+            remaining -= slice_s
+        if remaining > 0:
+            self._raw_sleep(remaining)
+        if self._stop:
+            raise StopRequested()
 
     # ── the tap primitive (L3 -> L1 -> L6) ────────────────────────────────────
 
@@ -378,6 +410,8 @@ class Engine:
         deadline = self.clock() + timeout_s
         cls, frame = self._classify()
         for _ in range(attempts - 1):
+            if self._stop:                       # bail before another ~1.4 s screencap
+                raise StopRequested()
             if predicate(cls, frame):
                 return True, cls, frame
             if self.clock() >= deadline:
@@ -443,6 +477,10 @@ class Engine:
                 self.sleep(timing.between_actions(self.rng, self.cfg.timing, self.state) * self.delay_scale)
                 if self.stats.target_found:
                     break
+            if self._stop and not self.stats.stop_reason:
+                self.stats.stop_reason = "user_stop"
+        except StopRequested:
+            self.stats.stop_reason = "user_stop"
         except CapReached as e:
             self.stats.stop_reason = f"cap:{e.which}"
             self._notify_stop(f"Stopped: {e}")

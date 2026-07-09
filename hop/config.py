@@ -194,6 +194,9 @@ class VisionConfig:
     screen_wait_attempts: int
     screen_wait_timeout_s: float
     screen_wait_poll_s: float
+    #: Slice length for the stop-aware sleep. A stop request is honoured within about
+    #: one slice instead of after the full (up to 12 s) delay, so "Stop" feels instant.
+    stop_poll_s: float
     #: Extra looks for motion after an unscoped tap, before calling it a missed tap.
     motion_wait_attempts: int
     #: Polls of a live board at the top of the loop before abandoning the game.
