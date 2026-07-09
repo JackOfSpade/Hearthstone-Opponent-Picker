@@ -147,13 +147,11 @@ class EngineController:
                 "familiarity": round(st.familiarity, 2),
                 "actions": st.actions_taken,
             },
+            # activity counters (informational; there are no volume caps to hit)
             "budget": {
                 "actions_run": lim.actions_this_run,
-                "actions_run_cap": lim.max_actions_per_run,
                 "concedes_run": lim.commits_this_run,
-                "concedes_cap": lim.committing_action_cap,
                 "games_session": lim.games_this_session,
-                "games_cap": lim.max_games_per_session,
                 "committing_ratio": round(lim.committing_ratio(), 2),
                 "session_minutes": round(lim.session_seconds / 60, 1),
             },

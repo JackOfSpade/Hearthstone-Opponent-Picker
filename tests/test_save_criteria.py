@@ -9,8 +9,6 @@ no `hop` command could load.
 
 import tomllib
 
-import pytest
-
 from hop.config import load_config, save_criteria
 from hop.hero_classes import HeroClass
 
@@ -100,17 +98,8 @@ def test_creates_the_file_and_table_when_absent(tmp_path):
     assert load_config(p).criteria.target_classes == (HeroClass.ROGUE,)
 
 
-def test_risk_profile_is_validated(tmp_path):
+def test_mode_writes_to_the_criteria_table(tmp_path):
     p = _user_cfg(tmp_path, "[criteria]\ntarget_classes = []\n")
-    with pytest.raises(ValueError, match="unknown risk profile"):
-        save_criteria(target_classes=(), require_second=False,
-                      risk_profile="yolo", path=p)
-
-
-def test_risk_profile_writes_to_its_own_table(tmp_path):
-    p = _user_cfg(tmp_path, "[criteria]\ntarget_classes = []\n")
-    save_criteria(target_classes=(), require_second=False,
-                  mode="ranked", risk_profile="balanced", path=p)
+    save_criteria(target_classes=(), require_second=False, mode="ranked", path=p)
     cfg = load_config(p)
-    assert cfg.risk_profile == "balanced"
     assert cfg.criteria.mode == "ranked"

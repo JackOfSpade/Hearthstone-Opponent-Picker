@@ -10,7 +10,7 @@ is decoupled from concede-time.** We know at the mulligan whether to keep or
 reject, but a reject still: performs the mulligan like a human (keep/replace a
 plausible subset), enters the game, plays a beat or two, and concedes at a
 *randomly chosen* point. Instant concedes are the single most detectable thing
-this tool could do, so the grammar never emits one on the cautious profile.
+this tool could do, so the grammar never emits one.
 
 This module plans the cognitive *shape* (which cards to replace, which turn to
 bail on, where to hesitate). The concrete screen taps live in the engine; the
@@ -36,8 +36,8 @@ class MulliganDecision:
     decision_type: str  # "commit" | "reject"
 
 
-# Concede points, and their base weights. min_play_turns (from the risk profile)
-# pushes the distribution later (cautious) or earlier (aggressive).
+# Concede points, in order. Weighted toward the later ones (see
+# choose_concede_point) so a normal user plays a beat before bailing.
 _CONCEDE_POINTS = ("mulligan", "turn1", "turn2")
 
 
@@ -69,17 +69,15 @@ def plan_mulligan(rng: Random, num_cards: int, keeping: bool) -> list[MulliganDe
     return decisions
 
 
-def choose_concede_point(rng: Random, min_play_turns: float) -> str:
+def choose_concede_point(rng: Random) -> str:
     """Pick where in a rejected game to concede.
 
-    ``min_play_turns`` in [0, 1]: 1.0 (cautious) heavily favors playing into the
-    game before conceding; 0.0 (aggressive) allows a fast mulligan-stage concede.
+    Weighted toward playing a beat into the game before conceding, so the exit
+    never correlates with the class reveal. A ``"mulligan"`` concede still
+    performs the full mulligan first; the grammar never emits an instant concede.
     """
-    # Weight later points more as min_play_turns rises.
-    w_mull = 1.0 + 3.0 * (1.0 - min_play_turns)   # aggressive inflates early bail
-    w_t1 = 1.2 + 0.6 * min_play_turns
-    w_t2 = 0.4 + 1.6 * min_play_turns
-    weights = [w_mull, w_t1, w_t2]
+    # mulligan : turn1 : turn2  ~=  1.0 : 1.8 : 2.0  ->  ~21% / 37% / 42%.
+    weights = (1.0, 1.8, 2.0)
     total = sum(weights)
     r = rng.random() * total
     acc = 0.0
@@ -100,12 +98,12 @@ class RejectPlan:
     extra_reads: int                   # number of idle "reading the board" pauses
 
 
-def plan_reject(rng: Random, num_cards: int, min_play_turns: float) -> RejectPlan:
+def plan_reject(rng: Random, num_cards: int) -> RejectPlan:
     """Compose a complete plausible-exit plan for a matchup we will concede."""
-    point = choose_concede_point(rng, min_play_turns)
+    point = choose_concede_point(rng)
     mull = plan_mulligan(rng, num_cards, keeping=False)
-    hesitate = rng.random() < (0.5 + 0.3 * min_play_turns)
-    extra = {"mulligan": 0, "turn1": rng.choice([0, 1]), "turn2": rng.choice([1, 1, 2])}[point]
+    hesitate = rng.random() < 0.5   # ~half the time, pause before conceding (real quitters do)
+    extra = {"mulligan": 0, "turn1": rng.choice([0, 0, 1]), "turn2": rng.choice([0, 1])}[point]
     return RejectPlan(
         concede_point=point,
         mulligan=mull,

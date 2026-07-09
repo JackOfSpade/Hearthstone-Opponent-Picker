@@ -113,6 +113,24 @@ def test_summarize_journal_surfaces_the_runs_active_criteria():
     assert "require_second=False" in summary
 
 
+def test_summarize_journal_surfaces_sleep_budget_and_gaps():
+    import json
+    events = [
+        {"t": 0.0, "kind": "mulligan_read", "detail": {"opponent": "Druid"}},
+        {"t": 0.1, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 2.4}},
+        {"t": 2.5, "kind": "tap", "detail": {"what": "mulligan_card[1]"}},
+        {"t": 3.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 1.6}},
+        {"t": 4.6, "kind": "tap", "detail": {"what": "mulligan_confirm"}},
+        {"t": 9.2, "kind": "tap", "detail": {"what": "gear"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    summary = br.summarize_journal(text)
+    assert "intentional sleeps" in summary
+    assert "tap_think=4.0s" in summary
+    assert "longest single sleeps: tap_think 2.4s" in summary
+    assert "largest journal gaps" in summary and "tap->tap 4.6s" in summary
+
+
 def test_summarize_journal_surfaces_the_unknown_screen_near_miss():
     """The closest known screen is the single most actionable line for an unknown halt."""
     import json
@@ -245,14 +263,13 @@ def test_format_status_surfaces_running_actions_and_distribution():
     s = {
         "running": True, "uptime_s": 12.3, "stop_reason": "", "last_error": "",
         "games": 2, "concedes": 1, "target_found": False, "last_opponent": "Mage",
-        "budget": {"actions_run": 5, "actions_run_cap": 100, "concedes_run": 1,
-                   "concedes_cap": 10, "games_session": 2, "games_cap": 50,
-                   "session_minutes": 0.4},
+        "budget": {"actions_run": 5, "concedes_run": 1, "games_session": 2,
+                   "committing_ratio": 0.2, "session_minutes": 0.4},
         "class_distribution": {"Mage": 2, "Rogue": 1},
     }
     out = br.format_status(s)
     assert "running: True" in out
-    assert "actions: 5/100" in out
+    assert "actions: 5" in out and "concedes: 1" in out
     assert "Mage×2" in out and "Rogue×1" in out
 
 

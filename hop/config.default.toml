@@ -6,8 +6,8 @@
 # be re-measured on your actual phone before trusting auto mode is tagged
 # LIVE-VERIFY in a comment. Run `hop calibrate` to derive real values (§10).
 #
-# User settings you'll actually edit live under [criteria], [risk], [device]
-# and [alerts]. The [motor], [timing], [contact], [scroll], [sensor], [caps]
+# User settings you'll actually edit live under [criteria], [device] and
+# [alerts]. The [motor], [timing], [contact], [scroll], [sensor], [caps]
 # and [vision] tables are the humanization priors - leave them unless you have
 # a measurement (provenance note required next to any change).
 
@@ -75,27 +75,26 @@ sound_name = "Glass"        # a /System/Library/Sounds name, looped until ack
 ntfy_topic = ""             # optional phone push via ntfy.sh (loud, no account)
 ntfy_server = "https://ntfy.sh"
 
-[risk]
-# cautious | balanced | aggressive - selects a bundle of pacing multipliers
-# applied on top of [caps] and the concede journey grammar.
-profile = "cautious"
-
 # ─────────────────────── HUMANIZATION PRIORS (§8) ───────────────────────
 # Provenance for every value below: "reference phone, one human" per the
 # standard. Re-measure via `hop calibrate` (§10) and record device/date here.
 
 [timing]
 sigma = 0.22                       # log-normal spread for human_delay/cooldown
-between_action_anchor_s = 3.5      # typical inter-action pause; spread, don't burst
-read_consider_dwell_s = 1.1        # per-item consideration pause
+between_action_anchor_s = 1.2      # typical inter-action pause; spread, don't burst
+read_consider_dwell_s = 0.55       # per-item consideration pause
 # Per-decision think time = shifted-lognormal(shift, mu, sigma), then modulated
 # by HumanState. A committing action is a faster reaction than a rejecting one.
-think_commit_shift = 1.2
-think_commit_mu = 0.65
-think_commit_sigma = 0.35          # -> ~3.2 s median
-think_reject_shift = 1.8
-think_reject_mu = 1.45
-think_reject_sigma = 0.42          # -> ~6.9 s median
+# shift+mu set the CENTRE (median = shift + exp(mu), independent of sigma); sigma
+# is the SPREAD only. Speed lives in shift/mu -- keep sigma wide so a detector
+# timing us ("class-read -> concede") sees a human right-skewed tail, not a tight
+# spike. Narrowing sigma buys no speed (the median is unchanged), only a tell.
+think_commit_shift = 0.45
+think_commit_mu = 0.25             # -> ~1.7 s median
+think_commit_sigma = 0.35
+think_reject_shift = 0.75
+think_reject_mu = 0.65             # -> ~2.7 s median
+think_reject_sigma = 0.42
 
 [motor]
 # FFitts (Bi & Zhai), not vanilla Fitts. a,b in seconds; precision term in mm.
@@ -154,16 +153,10 @@ swipe_torque_dps = 1.4             # angular side effect per swipe
 poll_rate_hz = 100
 
 [caps]
-# Behavioral hygiene (§ Layer 5). Conservative starting caps; the risk profile
-# scales them. When a cap is hit the run STOPS (never substitutes an action).
-max_actions_per_run = 30
-max_actions_per_day = 50
-committing_action_cap = 15         # the key cap: holds the concede/commit ratio human
-max_games_per_session = 60
-max_session_minutes = 120
-mandatory_break_every_games = 12   # take a randomized break after N games
-break_min_minutes = 5
-break_max_minutes = 20
+# The non-repetition gate (§ Layer 5). The volume/session/time caps and mandatory
+# breaks that used to live here were removed by request — a hunt runs until it
+# finds a target, an error halts it, or the user stops it. Pacing/volume is the
+# operator's call now.
 non_repetition_threshold = 0.06    # reject trajectories that near-duplicate a prior run
 # ...and, when one is rejected, DRAW ANOTHER rather than halt. Non-repetition is a
 # pre-action gate: the point is never to emit a duplicate, not to notice afterwards
@@ -171,7 +164,7 @@ non_repetition_threshold = 0.06    # reject trajectories that near-duplicate a p
 # resample, don't clamp.) Only when this many independent draws all near-duplicate a
 # prior trajectory is the generator genuinely degenerate -- then Halt, fail closed.
 # LIVE-MEASURED 2026-07-08 over the real per-game tap sequence (play, 2 card taps,
-# confirm, gear, concede, 2x end_dismiss), 300 seeded runs x max_actions_per_run=30:
+# confirm, gear, concede, 2x end_dismiss), 300 seeded runs x 30 taps each:
 #   resamples   emitted duplicates   runs that would Halt
 #       1            14.21%              293/300      <- the shipped behaviour
 #       2             2.40%              150/300

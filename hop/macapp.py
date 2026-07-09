@@ -206,7 +206,7 @@ class _AppState:
             return f"Idle ({reason})" if reason else "Idle"
         b = st.get("budget") or {}
         text = (f"Hunting · {st.get('games', 0)} games · "
-                f"{b.get('concedes_run', 0)}/{b.get('concedes_cap', '?')} concedes")
+                f"{b.get('concedes_run', 0)} concedes")
         ignored = st.get("ignored_card_taps") or 0
         if ignored:
             text += f" · {ignored} card taps ignored"

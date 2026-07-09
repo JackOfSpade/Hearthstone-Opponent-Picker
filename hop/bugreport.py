@@ -150,17 +150,34 @@ def summarize_journal(journal_text: str) -> str:
     kinds: dict[str, int] = {}
     classes: dict[str, int] = {}
     anomalies: list[str] = []
+    sleeps: dict[str, float] = {}
+    longest_sleeps: list[tuple[float, str]] = []
+    gaps: list[tuple[float, str, str]] = []
     last_halt = ""
     criteria = ""
     closest = ""
+    prev_t: float | None = None
+    prev_kind = ""
     for e in events:
         k = e.get("kind", "?")
         kinds[k] = kinds.get(k, 0) + 1
         d = e.get("detail", {})
+        t = e.get("t")
+        if isinstance(t, (int, float)):
+            if prev_t is not None:
+                gaps.append((float(t) - prev_t, prev_kind, k))
+            prev_t = float(t)
+            prev_kind = k
         if k == "mulligan_read" and d.get("opponent"):
             classes[d["opponent"]] = classes.get(d["opponent"], 0) + 1
         if k == "anomaly":
             anomalies.append(str(d.get("reason", "?")))
+        if k == "sleep":
+            reason = str(d.get("reason", "?"))
+            seconds = d.get("seconds")
+            if isinstance(seconds, (int, float)):
+                sleeps[reason] = sleeps.get(reason, 0.0) + float(seconds)
+                longest_sleeps.append((float(seconds), reason))
         if k in ("stop", "halt") and d.get("message"):
             last_halt = d["message"]
         if k == "unknown_screen" and d.get("near_misses"):
@@ -187,6 +204,18 @@ def summarize_journal(journal_text: str) -> str:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
+    if sleeps:
+        biggest = sorted(sleeps.items(), key=lambda kv: -kv[1])[:6]
+        out.append("- intentional sleeps: " + ", ".join(
+            f"{reason}={seconds:.1f}s" for reason, seconds in biggest))
+        long_one = sorted(longest_sleeps, key=lambda x: -x[0])[:3]
+        out.append("- longest single sleeps: " + ", ".join(
+            f"{reason} {seconds:.1f}s" for seconds, reason in long_one))
+    if gaps:
+        biggest_gaps = [g for g in sorted(gaps, key=lambda x: -x[0])[:5] if g[0] >= 2.0]
+        if biggest_gaps:
+            out.append("- largest journal gaps: " + "; ".join(
+                f"{a}->{b} {seconds:.1f}s" for seconds, a, b in biggest_gaps))
     if closest:
         out.append(f"- closest known screen (unknown near-miss): {closest}")
     if last_halt:
@@ -251,9 +280,9 @@ def format_status(status: dict) -> str:
                      f"target_found: {g('target_found')}   last_opponent: {g('last_opponent')}")
     b = g("budget") or {}
     if b:
-        lines.append(f"- actions: {b.get('actions_run')}/{b.get('actions_run_cap')}   "
-                     f"concedes: {b.get('concedes_run')}/{b.get('concedes_cap')}   "
-                     f"games: {b.get('games_session')}/{b.get('games_cap')}   "
+        lines.append(f"- actions: {b.get('actions_run')}   "
+                     f"concedes: {b.get('concedes_run')}   "
+                     f"games: {b.get('games_session')}   "
                      f"session_min: {b.get('session_minutes')}")
     hs = g("human_state") or {}
     if hs:

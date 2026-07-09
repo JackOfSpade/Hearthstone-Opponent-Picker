@@ -188,7 +188,6 @@ class DashboardServer:
             "target_classes": [DISPLAY_NAMES[c] for c in crit.target_classes],
             "require_second": crit.require_second,
             "mode": crit.mode,
-            "risk_profile": self.cfg.risk_profile,
             "pass_rate": round(pass_rate, 3),
             "concede_rate": round(concede_rate, 3),
             "barcode_risk": risk,
@@ -222,8 +221,6 @@ _INDEX_HTML = """<!doctype html>
   label.chk{display:inline-flex;align-items:center;gap:5px;font-size:13px;background:#22262f;padding:5px 9px;border-radius:8px;cursor:pointer}
   .stat{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;border-bottom:1px solid #23272f}
   .stat b{font-weight:600}
-  .bar{height:8px;background:#23272f;border-radius:5px;overflow:hidden;margin-top:4px}
-  .bar>i{display:block;height:100%;background:var(--acc)}
   .risk-high{color:var(--bad)} .risk-elevated{color:var(--warn)} .risk-moderate{color:var(--ok)}
   img#screen{width:100%;border-radius:8px;background:#000;min-height:120px;object-fit:contain}
   .mut{color:var(--mut);font-size:12px}
@@ -274,7 +271,6 @@ _INDEX_HTML = """<!doctype html>
       <div class="stat"><span>Coin split (1st / 2nd)</span><b id="coin">0 / 0</b></div>
       <div class="stat"><span>Committing ratio</span><b id="ratio">0</b></div>
       <div class="stat"><span>Actions this run</span><b id="actions">0</b></div>
-      <div class="bar"><i id="actbar" style="width:0%"></i></div>
       <div class="stat"><span>Session minutes</span><b id="mins">0</b></div>
       <div class="stat"><span>Last opponent</span><b id="lastopp">–</b></div>
       <div class="stat"><span>Stop reason</span><b id="stopreason">–</b></div>
@@ -292,7 +288,7 @@ _INDEX_HTML = """<!doctype html>
 let CRIT=null;
 async function loadCriteria(){
   CRIT=await (await fetch('/criteria')).json();
-  document.getElementById('prof').textContent=CRIT.risk_profile+' · '+CRIT.mode;
+  document.getElementById('prof').textContent=CRIT.mode;
   const box=document.getElementById('classes'); box.innerHTML='';
   CRIT.all_classes.forEach(c=>{
     const on=CRIT.target_classes.includes(c);
@@ -370,10 +366,8 @@ async function poll(){
       drawDistribution(s.class_distribution||{});
       if(s.budget){
         document.getElementById('ratio').textContent=s.budget.committing_ratio;
-        document.getElementById('actions').textContent=s.budget.actions_run+' / '+s.budget.actions_run_cap;
+        document.getElementById('actions').textContent=s.budget.actions_run;
         document.getElementById('mins').textContent=s.budget.session_minutes;
-        const pct=Math.min(100,100*s.budget.actions_run/Math.max(1,s.budget.actions_run_cap));
-        document.getElementById('actbar').style.width=pct+'%';
       }
       if(s.human_state){
         document.getElementById('attention').textContent=s.human_state.attention;

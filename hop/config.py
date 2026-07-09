@@ -167,14 +167,10 @@ class SensorConfig:
 
 @dataclass(frozen=True)
 class CapsConfig:
-    max_actions_per_run: int
-    max_actions_per_day: int
-    committing_action_cap: int
-    max_games_per_session: int
-    max_session_minutes: int
-    mandatory_break_every_games: int
-    break_min_minutes: int
-    break_max_minutes: int
+    """Config for the non-repetition gate. The volume/session/time caps and
+    mandatory breaks that used to live here were removed: a hunt now runs until it
+    finds a target, an error halts it, or the user stops it."""
+
     non_repetition_threshold: float
     #: Independent gesture draws before a near-duplicate becomes a Halt. The gate is
     #: pre-action: resample rather than emit-then-notice. See config.default.toml.
@@ -243,18 +239,7 @@ class Config:
     caps: CapsConfig
     vision: VisionConfig
     debug: DebugConfig
-    risk_profile: str
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
-
-
-# ─────────────────────── risk-profile multipliers ───────────────────────
-# Applied on top of [caps] and the concede journey timing. cautious = full
-# anti-barcode strength; aggressive = old-AHK-style fast concedes.
-RISK_PROFILES: dict[str, dict[str, float]] = {
-    "cautious":   {"cap_scale": 1.0, "delay_scale": 1.0, "min_play_turns": 1.0},
-    "balanced":   {"cap_scale": 1.4, "delay_scale": 0.65, "min_play_turns": 0.5},
-    "aggressive": {"cap_scale": 2.5, "delay_scale": 0.3, "min_play_turns": 0.0},
-}
 
 
 def _classes(values: list[str]) -> tuple[HeroClass, ...]:
@@ -283,10 +268,6 @@ def load_config(path: str | Path | None = None) -> Config:
     cp = merged["caps"]
     v = merged["vision"]
     dbg = merged["debug"]
-
-    profile = merged["risk"]["profile"]
-    if profile not in RISK_PROFILES:
-        raise ValueError(f"Unknown risk profile {profile!r}; choose one of {list(RISK_PROFILES)}")
 
     return Config(
         criteria=Criteria(
@@ -329,7 +310,6 @@ def load_config(path: str | Path | None = None) -> Config:
         caps=CapsConfig(**{k: cp[k] for k in CapsConfig.__annotations__}),
         vision=VisionConfig(**{k: v[k] for k in VisionConfig.__annotations__}),
         debug=DebugConfig(**{k: dbg[k] for k in DebugConfig.__annotations__}),
-        risk_profile=profile,
         raw=merged,
     )
 
@@ -338,16 +318,11 @@ def _default_user_path() -> Path:
     return Path.home() / ".config" / "hop" / "config.toml"
 
 
-def profile_multipliers(cfg: Config) -> dict[str, float]:
-    return RISK_PROFILES[cfg.risk_profile]
-
-
 def save_criteria(
     *,
     target_classes: tuple[HeroClass, ...] | list[HeroClass],
     require_second: bool,
     mode: str | None = None,
-    risk_profile: str | None = None,
     path: str | Path | None = None,
 ) -> Path:
     """Persist the user-facing criteria to the user config, in place.
@@ -370,10 +345,6 @@ def save_criteria(
                               "true" if require_second else "false")
     if mode is not None:
         text = upsert_toml_scalar(text, "criteria", "mode", f'"{mode}"')
-    if risk_profile is not None:
-        if risk_profile not in RISK_PROFILES:
-            raise ValueError(f"unknown risk profile: {risk_profile!r}")
-        text = upsert_toml_scalar(text, "risk", "profile", f'"{risk_profile}"')
 
     user_path.write_text(text)
     return user_path

@@ -34,13 +34,13 @@ import time
 from dataclasses import dataclass, field
 from random import Random
 
-from .config import Config, profile_multipliers
+from .config import Config
 from .geometry import PanelGeometry
 from .hearthstone import GameLayout, MulliganRead, Point, read_mulligan
 from .hero_classes import DISPLAY_NAMES
 from .humanize import journey, motor, timing
 from .humanize.contact import ContactModel
-from .humanize.limiter import CapReached, Limiter
+from .humanize.limiter import Limiter
 from .humanize.sensorimotor import Posture, SensorimotorModel
 from .humanize.state import HumanState
 from .perception.capture import CaptureError, Capturer, FrameDeduper
@@ -154,10 +154,7 @@ class Engine:
         # read_mulligan is bound here so tests can substitute a scripted reader
         self._read_mulligan = read_mulligan
 
-        mult = profile_multipliers(cfg)
-        self.limiter = limiter or Limiter(cfg.caps, scale=mult["cap_scale"])
-        self.delay_scale = mult["delay_scale"]
-        self.min_play_turns = mult["min_play_turns"]
+        self.limiter = limiter or Limiter(cfg.caps)
 
         self.stats = RunStats()
         self._stop = False
@@ -201,6 +198,18 @@ class Engine:
         if self._stop:
             raise StopRequested()
 
+    def _sleep_for(self, seconds: float, reason: str, **detail) -> None:
+        """Record an intentional wait, then sleep.
+
+        The raw journal already timestamps taps and verification, but a delay report
+        should not require subtracting timestamps and guessing whether the gap was a
+        deliberate humanization pause, a screen poll, or slow capture I/O.
+        """
+        seconds = float(seconds)
+        if self.debug:
+            self.debug.record("sleep", reason=reason, seconds=round(seconds, 3), **detail)
+        self.sleep(seconds)
+
     # ── the tap primitive (L3 -> L1 -> L6) ────────────────────────────────────
 
     def _capture(self) -> Frame:
@@ -220,7 +229,7 @@ class Engine:
         verify_region: Region | None = None,
         what: str = "",
     ) -> None:
-        """One humanized, verified tap. Raises Halt/CapReached/CleanStop upward.
+        """One humanized, verified tap. Raises Halt/CleanStop upward.
 
         ``verify_region`` scopes the "did the screen change?" check to a sub-region.
         Some taps are *supposed* to change only a small part of the screen - marking
@@ -229,15 +238,13 @@ class Engine:
         thing I touched change?" is both the honest question and a stricter one: a
         tap that misses the card leaves the card unchanged, and still fails.
         """
-        # L4 think time (stateful), scaled by the risk profile's delay_scale
+        # L4 think time (stateful)
         think = timing.think_time(
             self.rng, decision_type, self.cfg.timing, self.state,
             visual_complexity=visual_complexity, novelty=novelty,
-        ) * self.delay_scale
-        self.sleep(think)
-
-        # L5 cap gate BEFORE the action (never substitute; raise to stop)
-        self.limiter.check_before_action(committing)
+        )
+        self._sleep_for(think, "tap_think", what=what or "?",
+                        decision_type=decision_type, committing=committing)
 
         tx, ty, radius = point.to_px(self.panel)
         before = self._capture()
@@ -256,8 +263,11 @@ class Engine:
         # settle, then verify. (Session time is wall clock, accrued by `run()`; adding
         # think+settle here as well would double-count it.)
         settle = timing.human_delay(self.rng, 0.6, self.cfg.timing)
+        if self.debug:
+            self.debug.record("tap_timing", what=what or "?",
+                              think_s=round(think, 3), settle_s=round(settle, 3))
         self.state.tick(self.rng, dt=think + settle, action=("commit" if committing else decision_type))
-        self.sleep(settle)
+        self._sleep_for(settle, "tap_settle", what=what or "?")
         after = self._capture()
         if verify_region is None:
             after = self._await_screen_motion(before, after)
@@ -284,17 +294,18 @@ class Engine:
             self.state.note_failed_target((tx, ty))
             if self.debug:
                 self.debug.record("single_correction", point=(round(tx), round(ty)))
-            self.sleep(timing.human_delay(self.rng, 0.5, self.cfg.timing))
-            # the correction is a real action: it must clear the cap gate, be counted,
-            # and be remembered - the old code registered it but never gated or
-            # remembered it, so a committing correction could step past the cap.
-            self.limiter.check_before_action(committing)
+            self._sleep_for(timing.human_delay(self.rng, 0.5, self.cfg.timing),
+                            "correction_before_retry", what=what or "?")
+            # the correction is a real action: count it and remember its trajectory,
+            # so it feeds the concede ratio and can't replay an earlier gesture (the
+            # old code registered it but never remembered it).
             before2 = self._capture()
             g2 = self._synth_non_repeating_tap(tx, ty, radius)
             self.backend.emit(g2)
             self.limiter.register_action(committing)
             self.limiter.remember_trajectory(g2)
-            self.sleep(timing.human_delay(self.rng, 0.6, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 0.6, self.cfg.timing),
+                            "correction_settle", what=what or "?")
             after2 = self._capture()
             b2, a2 = self._verify_frames(before2, after2, verify_region)
             self.verifier.verify(b2, a2, expected_change=expected_change,
@@ -327,8 +338,10 @@ class Engine:
         if self.deduper.advanced(after):
             return after                       # already moved; nothing to wait for
         for _ in range(max(0, self.cfg.vision.motion_wait_attempts)):
-            self.sleep(timing.human_delay(self.rng, self.cfg.vision.screen_wait_poll_s,
-                                          self.cfg.timing))
+            self._sleep_for(
+                timing.human_delay(self.rng, self.cfg.vision.screen_wait_poll_s,
+                                   self.cfg.timing),
+                "await_screen_motion")
             frame = self._capture()
             if self.deduper.advanced(frame):
                 if self.debug:
@@ -395,7 +408,8 @@ class Engine:
         for _ in range(attempts - 1):
             if cls.state != ScreenState.UNKNOWN:
                 break
-            self.sleep(timing.human_delay(self.rng, 0.8, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
+                            "unknown_settle")
             cls, frame = self._classify()
         return cls, frame
 
@@ -453,7 +467,8 @@ class Engine:
                 return True, cls, frame
             if self.clock() >= deadline:
                 break
-            self.sleep(timing.human_delay(self.rng, poll_s, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, poll_s, self.cfg.timing),
+                            "wait_until_poll", what=what, state=cls.state.value)
             cls, frame = self._classify()
         satisfied = predicate(cls, frame)
         if not satisfied and self.debug:
@@ -482,16 +497,13 @@ class Engine:
         raise Halt(stuck)
 
     def run(self, max_iterations: int | None = None) -> RunStats:
-        """Main hunt loop. Returns when a target is found, a cap is hit, the app
-        closes, an unexpected halt occurs, or stop is requested.
+        """Main hunt loop. Returns when a target is found, the app closes, an
+        unexpected halt occurs, or the user stops it - there are deliberately no
+        volume or time caps.
 
-        Session time is **wall clock**, accrued here. It used to be accrued only inside
-        `_tap` (``think + settle``), so ``max_session_minutes`` gated tap-adjacent time
-        while the 12 s requeue delays, `between_actions`, `read_consider` and every
-        settle poll ran for free - and a loop that never tapped, like a soft-locked
-        queue, accrued nothing at all and could never trip a cap.
-
-        ``self.clock`` was taken and stored by ``__init__`` and never read. Read it.
+        Session time is **wall clock**, accrued here once per iteration for the
+        status display's session minutes; it gates nothing. ``self.clock`` was taken
+        and stored by ``__init__`` and never read. Read it.
         """
         iters = 0
         last = self.clock()
@@ -514,22 +526,19 @@ class Engine:
                 now = self.clock()
                 self.limiter.register_time(now - last)
                 last = now
-                # the caps that time alone can breach, checked whether or not we tap
-                self.limiter.check_elapsed_caps()
                 cls, frame = self._classify_settled()
                 self.phase = _phase_label(cls.state)
                 self._dispatch(cls, frame)
                 # inter-action spacing (never burst)
-                self.sleep(timing.between_actions(self.rng, self.cfg.timing, self.state) * self.delay_scale)
+                self._sleep_for(
+                    timing.between_actions(self.rng, self.cfg.timing, self.state),
+                    "loop_between_actions", state=cls.state.value)
                 if self.stats.target_found:
                     break
             if self._stop and not self.stats.stop_reason:
                 self.stats.stop_reason = "user_stop"
         except StopRequested:
             self.stats.stop_reason = "user_stop"
-        except CapReached as e:
-            self.stats.stop_reason = f"cap:{e.which}"
-            self._notify_stop(f"Stopped: {e}")
         except CleanStop as e:
             self.stats.stop_reason = "clean_stop"
             self._notify_stop(f"Clean stop: {e}")
@@ -562,7 +571,8 @@ class Engine:
         elif st == ScreenState.RECONNECTING:
             # Mid-reconnect: the buttons are gone, so any tap hits dead space.
             # Wait it out; _reconnect() owns the bounded polling.
-            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
+                            "reconnecting_wait")
         elif st == ScreenState.DECK_SELECT:
             # Dropped back to the deck list (e.g. after an error). hop does NOT reopen a
             # deck: it cannot reliably tell which deck was in play (the grid names render
@@ -593,7 +603,8 @@ class Engine:
             if self._queue_polls > max(1, self.cfg.vision.queue_wait_attempts):
                 raise Halt(f"still queueing after {self._queue_polls} polls; "
                            "matchmaking never matched")
-            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
+                            "queue_wait")
         elif st == ScreenState.COLLECTION:
             # hop is never meant to be here; a stray navigation got us in. Back out to
             # the deck list (a home screen) rather than halt. See ScreenState.COLLECTION.
@@ -605,7 +616,8 @@ class Engine:
             raise Halt("at the Hearthstone main menu; open Play and select a deck first "
                        "(the hunt loop queues from that deck's Play screen)")
         elif st == ScreenState.VS_SPLASH:
-            self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 1.2, self.cfg.timing),
+                            "vs_splash_wait")
         elif st == ScreenState.MULLIGAN:
             self._handle_mulligan(frame)
         elif st in (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
@@ -642,7 +654,8 @@ class Engine:
         """
         self._in_game_polls += 1
         if self._in_game_polls <= max(1, self.cfg.vision.in_game_wait_attempts):
-            self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
+            self._sleep_for(timing.read_consider(self.rng, self.cfg.timing, self.state),
+                            "in_game_read", poll=self._in_game_polls)
             return
         if not self._own_game:
             raise Halt("a game is in progress that this hunt did not start; refusing to "
@@ -651,8 +664,10 @@ class Engine:
         if self.debug:
             self.debug.record("abandoning_unread_game", polls=self._in_game_polls)
         # we never got to read this mulligan, so we never got to hesitate over it
-        self.sleep(timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
-                                     visual_complexity=0.6) * self.delay_scale)
+        self._sleep_for(
+            timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
+                              visual_complexity=0.6),
+            "unread_game_concede_think")
         conceded = self._concede()
         self._clear_end_screens()
         self._book_game(conceded)
@@ -671,23 +686,18 @@ class Engine:
             stuck="the 'Complete deck automatically?' dialog did not close after No")
 
     def _book_game(self, conceded: bool) -> None:
-        """Count a finished game, take any mandatory break, then pace the requeue."""
+        """Count a finished game, then pace the requeue."""
         self.limiter.register_game()
         self.stats.games += 1
         # A game that ended on its own was not conceded. `concedes` is the numerator of
-        # the concede/commit ratio the caps exist to keep human - do not inflate it.
+        # the concede/commit ratio surfaced in status - do not inflate it.
         self.stats.concedes += int(conceded)
         self._own_game = False
         self._in_game_polls = 0
 
-        brk = self.limiter.needs_break(self.rng)
-        if brk is not None:
-            if self.debug:
-                self.debug.record("break", seconds=round(brk))
-            self.sleep(brk)   # wall clock; `run()` accrues it on the next iteration
-
         # randomized requeue delay (humans don't requeue instantly)
-        self.sleep(timing.human_delay(self.rng, 12.0, self.cfg.timing) * self.delay_scale)
+        self._sleep_for(timing.human_delay(self.rng, 12.0, self.cfg.timing),
+                        "requeue_delay")
 
     def _reconnect(self) -> None:
         """Tap Reconnect once, then wait out the asynchronous reconnect.
@@ -725,7 +735,8 @@ class Engine:
                 # Mid-reconnect the client redraws; an unreadable frame is not
                 # evidence the reconnect resolved. Keep waiting (never tapping)
                 # rather than book a success we did not observe.
-                self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+                self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
+                                "reconnect_unknown_wait")
                 continue
             if cls.state not in (ScreenState.RECONNECTING, ScreenState.RECONNECT_DIALOG):
                 # This disconnect episode is over. The cap bounds *consecutive* failed
@@ -742,7 +753,8 @@ class Engine:
                 # The attempt finished and failed: the buttons are back. Let the
                 # outer loop re-enter _reconnect(), which re-checks the cap.
                 return
-            self.sleep(timing.human_delay(self.rng, 1.5, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
+                            "reconnect_poll")
         raise Halt("stuck on 'Reconnecting...'; Hearthstone never came back online")
 
     def _handle_mulligan(self, frame: Frame) -> None:
@@ -757,7 +769,8 @@ class Engine:
         decision = evaluate_matchup(read, self.cfg)
         if decision == "unusable":
             # a single re-read before halting (perception fallibility, one correction)
-            self.sleep(timing.human_delay(self.rng, 0.8, self.cfg.timing))
+            self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
+                            "mulligan_reread")
             frame2 = self._capture()
             read = self._read_mulligan(frame2, self.layout, self.reader, self.cfg.vision)
             decision = evaluate_matchup(read, self.cfg)
@@ -785,7 +798,12 @@ class Engine:
     # ── the plausible-exit journey (anti-barcode core) ───────────────────────
 
     def _execute_reject(self, read: MulliganRead) -> None:
-        plan = journey.plan_reject(self.rng, read.num_cards, self.min_play_turns)
+        plan = journey.plan_reject(self.rng, read.num_cards)
+        if self.debug:
+            self.debug.record("reject_plan", concede_point=plan.concede_point,
+                              hesitate=plan.hesitate_before_concede,
+                              extra_reads=plan.extra_reads,
+                              replace_slots=[d.slot for d in plan.mulligan if d.replace])
         # perform a plausible mulligan: replace the chosen cards, deliberating each
         for d in plan.mulligan:
             if d.replace and d.slot < len(read.card_centers_f):
@@ -797,8 +815,10 @@ class Engine:
             self._play_beats(plan)
 
         if plan.hesitate_before_concede:
-            self.sleep(timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
-                                         visual_complexity=0.6) * self.delay_scale)
+            self._sleep_for(
+                timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
+                                  visual_complexity=0.6),
+                "hesitate_before_concede")
 
         conceded = self._concede()
         self._clear_end_screens()
@@ -874,7 +894,8 @@ class Engine:
                 if self.debug:
                     self.debug.record("mulligan_card_tap_ignored",
                                       slot=slot, attempt=attempt + 1, of=attempts)
-                self.sleep(timing.human_delay(self.rng, 0.7, self.cfg.timing))
+                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                                "mulligan_card_retry", slot=slot, attempt=attempt + 1)
         self.stats.ignored_card_taps += 1
         return False
 
@@ -886,8 +907,10 @@ class Engine:
         end-turn tap is a sufficiently human exit. Bounded so it can't spin.
         """
         beats = 1 if plan.concede_point == "turn1" else 2
-        for _ in range(beats + plan.extra_reads):
-            self.sleep(timing.read_consider(self.rng, self.cfg.timing, self.state))
+        for i in range(beats + plan.extra_reads):
+            self._sleep_for(timing.read_consider(self.rng, self.cfg.timing, self.state),
+                            "play_beat_read", beat=i + 1,
+                            total=beats + plan.extra_reads)
             if self.rng.random() < 0.5:
                 try:
                     self._tap(self.layout.pass_turn_button, committing=False, decision_type="commit",
@@ -1016,7 +1039,8 @@ class Engine:
                 if waits >= max_waits:
                     raise Halt("board never finished dissolving after the concede")
                 waits += 1
-                self.sleep(timing.human_delay(self.rng, 1.2, self.cfg.timing))
+                self._sleep_for(timing.human_delay(self.rng, 1.2, self.cfg.timing),
+                                "clear_end_wait", wait=waits)
                 continue
             if cls.state not in self.END_SCREENS:
                 raise Halt(f"unexpected screen {cls.state.value!r} while clearing end "

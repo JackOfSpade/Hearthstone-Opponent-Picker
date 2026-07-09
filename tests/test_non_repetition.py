@@ -21,7 +21,6 @@ from hop.geometry import PanelGeometry
 from hop.hearthstone import GameLayout
 from hop.humanize.contact import ContactModel
 from hop.humanize.limiter import (
-    Limiter,
     TrajectoryMemory,
     trajectory_fingerprint,
 )
@@ -71,7 +70,7 @@ def test_the_gate_really_does_saturate_without_resampling(cfg):
         mem = TrajectoryMemory()
         contact = ContactModel(cfg.contact)
         state = HumanState()
-        for i in range(cfg.caps.max_actions_per_run):
+        for i in range(30):        # a representative run's worth of taps
             x, y, r = seq[i % len(seq)].to_px(PANEL)
             g = synth_tap(rng, (x, y), r, PANEL, cfg.motor, contact, state)
             fp = trajectory_fingerprint(g)
@@ -148,10 +147,10 @@ def test_a_full_game_of_taps_never_halts_on_non_repetition(cfg):
     seq = _game_sequence(layout)
     eng, backend = _engine(cfg, [ScreenState.PLAY_SCREEN])
     eng.panel = PANEL
-    for i in range(cfg.caps.max_actions_per_run):
+    for i in range(30):        # a full run's worth of taps
         eng._tap(seq[i % len(seq)], committing=False, decision_type="commit",
                  expected_change="full_transition", allow_correction=False, what="x")
-    assert len(backend.gestures) == cfg.caps.max_actions_per_run
+    assert len(backend.gestures) == 30
 
 
 # ── the correction is not a blind retry ──────────────────────────────────────
@@ -260,17 +259,3 @@ def test_scoped_card_taps_do_not_pay_for_the_motion_wait(cfg):
     eng._replace_card(slot=0, center_xf=0.25, decision_type="reject")
     assert looks["n"] == 0
     assert real is not None
-
-
-def test_the_correction_rechecks_the_cap_before_retapping(cfg):
-    """A committing correction used to step past the cap: registered, never gated."""
-    from hop.humanize.limiter import CapReached
-
-    limiter = Limiter(cfg.caps)
-    limiter.commits_this_run = cfg.caps.committing_action_cap - 1
-    eng, backend = _engine(cfg, [ScreenState.IN_GAME], limiter=limiter,
-                           capturer=_NeverChangesCapturer())
-    with pytest.raises(CapReached):
-        eng._tap(eng.layout.concede_button, committing=True, decision_type="reject",
-                 expected_change="full_transition", what="concede")
-    assert len(backend.gestures) == 1       # the correction never fired

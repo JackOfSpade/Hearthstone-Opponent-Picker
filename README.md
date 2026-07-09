@@ -44,7 +44,7 @@ projection of a latent *HumanState* rather than independent randomness:
 - **Orientation:** Hearthstone runs **landscape** while the phone's panel is native **portrait**, so perception and the engine work in *display* space while the digitizer reports *native panel* pixels. `hop.orientation` maps between them from the live rotation, handling **both** landscape orientations (a phone can sit either way up).
 - **Timing (L4):** stateful, per-decision think time (a committing action reacts faster than a rejecting one), modulated by fatigue/familiarity/urgency/confidence. No bare `sleep(constant)` on any game-facing action.
 - **Sensorimotor (L4):** predicts the coherent inertial side effect of each touch; a **desk-mounted** run declares its posture and does not claim handheld IMU realism (the honest option for a bench phone driven over ADB, per the standard).
-- **Behavioral caps (L5):** per-run/-session/-day volume caps, a dedicated cap on the **committing action** (the concede — the barcode signal), mandatory jittered breaks, and a non-repetition check so trajectories never replay.
+- **Non-repetition (L5):** every gesture is fingerprinted and a near-duplicate of a prior trajectory is resampled *before* it is emitted, so replays and repeated runs never reuse an identical path. (The per-run/-session/-day volume caps and mandatory breaks that used to live here were removed by request — a hunt runs until it finds a target, an error halts it, or you stop it; pacing and volume are yours to manage.)
 - **Verify + fail-closed (L6):** after every tap the screen must change *and* cohere; otherwise one evidence-based correction, then a clean halt with a debug snapshot. Verification is **scoped to what the tap aimed at** where that's the honest question — marking one mulligan card moves the whole frame by 4.8 (under the 9.0 threshold) and the card's own rectangle by 24.2. And fail-closed means *unknown state*: a card the game declines to toggle leaves us squarely on the mulligan, so the loop retries a bounded number of times and keeps the card rather than halting.
 
 ## Anti-barcode design
@@ -55,17 +55,18 @@ Blizzard demonstrably tracks rapid-concede patterns server-side (the Arena
 1. **Never insta-concede.** A rejected game performs the mulligan, enters the
    game, plays a beat or two, and concedes at a *randomly chosen* point. Detect
    time is decoupled from concede time.
-2. **Session shaping.** Concede caps, mandatory breaks, session ceilings, no
-   24/7 running.
+2. **You own pacing.** There are deliberately no volume, session, or time caps
+   and no forced breaks — a hunt runs until a target, an error, or you stop it.
 3. **Randomized requeue.** Humans don't hit Play 400 ms after the defeat banner.
 4. **A risk meter** in the dashboard: it estimates your concede rate from your
    criteria and flags barcode-shaped setups (one class + require-second ≈ 95%
    concedes). Widening criteria is both safer *and* faster to hit a target.
 
-The `cautious | balanced | aggressive` risk profile scales all of the above.
+All of the above is tuned for a single "normal user" — one persistent, unhurried
+identity, not a set of selectable aggression levels.
 **Honest limit:** this shapes your pattern toward "impatient human"; it cannot
-make a high concede rate statistically invisible. Volume discipline is the real
-protection.
+make a high concede rate statistically invisible. With the caps removed, volume
+discipline is the real protection — and it is now yours to keep.
 
 ---
 
@@ -165,9 +166,6 @@ mode = "casual"                       # avoid cratering ranked MMR while hunting
 adb_address = "192.168.1.50:5555"
 touch_backend = "auto"                # auto | uhid | adb
 posture = "desk_mounted"              # handheld | desk_mounted
-
-[risk]
-profile = "cautious"                  # cautious | balanced | aggressive
 
 [alerts]
 mac_sound = true

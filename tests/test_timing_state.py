@@ -14,6 +14,14 @@ def test_commit_faster_than_reject(cfg):
     assert reject > commit
 
 
+def test_default_think_times_are_human_responsive(cfg):
+    """Simple UI choices should not wait like a distracted rope timer."""
+    commit = _mean(lambda r: timing.think_time(r, "commit", cfg.timing, HumanState()))
+    reject = _mean(lambda r: timing.think_time(r, "reject", cfg.timing, HumanState()))
+    assert 1.0 <= commit <= 2.5
+    assert 2.0 <= reject <= 4.0
+
+
 def test_think_time_never_negative(cfg):
     for s in range(500):
         assert timing.think_time(Random(s), "reject", cfg.timing, HumanState()) >= 0

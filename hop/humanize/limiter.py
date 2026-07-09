@@ -1,146 +1,58 @@
-"""Layer 5 - volume/session caps and the non-repetition safeguard.
+"""Layer 5 - the non-repetition safeguard, plus informational activity counters.
 
-Standard: *"Per-session and per-day volume caps ... When a cap is hit, stop the
-run - don't substitute a different action to keep going; that both looks robotic
-and corrupts any labels/data. Checks run before each autonomous action."* Plus
-the Rev-2 non-repetition obligation: *"Replay ... or repeated auto runs, must
-not reuse identical trajectories, inter-event timings, or navigation rhythms."*
+Rev-2 non-repetition obligation: *"Replay ... or repeated auto runs, must not
+reuse identical trajectories, inter-event timings, or navigation rhythms."* Every
+emitted gesture is fingerprinted; a near-duplicate of a prior one is rejected
+*before* emission (the engine resamples, and only a genuinely degenerate generator
+halts - fail closed).
 
-For Hearthstone the *committing action* - the tap a bot over-produces and the
-one an anomalous ratio is computed on - is the **concede**. Rapid, repeated
-concedes are exactly the "barcode account" pattern Blizzard segregates, so the
-concede is capped below total actions and paced with mandatory breaks.
-
-The counting logic is pure and in-memory; :meth:`Limiter.to_dict` /
-:func:`Limiter.from_dict` persist day-level counters across runs (the engine
-saves them to a small JSON state file - longitudinal ceilings need persistence).
+A hunt runs until it finds a target, an error halts it, or the user stops it:
+there are deliberately **no** volume, per-session, or time ceilings, and no
+mandatory breaks. (Those caps used to live here; they were removed by request -
+the operator owns pacing and volume.) The run counters kept here are
+informational only - the status display and the concede ratio - never gates.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from random import Random
 
 from ..config import CapsConfig
 from ..touchstream import Gesture
 
 
-class CapReached(Exception):
-    """Raised when a cap forbids the next autonomous action. The engine treats
-    this as a clean stop, never as a signal to substitute another action."""
-
-    def __init__(self, which: str, message: str):
-        super().__init__(message)
-        self.which = which
-
-
 @dataclass
 class Limiter:
-    """Tracks and enforces the behavioral caps for one persistent identity.
-
-    ``scale`` comes from the risk profile (``cap_scale``): cautious=1.0 keeps
-    the conservative starting caps; aggressive loosens them. Session and run
-    counters reset per process; day counters persist.
-    """
+    """The non-repetition memory for one persistent identity, plus informational
+    activity counters. All counters reset per process; none of them gate a run."""
 
     caps: CapsConfig
-    scale: float = 1.0
 
-    # run/session counters
+    # informational counters (status display + concede ratio; never gates)
     actions_this_run: int = 0
     commits_this_run: int = 0
     games_this_session: int = 0
     session_seconds: float = 0.0
-    games_since_break: int = 0
-
-    # persisted day counters
-    actions_today: int = 0
-    commits_today: int = 0
 
     _traj: "TrajectoryMemory" = field(default_factory=lambda: TrajectoryMemory())
 
-    # scaled cap accessors ----------------------------------------------------
-
-    def _cap(self, base: int) -> int:
-        return int(round(base * self.scale))
-
-    @property
-    def max_actions_per_run(self) -> int:
-        return self._cap(self.caps.max_actions_per_run)
-
-    @property
-    def max_actions_per_day(self) -> int:
-        return self._cap(self.caps.max_actions_per_day)
-
-    @property
-    def committing_action_cap(self) -> int:
-        return self._cap(self.caps.committing_action_cap)
-
-    @property
-    def max_games_per_session(self) -> int:
-        return self._cap(self.caps.max_games_per_session)
-
-    # checks ------------------------------------------------------------------
-
-    def check_elapsed_caps(self) -> None:
-        """Raise :class:`CapReached` on the caps that time alone can breach.
-
-        Separate from :meth:`check_before_action` because *every* cap used to be
-        checked only there - i.e. only inside a tap. A loop that never taps could
-        therefore never trip a cap, however long it ran, which is exactly what a
-        soft-locked matchmaking queue produces. The hunt loop calls this once per
-        iteration, tap or no tap.
-        """
-        if self.session_seconds >= self.caps.max_session_minutes * 60 * self.scale:
-            raise CapReached("session_minutes", "Session time limit reached; stopping.")
-        if self.games_this_session >= self.max_games_per_session:
-            raise CapReached("games_session", "Per-session game cap reached; stopping.")
-
-    def check_before_action(self, committing: bool) -> None:
-        """Raise :class:`CapReached` if the next action would breach a cap.
-
-        Called before every autonomous tap. ``committing`` marks a concede (or
-        other conversion-like action) so its dedicated, tighter cap applies.
-        """
-        self.check_elapsed_caps()
-        if self.actions_this_run >= self.max_actions_per_run:
-            raise CapReached("actions_run", "Per-run action cap reached; stopping.")
-        if self.actions_today >= self.max_actions_per_day:
-            raise CapReached("actions_day", "Per-day action cap reached; stopping.")
-        if committing and self.commits_this_run >= self.committing_action_cap:
-            raise CapReached("committing", "Committing-action (concede) cap reached; stopping.")
+    # counters (informational only; never gate a run) -------------------------
 
     def register_action(self, committing: bool) -> None:
         self.actions_this_run += 1
-        self.actions_today += 1
         if committing:
             self.commits_this_run += 1
-            self.commits_today += 1
 
     def register_game(self) -> None:
         self.games_this_session += 1
-        self.games_since_break += 1
 
     def register_time(self, dt: float) -> None:
         self.session_seconds += max(0.0, dt)
 
-    def needs_break(self, rng: Random) -> float | None:
-        """If a mandatory break is due, return its length in seconds, else None.
-
-        Humans queue in bursts and stop; a break every N games (jittered length)
-        breaks up an otherwise metronomic session. Resets the counter.
-        """
-        every = max(1, int(round(self.caps.mandatory_break_every_games * self.scale)))
-        if self.games_since_break >= every:
-            self.games_since_break = 0
-            lo = self.caps.break_min_minutes * 60
-            hi = self.caps.break_max_minutes * 60
-            return lo + rng.random() * (hi - lo)
-        return None
-
     def committing_ratio(self) -> float:
-        """Concedes / total actions this run - the key aggregate to keep human."""
+        """Concedes / total actions this run - surfaced in status so a high concede
+        rate (the barcode-shaped pattern) stays visible to the operator."""
         return self.commits_this_run / self.actions_this_run if self.actions_this_run else 0.0
 
     # non-repetition ----------------------------------------------------------
@@ -152,23 +64,6 @@ class Limiter:
 
     def remember_trajectory(self, gesture: Gesture) -> None:
         self._traj.add(trajectory_fingerprint(gesture))
-
-    # persistence -------------------------------------------------------------
-
-    def to_dict(self) -> dict:
-        return {
-            "actions_today": self.actions_today,
-            "commits_today": self.commits_today,
-            "trajectories": self._traj.fingerprints,
-        }
-
-    @classmethod
-    def from_dict(cls, caps: CapsConfig, scale: float, data: dict) -> "Limiter":
-        lim = cls(caps=caps, scale=scale)
-        lim.actions_today = int(data.get("actions_today", 0))
-        lim.commits_today = int(data.get("commits_today", 0))
-        lim._traj = TrajectoryMemory(list(data.get("trajectories", [])))
-        return lim
 
 
 def trajectory_fingerprint(g: Gesture) -> list[float]:

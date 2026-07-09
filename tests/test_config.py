@@ -1,12 +1,11 @@
 from dataclasses import replace
 
-from hop.config import load_config, profile_multipliers
+from hop.config import load_config
 from hop.hero_classes import HeroClass
 
 
 def test_defaults_load():
     cfg = load_config()
-    assert cfg.risk_profile == "cautious"
     assert cfg.device.opponent_corner == "bottom_left"
     assert cfg.motor.tap_dwell_min_s < cfg.motor.tap_dwell_max_s
 
@@ -40,8 +39,3 @@ def test_pass_rate_estimate():
     assert 0.0 < one_class.pass_rate_estimate() < 0.2
     one_class_second = replace(one_class, require_second=True)
     assert one_class_second.pass_rate_estimate() < one_class.pass_rate_estimate()
-
-
-def test_profile_multipliers():
-    cfg = load_config()
-    assert profile_multipliers(cfg)["delay_scale"] == 1.0  # cautious full strength

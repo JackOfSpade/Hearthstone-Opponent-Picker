@@ -28,7 +28,7 @@ from random import Random
 from . import __version__
 from .adb import Adb, AdbError
 from .alerts import Alerter
-from .config import Config, load_config, profile_multipliers
+from .config import Config, load_config
 from .debuglog import DebugLog, prune_runs
 from .engine import Engine
 from .geometry import PanelGeometry
@@ -198,8 +198,7 @@ def cmd_doctor(args) -> int:
           "run `hop capture` for each screen (mulligan, victory, defeat, menu, ...)")
 
     print("-" * 40)
-    print(f"posture={cfg.device.posture}  touch_backend={cfg.device.touch_backend}  "
-          f"risk={cfg.risk_profile}")
+    print(f"posture={cfg.device.posture}  touch_backend={cfg.device.touch_backend}")
     print(f"criteria pass-rate estimate: {cfg.criteria.pass_rate_estimate()*100:.0f}%  "
           f"(concede-rate {100-cfg.criteria.pass_rate_estimate()*100:.0f}%)")
     print("READY" if ok else "NOT READY - resolve the !! items above")
@@ -214,8 +213,7 @@ def _device_summary(cfg: Config, pack_dir: Path) -> str:
     """
     out: list[str] = [f"- hop {__version__}",
                       f"- adb_address: `{cfg.device.adb_address or '(unset)'}`",
-                      f"- touch_backend: {cfg.device.touch_backend}  posture: {cfg.device.posture}  "
-                      f"risk: {cfg.risk_profile}",
+                      f"- touch_backend: {cfg.device.touch_backend}  posture: {cfg.device.posture}",
                       f"- OCR (pytesseract): {'available' if tesseract_available() else 'MISSING'}"]
     clf = load_template_pack(pack_dir)
     out.append(f"- anchors: {len(clf.anchors)} in {pack_dir}")
@@ -459,7 +457,7 @@ def cmd_run(args) -> int:
     pack_dir = Path(args.templates or _default_pack_dir())
     debug_dir = _default_run_dir(cfg.debug.keep_runs)
     print(f"run: criteria pass-rate ~{cfg.criteria.pass_rate_estimate()*100:.0f}%, "
-          f"risk={cfg.risk_profile}, logs -> {debug_dir}")
+          f"logs -> {debug_dir}")
     engine = build_engine(cfg, pack_dir=pack_dir, debug_dir=debug_dir, alerter=alerter,
                           seed=args.seed)
     _install_hotkeys(engine)

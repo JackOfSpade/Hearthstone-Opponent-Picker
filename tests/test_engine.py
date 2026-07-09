@@ -5,7 +5,6 @@ import pytest
 from hop.engine import Engine, evaluate_matchup
 from hop.hearthstone import GameLayout, MulliganRead
 from hop.hero_classes import HeroClass
-from hop.humanize.limiter import Limiter
 from hop.perception.screens import ScreenState
 
 from conftest import FakeAdb, FakeBackend, FakeClassifier, ScriptedCapturer, gray_frame
@@ -157,24 +156,6 @@ def test_no_templates_refuses(cfg):
     assert "halt" in stats.stop_reason
 
 
-def test_committing_cap_stops_run(cfg):
-    # Force a tiny committing cap and drive a concede-menu tap repeatedly.
-    lim = Limiter(cfg.caps, scale=1.0)
-    lim.commits_this_run = lim.committing_action_cap  # already at cap
-    adb = FakeAdb()
-    from hop.geometry import PanelGeometry
-    panel = PanelGeometry(800, 400, 400.0)
-    # before/after frames differ (full transition) so verify would pass if reached
-    before = gray_frame(80, 40, 20)
-    after = gray_frame(80, 40, 220)
-    eng = Engine(cfg, adb, FakeBackend(), panel,
-                 FakeClassifier([ScreenState.CONCEDE_MENU]), reader=None,
-                 sleep=lambda s: None, rng=Random(1), limiter=lim,
-                 capturer=ScriptedCapturer([before, after]))
-    stats = eng.run(max_iterations=2)
-    assert stats.stop_reason == "cap:committing"
-
-
 def test_tap_emits_and_registers(cfg):
     # A Play-screen tap: before/after differ as a full transition so verify passes.
     adb = FakeAdb()
@@ -242,17 +223,17 @@ def test_finding_a_match_resets_the_queue_patience(cfg):
     assert eng._queue_polls == 0
 
 
-def test_session_time_is_wall_clock_and_gates_a_tapless_loop(cfg):
-    """`max_session_minutes` used to gate tap-adjacent time only: session_seconds was
-    accrued inside `_tap`, and every cap was checked there too. A loop that never taps
-    -- a stuck queue -- ran forever, however long. `Engine.clock` existed and was
-    never read."""
-    ticks = iter([0.0] + [cfg.caps.max_session_minutes * 60 + 1] * 10)
+def test_session_time_is_accrued_as_wall_clock(cfg):
+    """Session time is wall clock, accrued once per loop iteration (not only inside
+    `_tap`). It is informational now - no cap - so a tapless loop like a stuck queue
+    just keeps polling until the queue-poll cap Halts it, never a session cap."""
     eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    ticks = iter([float(i) for i in range(200)])
     eng.clock = lambda: next(ticks)
     stats = eng.run(max_iterations=5)
-    assert stats.stop_reason == "cap:session_minutes"
-    assert backend.gestures == []
+    assert eng.limiter.session_seconds > 0        # time was accrued
+    assert not (stats.stop_reason or "").startswith("cap")  # never a volume/time cap
+    assert backend.gestures == []                 # a stuck queue still taps nothing
 
 
 def test_error_dialog_is_dismissed_not_halted(cfg):
@@ -561,3 +542,29 @@ def test_every_tap_site_is_named_for_the_journal(cfg):
     for m in re.finditer(r"self\._tap\((.{0,320}?)\)\n", src, re.DOTALL):
         call = m.group(1)
         assert "what=" in call, f"unnamed tap site: {call.splitlines()[0].strip()}"
+
+
+def test_tap_records_timing_evidence_for_delay_reports(cfg):
+    from hop.geometry import PanelGeometry
+
+    class RecordingDebug:
+        def __init__(self):
+            self.events = []
+
+        def record(self, kind, /, **detail):
+            self.events.append((kind, detail))
+
+    dbg = RecordingDebug()
+    before = gray_frame(80, 40, 20)
+    after = gray_frame(80, 40, 220)
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.PLAY_SCREEN]), reader=None,
+                 sleep=lambda s: None, rng=Random(1), debug=dbg,
+                 capturer=ScriptedCapturer([before, after]))
+    eng._tap(GameLayout().play_button, committing=False, decision_type="commit",
+             expected_change="full_transition", what="play")
+
+    kinds = [k for k, _ in dbg.events]
+    assert "tap_timing" in kinds
+    assert any(k == "sleep" and d["reason"] == "tap_think" and d["what"] == "play"
+               for k, d in dbg.events)
