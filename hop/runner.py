@@ -24,6 +24,10 @@ class EngineController:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._last_error: str = ""
+        #: full traceback of the last crash, captured so a pasted bug report pinpoints
+        #: the failing line instead of just its message (a bare "TypeError: ..." once
+        #: cost a grep-hunt to locate). Surfaced in status() -> the report, not the UI.
+        self._last_error_tb: str = ""
         self._started_at: float = 0.0
         #: a stop asked for before the engine exists (during construction) must not be
         #: lost -- see start()/stop(). Building an engine (ADB connect + UHID enumerate)
@@ -49,6 +53,7 @@ class EngineController:
             if self.running:
                 return False
             self._last_error = ""
+            self._last_error_tb = ""
             self._stop_requested = False
             self._phase = "connecting to phone…"
             self._started_at = time.time()
@@ -68,7 +73,9 @@ class EngineController:
                     eng.run()
                     self._phase = "stopped"
                 except Exception as e:  # surface, don't crash the dashboard
+                    import traceback
                     self._last_error = f"{type(e).__name__}: {e}"
+                    self._last_error_tb = traceback.format_exc()
                     self._phase = "error"
 
             self._thread = threading.Thread(target=_run, daemon=True)
@@ -103,6 +110,10 @@ class EngineController:
             "running": self.running,
             "phase": self._current_phase(),
             "last_error": self._last_error,
+            "last_error_traceback": self._last_error_tb,
+            # whether the target alarm is actively sounding, so the dashboard can enable
+            # "Silence alarm" only when there is something to silence.
+            "alarming": bool(getattr(self.alerter, "is_alarming", False)),
             "uptime_s": round(time.time() - self._started_at, 1) if self._started_at else 0,
         }
         if eng is None:

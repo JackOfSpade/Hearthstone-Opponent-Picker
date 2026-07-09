@@ -56,6 +56,15 @@ class Alerter:
 
     # ── looping alarm (until acknowledged) ───────────────────────────────────
 
+    @property
+    def is_alarming(self) -> bool:
+        """True while the looping alert sound is actually playing (until acknowledged).
+
+        The dashboard gates the "Silence alarm" button on this: before a search, or once
+        acknowledged, there is nothing to silence, so the button should be disabled.
+        """
+        return self._alarm_thread is not None and self._alarm_thread.is_alive()
+
     def start_alarm(self) -> None:
         """Loop the alert sound in a background thread until :meth:`stop_alarm`."""
         if self._alarm_thread and self._alarm_thread.is_alive():

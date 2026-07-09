@@ -204,8 +204,8 @@ _INDEX_HTML = """<!doctype html>
       </div>
       <div class="row">
         <button id="startBtn">Start Search</button>
-        <button id="stopBtn" class="sec">Stop</button>
-        <button id="ackBtn" class="warn">Silence alarm</button>
+        <button id="stopBtn" class="sec" disabled>Stop</button>
+        <button id="ackBtn" class="warn" disabled>Silence alarm</button>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -299,7 +299,12 @@ async function poll(){
     if(s.running) connEl.textContent=s.phase||'running';
     else if(s.last_error) connEl.textContent='error';
     else connEl.textContent=(s.phase&&!['running','idle'].includes(s.phase))?s.phase:'idle';
+    // Only enable a button when its action is actually available: Start when idle,
+    // Stop when a hunt is live, Silence alarm only while the alarm is sounding (or a
+    // target is up). This stops "clicking Silence alarm does nothing before a search".
     document.getElementById('startBtn').disabled=s.running;
+    document.getElementById('stopBtn').disabled=!s.running;
+    document.getElementById('ackBtn').disabled=!(s.alarming||s.target_found);
     // Surface a Search that died on arrival (e.g. missing vision deps) rather than let it
     // read as "nothing happened": a failed start leaves last_error set and running=false.
     const b=document.getElementById('banner');
