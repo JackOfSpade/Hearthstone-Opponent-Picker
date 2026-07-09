@@ -182,6 +182,7 @@ _INDEX_HTML = """<!doctype html>
   img#screen{width:100%;border-radius:8px;background:#000;min-height:120px;object-fit:contain}
   .mut{color:var(--mut);font-size:12px}
   #banner{display:none;padding:12px 16px;background:var(--ok);color:#04231a;font-weight:700;border-radius:10px;margin-bottom:12px}
+  #banner.err{background:var(--bad);color:#2a0508}
 </style></head>
 <body>
 <header><h1>hop</h1><span class="pill" id="conn">connecting…</span><span class="pill" id="prof"></span></header>
@@ -196,7 +197,7 @@ _INDEX_HTML = """<!doctype html>
         <label class="chk"><input type="checkbox" id="second"> Only when going 2nd</label>
       </div>
       <div class="row">
-        <button id="startBtn">Start hunt</button>
+        <button id="startBtn">Start Search</button>
         <button id="stopBtn" class="sec">Stop</button>
         <button id="ackBtn" class="warn">Silence alarm</button>
       </div>
@@ -288,6 +289,18 @@ async function poll(){
     const s=await (await fetch('/status')).json();
     document.getElementById('conn').textContent=s.running?'running':'idle';
     document.getElementById('startBtn').disabled=s.running;
+    // Surface a Search that died on arrival (e.g. missing vision deps) rather than let it
+    // read as "nothing happened": a failed start leaves last_error set and running=false.
+    const b=document.getElementById('banner');
+    if(s.target_found){
+      b.className=''; b.style.display='block';
+      b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn! (Silence alarm to dismiss)';
+    }else if(s.last_error && !s.running){
+      b.className='err'; b.style.display='block';
+      b.textContent='⚠ Search stopped — '+s.last_error;
+    }else if(b.className==='err'){
+      b.className=''; b.style.display='none';
+    }
     if(s.games!==undefined){
       document.getElementById('games').textContent=s.games;
       document.getElementById('concedes').textContent=s.concedes;
@@ -308,10 +321,6 @@ async function poll(){
         document.getElementById('confidence').textContent=s.human_state.confidence;
         document.getElementById('fatigue').textContent=s.human_state.fatigue;
         document.getElementById('familiarity').textContent=s.human_state.familiarity;
-      }
-      if(s.target_found){
-        const b=document.getElementById('banner');
-        b.style.display='block'; b.textContent='🎯 TARGET FOUND — '+(s.last_opponent||'')+' — your turn! (Silence alarm to dismiss)';
       }
     }
   }catch(e){ document.getElementById('conn').textContent='offline'; }

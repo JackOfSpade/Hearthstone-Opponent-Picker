@@ -10,6 +10,18 @@
 # There is no Terminal window (this is a real .app), so all output goes to the log at
 # ~/Library/Logs/hop.log -- read it if the menu-bar icon never appears.
 
+# Run under the Mac's NATIVE architecture. LaunchServices can start a universal .app
+# under the x86_64 (Rosetta) slice; a translated x86_64 Python then cannot dlopen the
+# arm64 numpy/Pillow wheels installed for native Python ("incompatible architecture"),
+# so the vision import breaks and Start Search dies the instant it runs. Re-exec once
+# under arm64 when we are on Apple Silicon hardware but running translated. (Guarded by
+# HOP_ARCH_FIXED so the re-exec can never loop; a no-op on Intel, where x86_64 IS native.)
+if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] \
+   && [ "$(/usr/bin/uname -m)" != "arm64" ] && [ -z "$HOP_ARCH_FIXED" ]; then
+  export HOP_ARCH_FIXED=1
+  exec /usr/bin/arch -arm64 /bin/zsh "$0" "$@"
+fi
+
 LOG="$HOME/Library/Logs/hop.log"
 mkdir -p "$(dirname "$LOG")"
 exec >"$LOG" 2>&1                        # truncate each launch; keeps the log bounded
@@ -62,11 +74,27 @@ cd "$PROJECT_DIR" || { echo "x project dir vanished: $PROJECT_DIR"; notify "hop 
 MARKER="hop.egg-info/PKG-INFO"
 if [ ! -e "$MARKER" ] || [ pyproject.toml -nt "$MARKER" ]; then
   echo "> pyproject.toml changed since the last install -- refreshing dependencies..."
-  "$PY" -m pip install -e . --quiet \
+  "$PY" -m pip install -e '.[vision,mac,hotkeys]' --quiet \
     && notify "hop dependencies refreshed." "Glass" \
     || { echo "x pip install failed -- launching on the existing install."; notify "Dependency refresh failed." "Basso"; }
 else
   echo "> Up to date."
+fi
+
+# The hunt needs the optional VISION extra (Pillow/numpy) to decode screencaps, but
+# hop's core deps are intentionally empty -- an editable install alone does NOT pull it
+# in. Without Pillow the engine dies the instant you press Start Search, and because
+# perception/image.py caches the missing import at load time, that failure reads as
+# "Start does nothing" in the window. So verify the extras are importable every launch
+# (one cheap import) and install them if missing, independent of the metadata refresh.
+if ! deperr="$("$PY" -c 'import PIL, numpy' 2>&1)"; then
+  echo "> Vision deps not importable by $PY:"
+  echo "    $("$PY" -c 'import sys; print(sys.executable)')"
+  echo "    ${deperr##*$'\n'}"
+  echo "> installing hop[vision,mac,hotkeys]..."
+  "$PY" -m pip install -e '.[vision,mac,hotkeys]' --quiet \
+    && notify "hop vision dependencies installed." "Glass" \
+    || { echo "x vision install failed -- Start Search will not work until deps are present."; notify "Vision dependency install failed. See ~/Library/Logs/hop.log" "Basso"; }
 fi
 
 if "$PY" -c 'import AppKit' >/dev/null 2>&1; then

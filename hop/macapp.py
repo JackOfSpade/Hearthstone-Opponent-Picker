@@ -203,7 +203,7 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             s.risk_line = self._disabled(menu, s.risk_text())
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-            self._action(menu, "Start hunting", "start_", key="s")
+            self._action(menu, "Start Search", "start_", key="s")
             self._action(menu, "Stop", "stop_", key=".")
             self._action(menu, "Silence alarm", "ack_", key="a")
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
