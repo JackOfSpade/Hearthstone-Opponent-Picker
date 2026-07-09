@@ -214,3 +214,23 @@ def test_a_failing_status_probe_never_breaks_the_report(tmp_path):
         raise RuntimeError("kaboom")
     md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0, status_probe=boom)
     assert "status probe failed" in md and "kaboom" in md
+
+
+# ── tooling / environment ─────────────────────────────────────────────────────
+
+def test_tooling_summary_flags_missing_tools():
+    out = br.tooling_summary(which=lambda name: None, env={"PATH": "/usr/bin:/bin"})
+    assert "adb on PATH: NOT FOUND" in out
+    assert "tesseract on PATH: NOT FOUND" in out
+    assert "/usr/bin:/bin" in out
+
+
+def test_tooling_summary_reports_resolved_paths():
+    out = br.tooling_summary(which=lambda n: "/opt/homebrew/bin/" + n, env={"PATH": "x"})
+    assert "adb on PATH: /opt/homebrew/bin/adb" in out
+    assert "tesseract on PATH: /opt/homebrew/bin/tesseract" in out
+
+
+def test_collect_includes_the_tooling_section(tmp_path):
+    md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0)
+    assert "## Tooling / environment" in md

@@ -17,6 +17,7 @@ format is testable without a device, a run, or a filesystem.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import time
 from dataclasses import dataclass
@@ -226,6 +227,26 @@ def format_status(status: dict) -> str:
     return "\n".join(lines)
 
 
+def tooling_summary(*, which=None, env=None) -> str:
+    """The external tools hop shells out to, and whether they resolve on PATH.
+
+    A .app launched from Finder gets a minimal PATH; when ``adb`` or ``tesseract`` fall
+    off it, Start Search dies with "No such file: 'adb'" and OCR can't read the class.
+    Surfacing the resolved paths + PATH makes that root cause obvious from the report
+    rather than something to infer. Pure lookups (no subprocess), so it can't hang;
+    ``which``/``env`` are injectable for tests.
+    """
+    import shutil
+    import sys
+    which = which or shutil.which
+    environ = env if env is not None else os.environ
+    lines = [f"- python: {sys.executable}"]
+    for tool in ("adb", "tesseract"):
+        lines.append(f"- {tool} on PATH: {which(tool) or 'NOT FOUND'}")
+    lines.append(f"- PATH: {environ.get('PATH', '')}")
+    return "\n".join(lines)
+
+
 def collect(description: str, paths: ReportPaths, *, version: str,
             journal_tail_lines: int = 120, log_tail_lines: int = 120,
             clock=time.time, device_probe=None, status_probe=None) -> str:
@@ -257,6 +278,8 @@ def collect(description: str, paths: ReportPaths, *, version: str,
         except Exception as e:  # never let a device probe break the report
             probe = f"(device probe failed: {e})"
         sections.append(Section("Device / anchors", probe))
+
+    sections.append(Section("Tooling / environment", tooling_summary()))
 
     cfg_text = _read(paths.config)
     if cfg_text:
