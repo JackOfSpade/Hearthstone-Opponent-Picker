@@ -5,8 +5,10 @@ write them, so a restart lost them and a bug report's config showed stale classe
 it not log my new selections?"). Start now persists, like the menu bar always has.
 """
 
+import re
+
 from hop.config import load_config
-from hop.hero_classes import HeroClass
+from hop.hero_classes import DISPLAY_NAMES, HeroClass
 from hop.webui.server import _INDEX_HTML, DashboardServer
 
 
@@ -64,3 +66,28 @@ def test_dashboard_is_branded_with_the_project_name_not_hop():
     assert "Hearthstone Opponent Picker" in _INDEX_HTML
     assert "<h1>hop</h1>" not in _INDEX_HTML
     assert "<title>hop dashboard</title>" not in _INDEX_HTML
+
+
+def test_distribution_renders_on_open_not_only_after_a_search_starts():
+    """The observed class distribution is day-scoped and persists across runs (status carries
+    it even while idle), so the chart must render on every poll -- including on app open,
+    before any Search. It regressed once by living inside the `if(s.games!==undefined)` block,
+    which only runs after a run begins, so the chart appeared only once searching started."""
+    html = _INDEX_HTML
+    draw = html.index("drawDistribution(s.class_distribution")
+    guard = html.index("if(s.games!==undefined)")
+    assert draw < guard, "drawDistribution must be called BEFORE (outside) the per-run games guard"
+    assert html.count("drawDistribution(s.class_distribution") == 1   # one unconditional call
+    assert "loadCriteria();\npoll();" in html   # first render is immediate, not after the 1 s tick
+
+
+def test_class_colors_covers_every_hero_class():
+    """The chart colours each bar/label by the opponent class (CLASS_COLORS, keyed on the
+    DISPLAY_NAMES the engine emits). An unrecognised label falls back to the neutral accent
+    with no crash and no failing test -- so if a class is ever added/renamed, the drift is
+    silent. Pin the JS map to the Python enum: every DISPLAY_NAME must have a colour."""
+    block = re.search(r"const CLASS_COLORS=\{(.*?)\};", _INDEX_HTML, re.S)
+    assert block, "CLASS_COLORS map not found in the dashboard HTML"
+    keys = set(re.findall(r'"([^"]+)":"#', block.group(1)))
+    missing = set(DISPLAY_NAMES.values()) - keys
+    assert not missing, f"CLASS_COLORS is missing a colour for: {sorted(missing)}"

@@ -232,6 +232,14 @@ in_game_wait_attempts = 6
 # Silent: no tap, no cap, no Halt, no alert. Bound it. At ~1.5 s a poll this is ~2 min,
 # far beyond any real queue.
 queue_wait_attempts = 60
+# hop lands on the deck LIST after dismissing an "error starting your game" (Hearthstone
+# kicks you out of matchmaking back to deck selection). hop can't reopen a deck itself --
+# it can't tell which one you were playing, and opening the wrong/incomplete one is worse
+# than stopping -- so instead of ending the whole hunt it PAUSES: it alerts, then waits
+# (never tapping the list) and resumes automatically the moment you re-select your deck.
+# This bounds that wait: at ~4 s a poll, 40 is ~3 min, after which it stops cleanly so a
+# walked-away session doesn't poll forever.
+deck_select_wait_attempts = 40
 # Hearthstone shuts down idle connections ("You are currently offline"), which the
 # hunt loop's own anti-barcode pacing provokes. Tapping Reconnect starts an
 # ASYNCHRONOUS reconnect: the body becomes "Reconnecting..." and both buttons are
@@ -251,6 +259,27 @@ reconnect_attempt_cap = 3
 # an unknown state (we are still on the mulligan), so halting the hunt over it would be
 # fail-closed applied where nothing is closed.
 mulligan_card_tap_attempts = 3
+# After we tap Confirm, the wait for the mulligan to LEAVE has to cover the OPPONENT
+# finishing their own mulligan too -- not just our board drawing in. While they choose,
+# this client replaces the "Starting Hand" banner (our mulligan anchor) with an
+# "Opponent Still Choosing..." banner that has NO anchor, so the frame classifies UNKNOWN.
+# The generic screen_wait_timeout_s (20 s) is a transition budget and is far too short for
+# that: an opponent who ropes their mulligan trips a FALSE "Confirm did not dismiss the
+# mulligan" halt though the Confirm worked (its verify_ok fired). Size this one wait to the
+# mulligan rope. The wait NEVER taps, so a generous budget costs only a later fail-closed,
+# never a misdirected tap. (Fix: build an "Opponent Still Choosing..." anchor with
+# `hop capture --from-file` to turn the UNKNOWN polls into cheap scoped ones.)
+mulligan_resolve_timeout_s = 75.0  # wall-clock; a roping opponent + slow UNKNOWN full-scans
+mulligan_resolve_attempts = 30     # poll bound (a frozen-clock test needs this; timeout binds on-device)
+# Reading the OPPONENT's class off the mulligan can whiff even once the mulligan is up:
+# the nameplate is still drawing in, or the same "Opponent Still Choosing..." banner is
+# sitting over it, so the class region reads blank (class='') though our cards count fine.
+# That is a transient, not a lost screen -- so re-read a few times before failing closed,
+# the same patience the resolve wait above gives a roping opponent. LIVE-OBSERVED
+# 2026-07-10: a single re-read (the old behaviour, =2) halted a healthy hunt on one
+# slow-rendering nameplate. Each try costs ~0.8 s think + a wireless capture + OCR (~5 s),
+# so 4 keeps the added patience to ~15 s. (>=1; 1 = one read, no retry.)
+mulligan_read_attempts = 4
 # Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
 # The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
 # which this replaced - card artwork cannot fake it. A strip must span most of the

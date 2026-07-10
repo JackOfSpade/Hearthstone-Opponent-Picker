@@ -28,7 +28,7 @@ from random import Random
 from . import __version__
 from .adb import Adb, AdbError
 from .alerts import Alerter
-from .config import Config, load_config
+from .config import Config, clear_target_classes, load_config
 from .debuglog import DebugLog, prune_runs
 from .engine import Engine
 from .geometry import PanelGeometry
@@ -471,11 +471,28 @@ def cmd_run(args) -> int:
     return 0
 
 
+def _load_config_clean_targets(config_path) -> Config:
+    """Load the config for an app launch with *nothing selected*.
+
+    Target classes are session-only (see :func:`hop.config.clear_target_classes`): the
+    app starts each launch with an empty selection and you re-pick. We wipe the persisted
+    picks on disk AND drop them from the in-memory config the UIs build their checkboxes
+    from, so neither surface shows a stale class carried over from last time.
+    """
+    from dataclasses import replace
+
+    cfg = load_config(config_path)
+    if cfg.criteria.target_classes:
+        clear_target_classes(config_path)
+        cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=()))
+    return cfg
+
+
 def cmd_app(args) -> int:
     """The Mac control panel: a menu-bar item that drives the hunt loop."""
     from .macapp import MacAppUnavailable, run_menubar
 
-    cfg = load_config(args.config)
+    cfg = _load_config_clean_targets(args.config)
     alerter = Alerter(cfg.alerts)
     pack_dir = Path(args.templates or _default_pack_dir())
 
@@ -492,9 +509,10 @@ def cmd_app(args) -> int:
 
 
 def cmd_dashboard(args) -> int:
-    cfg = load_config(args.config)
+    cfg = _load_config_clean_targets(args.config)
     alerter = Alerter(cfg.alerts)
     pack_dir = Path(args.templates or _default_pack_dir())
+    from .observed import ObservedDistribution, default_path
     from .runner import EngineController
     from .webui import DashboardServer
 
@@ -503,7 +521,9 @@ def cmd_dashboard(args) -> int:
         return build_engine(c, pack_dir=pack_dir, debug_dir=_default_run_dir(c.debug.keep_runs),
                             alerter=alerter, seed=args.seed)
 
-    controller = EngineController(factory, alerter=alerter)
+    # day-scoped observed-class tally: continues within a day, resets on a new one.
+    observed = ObservedDistribution.load(default_path(args.config))
+    controller = EngineController(factory, alerter=alerter, observed=observed)
     server = DashboardServer(controller, cfg, host=args.host, port=args.port,
                              config_path=args.config)
     url = f"http://{args.host}:{args.port}/"
@@ -517,6 +537,7 @@ def cmd_dashboard(args) -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         controller.stop()
+        controller.flush_observed()   # save the day's tally before we exit
         server.shutdown()
     return 0
 

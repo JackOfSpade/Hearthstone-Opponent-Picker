@@ -3,9 +3,11 @@
 hop reaches the deck grid only on recovery (an error dropped it back there). It does NOT
 reopen a deck: it cannot reliably tell which deck was in play (the grid names render too
 soft/stylised to OCR; any other pick could open the wrong deck or an incomplete one), and
-re-selecting a *different* deck than the user chose is worse than stopping. So it pauses
-(halts + alerts) and the user re-selects. The one thing it still does on the deck screens
-is refuse to auto-complete: on "Complete deck automatically?" it taps No, never Yes.
+re-selecting a *different* deck than the user chose is worse than stopping. So it PAUSES --
+alerts and waits, never tapping the list -- and resumes the hunt by itself when the user is
+back on a deck's Play screen; only if nobody re-selects within the bounded wait does it fail
+closed. The one thing it still does on the deck screens is refuse to auto-complete: on
+"Complete deck automatically?" it taps No, never Yes.
 """
 
 from random import Random
@@ -44,14 +46,39 @@ def _engine(cfg, states):
 
 # ── the deck list pauses ─────────────────────────────────────────────────────
 
-def test_deck_select_pauses_and_never_taps_a_deck(cfg):
-    """hop cannot tell which deck was in play, so it must not open one -- opening a
-    different deck than the user chose is worse than stopping."""
+def test_deck_select_pauses_without_halting_and_never_taps_a_deck(cfg):
+    """A single look at the deck list must NOT end the hunt: hop pauses (waits, never
+    tapping) so it can resume when the user re-selects. The invariant is unchanged -- it
+    never opens a deck, since opening a different one than the user chose is worse."""
     eng, backend = _engine(cfg, [ScreenState.DECK_SELECT])
     frame = gray_frame(80, 40)
-    with pytest.raises(Halt, match="[Rr]e-select your deck"):
-        eng._dispatch(eng.classifier.classify(frame), frame)
+    eng._dispatch(eng.classifier.classify(frame), frame)   # pauses, does not raise
     assert backend.gestures == []          # never a deck tap
+    assert eng._deck_select_polls == 1     # counting toward the bounded wait
+
+
+def test_deck_select_resumes_when_the_user_returns_to_a_play_screen(cfg):
+    """The whole point of pausing: after the user re-selects their deck, the next look is a
+    Play screen and the hunt continues on its own (the pause counter resets, Play is tapped)."""
+    eng, backend = _engine(cfg, [ScreenState.DECK_SELECT, ScreenState.PLAY_SCREEN])
+    frame = gray_frame(80, 40)
+    eng._dispatch(eng.classifier.classify(frame), frame)   # deck list: pause
+    assert backend.gestures == []
+    eng._dispatch(eng.classifier.classify(frame), frame)   # play screen: resume -> tap Play
+    assert eng._deck_select_polls == 0                     # pause cleared on leaving the list
+    assert len(backend.gestures) == 1                      # the Play tap fired
+
+
+def test_deck_select_halts_only_after_the_wait_budget(cfg):
+    """A deck list nobody re-selects is bounded: after the budget it fails closed, so a
+    walked-away session still stops cleanly rather than pausing forever -- and never taps."""
+    eng, backend = _engine(cfg, [ScreenState.DECK_SELECT])
+    frame = gray_frame(80, 40)
+    for _ in range(cfg.vision.deck_select_wait_attempts):   # exhaust the budget (each pauses)
+        eng._dispatch(eng.classifier.classify(frame), frame)
+    with pytest.raises(Halt, match="[Rr]e-select your deck"):
+        eng._dispatch(eng.classifier.classify(frame), frame)   # one past the budget -> halt
+    assert backend.gestures == []          # still never tapped a deck
 
 
 # ── never auto-complete ──────────────────────────────────────────────────────

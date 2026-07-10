@@ -102,7 +102,11 @@ def run_menubar(cfg: Config, engine_factory, alerter=None,
     from .runner import EngineController
 
     _brand_process()   # relabel "Python" -> our name BEFORE NSApplication reads it
-    controller = EngineController(engine_factory, alerter=alerter)
+    from .observed import ObservedDistribution, default_path
+    # day-scoped observed-class tally: reloaded if it is from today, reset otherwise, so
+    # the dashboard chart continues within a day and starts fresh on a new one.
+    observed = ObservedDistribution.load(default_path(config_path))
+    controller = EngineController(engine_factory, alerter=alerter, observed=observed)
     app = AppKit.NSApplication.sharedApplication()
     # Regular app: a Dock icon and a Cmd-Tab entry, PLUS the menu-bar item. The Dock
     # icon lets the hub window be reopened after it's closed (see the reopen handler);
@@ -435,9 +439,14 @@ else:  # pragma: no cover - needs a Mac GUI session to exercise
             return True
 
         def applicationWillTerminate_(self, note):
-            """Stop the hunt cleanly on the way out (release ADB), same as Quit."""
+            """Stop the hunt cleanly on the way out (release ADB), same as Quit, and save
+            the day's observed distribution so a mid-run quit does not lose it."""
             try:
                 self._state.controller.stop()
+            except Exception:
+                pass
+            try:
+                self._state.controller.flush_observed()
             except Exception:
                 pass
 

@@ -151,6 +151,64 @@ def test_mulligan_reread_is_journalled_with_its_recovered_class(cfg):
     assert eng.stats.last_opponent == "Druid"
 
 
+def _mulligan_read_engine(cfg, reads, n_frames=6):
+    """An engine on the mulligan whose `_read_mulligan` yields a scripted sequence."""
+    from hop.geometry import PanelGeometry
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1), layout=GameLayout(),
+                 capturer=ScriptedCapturer([gray_frame(80, 40)] * n_frames))
+    eng._execute_reject = lambda read: None      # skip the concede journey; we test the read
+    it = iter(reads)
+    eng._read_mulligan = lambda *a, **k: next(it)
+    return eng
+
+
+def test_mulligan_class_recovers_on_a_later_reread_not_just_the_first(cfg):
+    """A blank opponent class on a *confirmed* mulligan is a transient -- the nameplate is
+    still drawing in, or an "Opponent Still Choosing..." banner is over it. The engine must
+    re-read a few times and recover, not halt after a single re-read as it used to."""
+    from dataclasses import replace
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    eng = _mulligan_read_engine(cfg, [
+        MulliganRead(None, False, 3, 0.0, "", "tesseract"),                  # first: blank
+        MulliganRead(None, False, 3, 0.0, "", "tesseract"),                  # re-read 1: still blank
+        MulliganRead(HeroClass.MAGE, False, 3, 0.8, "MAGE", "tesseract"),    # re-read 2: recovered
+    ])
+    eng._handle_mulligan(gray_frame(80, 40))     # must NOT raise Halt
+    assert eng.stats.class_distribution == {"Mage": 1}   # the recovered read drove the stats
+    assert eng.stats.last_opponent == "Mage"
+
+
+def test_a_persistently_unreadable_mulligan_still_halts(cfg):
+    """The patience is bounded: a class that never reads still fails closed."""
+    from hop.verify import Halt
+    eng = _mulligan_read_engine(
+        cfg, [MulliganRead(None, False, 3, 0.0, "", "tesseract")] * 8)
+    with pytest.raises(Halt, match="could not read mulligan"):
+        eng._handle_mulligan(gray_frame(80, 40))
+
+
+def test_mulligan_read_attempts_one_restores_single_read_no_retry(cfg):
+    """`mulligan_read_attempts = 1` is the escape hatch back to one read, no re-read."""
+    from dataclasses import replace
+    from hop.verify import Halt
+
+    cfg = replace(cfg, vision=replace(cfg.vision, mulligan_read_attempts=1))
+    reads = []
+
+    def read(*a, **k):
+        r = MulliganRead(None, False, 3, 0.0, "", "tesseract")
+        reads.append(r)
+        return r
+
+    eng = _mulligan_read_engine(cfg, [])
+    eng._read_mulligan = read
+    with pytest.raises(Halt):
+        eng._handle_mulligan(gray_frame(80, 40))
+    assert len(reads) == 1        # one read, no re-read
+
+
 def test_queue_dispatch_sets_the_scoped_prior_for_the_next_look(cfg):
     """The dominant heartbeat: after a QUEUE poll the next top-loop look is scoped to
     {queue, mulligan} (still-queueing or matched-in) -- the interrupt floor still catches a
@@ -595,6 +653,93 @@ def test_mulligan_confirm_halts_if_the_mulligan_never_leaves(cfg):
     eng, _ = _reconnect_engine(cfg, [ScreenState.MULLIGAN])
     with pytest.raises(Halt, match="did not dismiss"):
         eng._confirm_mulligan()
+
+
+class _PollClockCapturer:
+    """A capturer that also advances a shared wall-clock by a fixed 'perception cost' per
+    look, modelling the ~8-12 s a wireless capture + slow UNKNOWN full-scan burns each poll
+    -- a cost the instant fakes otherwise hide, and the reason the real on-device wait hit
+    the WALL-CLOCK cut after only ~3 looks. One ``capture()`` == one poll; plain ``read()``s
+    never move the clock, so the deadline arithmetic is deterministic.
+    """
+
+    def __init__(self, per_poll_s: float):
+        self.t = 0.0
+        self.per_poll_s = per_poll_s
+        self._frame = gray_frame(80, 40)
+
+    def read(self) -> float:
+        return self.t
+
+    def capture(self):
+        self.t += self.per_poll_s
+        return self._frame
+
+
+def _leave_wait_engine(cfg, states, cap):
+    from hop.geometry import PanelGeometry
+    return Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                  FakeClassifier(states), reader=None, sleep=lambda s: None,
+                  clock=cap.read, rng=Random(1), capturer=cap)
+
+
+def test_mulligan_confirm_wait_survives_a_slow_opponents_mulligan(cfg):
+    """Regression: a roping opponent false-halted the run.
+
+    After we Confirm, the client shows an anchorless "Opponent Still Choosing..." banner
+    until the OPPONENT confirms -- every frame classifies UNKNOWN. Each such look costs
+    ~8-12 s (capture + full-scan) over Wi-Fi, so the generic ~20 s transition budget was
+    spent after ~2-3 looks and the engine halted "Confirm did not dismiss the mulligan"
+    even though Confirm had worked. The mulligan-resolve budget must wait it out.
+    """
+    from hop.verify import Halt
+
+    # six UNKNOWN looks (the opponent deliberating), then the board finally draws in.
+    states = [ScreenState.UNKNOWN] * 6 + [ScreenState.IN_GAME]
+
+    eng = _leave_wait_engine(cfg, states, _PollClockCapturer(per_poll_s=8.0))
+    cls = eng._wait_until_screen_leaves(
+        ScreenState.MULLIGAN, where="mulligan_confirm", stuck="did not dismiss",
+        arrivals={ScreenState.IN_GAME},
+        attempts=cfg.vision.mulligan_resolve_attempts,
+        timeout_s=cfg.vision.mulligan_resolve_timeout_s)
+    assert cls.state == ScreenState.IN_GAME, "must wait out the opponent's mulligan, not halt"
+
+    # And prove the budget is what saves it: the generic transition budget WOULD have
+    # halted on this very sequence (deadline reached long before IN_GAME arrives).
+    eng2 = _leave_wait_engine(cfg, states, _PollClockCapturer(per_poll_s=8.0))
+    with pytest.raises(Halt, match="did not dismiss"):
+        eng2._wait_until_screen_leaves(
+            ScreenState.MULLIGAN, where="mulligan_confirm", stuck="did not dismiss",
+            arrivals={ScreenState.IN_GAME},
+            attempts=cfg.vision.screen_wait_attempts,
+            timeout_s=cfg.vision.screen_wait_timeout_s)
+
+
+def test_mulligan_confirm_wait_halts_on_the_wall_clock_not_the_poll_count(cfg):
+    """The flip side of the survive test: an opponent whose mulligan NEVER resolves must
+    still fail closed -- and on-device it is the 75 s WALL CLOCK, not the 30-attempt poll
+    bound, that halts it. Every look is UNKNOWN (the anchorless "Opponent Still Choosing..."
+    rope) and each costs ~8 s (Wi-Fi capture + full-scan), so the timeout fires after ~10
+    looks, far short of mulligan_resolve_attempts (30) -- which on-device would be ~240 s of
+    hanging. Guards the config invariant 'timeout binds on-device; attempts binds a frozen
+    clock': a regression dropping timeout_s through (so the wall clock never binds) would
+    hang far longer with every other test still green.
+    """
+    from hop.verify import Halt
+
+    cap = _PollClockCapturer(per_poll_s=8.0)
+    eng = _leave_wait_engine(cfg, [ScreenState.UNKNOWN], cap)   # UNKNOWN repeats forever
+    with pytest.raises(Halt, match="did not dismiss"):
+        eng._wait_until_screen_leaves(
+            ScreenState.MULLIGAN, where="mulligan_confirm", stuck="did not dismiss",
+            arrivals={ScreenState.IN_GAME},
+            attempts=cfg.vision.mulligan_resolve_attempts,
+            timeout_s=cfg.vision.mulligan_resolve_timeout_s)
+    # the wall clock tripped, not the poll count: halted just past 75 s after ~10 looks,
+    # well short of the 30-attempt bound (which on-device is ~240 s).
+    assert cap.t >= cfg.vision.mulligan_resolve_timeout_s
+    assert cap.t / 8.0 < cfg.vision.mulligan_resolve_attempts
 
 
 def test_every_tap_site_is_named_for_the_journal(cfg):

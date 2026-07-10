@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,13 +40,19 @@ SELF_IMPROVE_PROMPT = """\
 """
 
 
-#: Hard ceiling on the whole report's line count. A report is pasted straight into
-#: Claude Code, so it must not balloon: past this, the oldest lines of the biggest log
-#: sections (app log first, then the run journal) are dropped — the newest lines are the
-#: most diagnostic. Generous enough that a normal report is never touched.
-MAX_REPORT_LINES = 50_000
+#: Hard ceiling on the whole report's CHARACTER count. The report is pasted straight into
+#: Claude Code, which truncates a pasted message at ~50k characters -- and that truncation
+#: lands mid-journal, cutting the NEWEST lines (the transition into the halt, the ones that
+#: actually diagnose it). We must trim ourselves, oldest-first, so the tail survives. This
+#: is characters, not lines, on purpose: a 500-line journal is only ~1000 lines but ~100k
+#: characters, so a line cap never fired and let the external truncator cut the diagnosis.
+#: A touch under 50k for margin (the note we add, and any downstream wrapping, cost a little).
+MAX_REPORT_CHARS = 48_000
 
-#: Sections trimmed (in this order, oldest-line-first) when a report exceeds the cap.
+#: Sections trimmed (in this order, oldest-line-first) when a report exceeds the cap: the
+#: app log first (mostly launch noise), then the run journal -- and because the journal
+#: section is emitted BEFORE the app log, even the final backstop truncation eats app-log
+#: tail, never the journal's newest lines.
 _TRIMMABLE_TITLES = ("App log (~/Library/Logs/hop.log)", "Latest run journal (tail)")
 
 
@@ -128,6 +135,148 @@ def tail(text: str, max_lines: int) -> str:
     return f"... ({dropped} earlier lines omitted) ...\n" + "\n".join(all_lines[-max_lines:])
 
 
+#: Phrases the *button-transition* stuck halts use -- the ``_wait_until_screen_leaves`` waits
+#: (mulligan Confirm, gear, Concede, deck dialog) where a verified tap should have moved us to
+#: a NEW screen and, positively, did not. A halt matching one of these whose triggering tap had
+#: already verified OK is a false halt on the unnamed DESTINATION, not a stuck source (see below).
+#: Deliberately NOT "never ...": the engine's "never came back online" / "board never finished
+#: dissolving" halts are genuine external/async timeouts (a network outage, a slow fade), not a
+#: tap that landed on an unclassifiable screen -- and the destination-anchor advice is wrong for
+#: them. All the true targets match via "did not X", so "never " is unneeded and only over-matches.
+_STUCK_HALT_PHRASES = ("did not dismiss", "did not open", "did not close")
+
+
+def _is_stuck_halt(message: str) -> bool:
+    m = (message or "").lower()
+    return any(p in m for p in _STUCK_HALT_PHRASES)
+
+
+#: The "could not read mulligan (class=<raw>, cards=<n>)" halt carries BOTH signals the
+#: mulligan read needs, so which one failed is decidable from the message alone.
+_MULLIGAN_READ_HALT_RE = re.compile(
+    r"could not read mulligan \(class=(?P<cls>.*), cards=(?P<cards>-?\d+)\)")
+
+
+def _diagnose_mulligan_read_halt(message: str) -> str:
+    """Name the cause of a 'could not read mulligan' halt from its own message.
+
+    The read needs two signals: the opponent's CLASS (OCR of the bottom-left nameplate)
+    and our CARD count (the green keep-glow strips). The halt message carries both, so
+    which failed is decidable here instead of by opening the kept frame. The common --
+    and confusing -- case is class BLANK while the cards read fine: the mulligan genuinely
+    IS up, but the opponent's nameplate had not rendered, or an "Opponent Still
+    Choosing..." banner sat over the class region. That is the transient the read now
+    retries (``vision.mulligan_read_attempts``) before failing closed, so a recurrence
+    means the phone is slower than that budget, not a code regression. Returns "" for any
+    other halt.
+    """
+    m = _MULLIGAN_READ_HALT_RE.search(message or "")
+    if not m:
+        return ""
+    cls_raw = m.group("cls").strip()
+    blank = cls_raw in ("''", '""', "")
+    try:
+        cards = int(m.group("cards"))
+    except ValueError:
+        cards = -1
+    cards_ok = cards in (3, 4)
+    if blank and cards_ok:
+        return ("the opponent-CLASS OCR read BLANK (class='') while the cards counted fine "
+                f"(cards={cards}) -- the mulligan WAS up, but the opponent's nameplate had "
+                "not rendered yet / an 'Opponent Still Choosing...' banner was over the class "
+                "region. Transient, not a lost screen: the read retries "
+                "vision.mulligan_read_attempts times before halting. If it still recurs, "
+                "raise that knob or build an 'Opponent Still Choosing...' anchor (hop capture "
+                "--from-file).")
+    if cards_ok:   # class present but did not snap to a known class
+        return (f"the class text ({cls_raw}) did not resolve to a known class though the "
+                f"cards counted fine (cards={cards}) -- a GARBLED nameplate read, not a blank "
+                "one. Suspect the opponent-class region/threshold (vision.ocr_max_edit_distance) "
+                "rather than the still-choosing transient.")
+    return (f"the CARD count was off (cards={cards}, expected 3 or 4) -- the green keep-glow "
+            "strip detection miscounted, so this is a card-count/glow failure, not an "
+            "opponent-class read. Check the glow thresholds against a kept frame.")
+
+
+def _norm_class(s) -> str:
+    """Normalize a class token so an enum NAME compares equal to a DISPLAY name: uppercase,
+    alphanumerics only. ``_norm_class("Death Knight") == _norm_class("DEATHKNIGHT") ==
+    "DEATHKNIGHT"``. Shared by both criteria recomputes (the target_found KEEP check and the
+    reject-reason check), which compare ``run_criteria`` enum tokens against ``mulligan_read``
+    display names."""
+    return "".join(ch for ch in str(s).upper() if ch.isalnum())
+
+
+#: Human labels for the three ways :meth:`hop.config.Criteria.accepts` rejects a matchup.
+_REJECT_LABELS = {
+    "went_first": "went 1st (require_second is set, so only going-2nd games are kept)",
+    "not_targeted": "opponent class not in the target list",
+    "avoided": "opponent class is on the avoid list",
+}
+
+
+def _reject_reason(opponent: str, we_go_second: bool, require_second: bool,
+                   targets: list, avoid: list) -> str:
+    """Why a *conceded* matchup was rejected, mirroring :meth:`hop.config.Criteria.accepts`
+    precedence EXACTLY (require_second first and class-independent; then target list; then
+    avoid list). Returns a key in :data:`_REJECT_LABELS`, or ``"misfire"`` when ``accepts``
+    would in fact have KEPT the matchup -- i.e. a reject fired on a game the criteria say to
+    keep, a real bug, flagged as loudly as the target_found misfire check. Only meaningful for
+    a game that genuinely rejected (the caller anchors on ``reject_plan``), so the three real
+    reasons are exhaustive and ``"misfire"`` is reached only on a true keep/reject inversion."""
+    if require_second and not we_go_second:
+        return "went_first"
+    if targets:
+        return "misfire" if _norm_class(opponent) in {_norm_class(t) for t in targets} else "not_targeted"
+    if avoid:
+        return "avoided" if _norm_class(opponent) in {_norm_class(a) for a in avoid} else "misfire"
+    return "misfire"   # no class filter and the coin gate passed => accepts keeps => a misfire
+
+
+#: The engine's DELIBERATE fail-closed halts: each is a *designed* stop that needs a specific
+#: human action, NOT a malfunction. Matching the terminal halt against this table is the one
+#: line that answers "is this a bug?" for the whole guard family -- a reader (or Claude on
+#: paste-back) sees "expected stop, do X" instead of re-deriving it from the journal, the way
+#: this module already pattern-matches the stuck-tap and mulligan-read halts. Each entry is
+#: (lowercase substrings identifying the halt, guidance); the signatures are disjoint. A halt
+#: matching NONE falls through to the unknown/mulligan/false-halt diagnostics, which cover the
+#: genuinely-unexpected halts -- so silence here never blesses a real fault as designed.
+_DELIBERATE_HALTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("deck list", "re-select your deck"),
+     "hop dropped back to the deck LIST after a game error (commonly Hearthstone's \"error "
+     "starting your game\", which kicks you out of matchmaking). It deliberately will NOT re-pick "
+     "a deck -- it can't tell which one you were on, and opening the wrong or an incomplete deck "
+     "is worse than stopping. Re-select your deck and restart the hunt from its Play screen; the "
+     "hunt resumes on its own the moment you're back on a Play screen."),
+    (("main menu",),
+     "hop was at the Hearthstone main menu, which is not where it queues from. Open Play, select "
+     "a deck, and start the hunt from that deck's Play screen."),
+    (("hunt did not start",),
+     "a live game was in progress that THIS hunt did not queue, so hop refused to concede it (it "
+     "may be YOUR game -- possibly the target it just alerted you to). Finish the game, or stop "
+     "and restart the hunt from the deck's Play screen."),
+    (("matchmaking never matched", "still queueing"),
+     "matchmaking stayed in the queue past the poll bound (vision.queue_wait_attempts) -- a "
+     "soft-lock, not a hop fault. Check the phone's connection and restart the hunt."),
+    (("failed to reconnect", "came back online"),
+     "Hearthstone could not reconnect within the attempt cap (vision.reconnect_attempt_cap). "
+     "External: the phone's network or the account needs attention, not a hop fault."),
+    (("no screen templates",),
+     "no template pack is loaded, so hop refused to run blind. Run `hop capture` to build the "
+     "anchor pack first."),
+)
+
+
+def _classify_halt(message: str) -> str:
+    """Guidance for a DELIBERATE fail-closed halt (see :data:`_DELIBERATE_HALTS`), or ``""`` if
+    the halt is not a recognized designed stop (and so may be a genuine fault)."""
+    m = (message or "").lower()
+    for needles, guidance in _DELIBERATE_HALTS:
+        if any(n in m for n in needles):
+            return guidance
+    return ""
+
+
 def summarize_journal(journal_text: str) -> str:
     """A human summary of a run journal: counts, the class distribution, and the tail.
 
@@ -168,8 +317,65 @@ def summarize_journal(journal_text: str) -> str:
     gaps: list[tuple[float, str, str]] = []
     last_halt = ""
     criteria = ""
+    # Structured criteria + the matchup a target_found stopped on, so the summary can
+    # RECOMPUTE whether the stop actually satisfied the criteria -- answering "did it stop on
+    # the right thing?" ("wrong target found, unless bug?") and flagging a genuine misfire.
+    crit_targets: list[str] = []
+    crit_avoid: list[str] = []
+    crit_require_second = False
+    crit_seen = False   # a run_criteria line was present -> the reject recompute is meaningful
+    # Why each CONCEDED game was rejected, recomputed against the criteria the SAME way the
+    # target_found line recomputes a KEEP -- so a run that only ever conceded (the common shape,
+    # and this report's) still answers "were these the right concedes?" instead of leaving the
+    # reader to hand-cross the coin split against require_second. reject_plan carries no class or
+    # coin (engine `_execute_reject`), so each is paired with the most recent resolved mulligan_read.
+    reject_reasons: dict[str, int] = {}
+    reject_misfires: list[str] = []   # conceded a matchup the criteria say to KEEP -> a real bug
+    last_read_opp = ""                # opponent of the most recent resolved (non-"?") mulligan_read
+    last_read_second = False
+    have_read = False                 # a resolved read is available to pair with a reject_plan
+    # Trailing run of the last classified state, so a halt can be shown to have followed a BOUNDED
+    # wait (deck_select polled N times, queue polled N times) -- the shape that tells a deliberate
+    # fail-closed guard (polls its budget, then stops) from a crash (bails mid-action). Distinct
+    # from unknown_run_len, which counts only the trailing UNKNOWN looks.
+    terminal_state = ""
+    terminal_state_run = 0
+    tf_opponent = ""
+    tf_second = False
     closest = ""
     false_halt_note = ""   # "waited for X to leave; X is gone, destination just unnamed"
+    verified_then_halt = ""  # the last tap verified OK, then we halted "stuck": a false halt
+    # The coin/turn story. A recurring class of question ("does it only concede on MY turn?
+    # it waits till turn 2 when I go second?") is unanswerable from taps alone -- it needs
+    # the coin split, where the reject grammar chose to bail, and whether the End Turn taps
+    # actually did anything. Concede is via the gear menu and works on EITHER turn; only the
+    # pass_turn beat is turn-gated (a no-op when End Turn is greyed on the opponent's turn).
+    went_second = 0
+    went_first = 0
+    coin_counted_game = False   # coin already tallied for the current game (once-per-game)
+    concede_points: dict[str, int] = {}
+    pass_turn_taps = 0
+    pass_turn_noops = 0     # tap was a no-op (End Turn greyed -> not our turn); benign
+    # last verified tap, for the false-halt-by-verification check below
+    last_tap_what = ""
+    last_tap_verified = ""      # change_kind of the verify_ok that confirmed the last tap
+    unknown_after_verify = False
+    # Unknown-halt context: which NAMED screen the terminal UNKNOWN run followed, and how many
+    # looks it persisted. A near-miss line already says which anchor an unknown came closest to,
+    # but not WHERE IN THE FLOW it appeared -- and "an unknown that won't settle right after
+    # QUEUE" is the unmistakable signature of the match-start transition (the VS 'match found'
+    # splash / board fade-in) that a pack may lack an anchor for. That is derivable from the
+    # classify sequence the journal already holds, and it is exactly what turns a useless
+    # "closest: deck_select 0.302" into "capture a vs_splash anchor".
+    last_named_state = ""
+    unknown_run_len = 0
+    state_before_unknown_run = ""
+    # The sequence of screens the run passed through, consecutive repeats collapsed. On a
+    # halt this is emitted as the "state trail into the halt" -- the single line that would
+    # have shown, in THIS report, that a dismissed error_dialog dropped to deck_select
+    # (queue -> error_dialog -> deck_select). It's what a truncated journal tail hides, and
+    # it's derivable from the classify stream the summary already walks.
+    state_trail: list[str] = []
     first_t: float | None = None
     prev_t: float | None = None
     prev_kind = ""
@@ -192,17 +398,72 @@ def summarize_journal(journal_text: str) -> str:
             # report answers "did class detection work?" instead of implying it didn't.
             opp = d.get("opponent")
             is_reread = bool(d.get("reread"))
-            if opp and opp != "?":
+            # Count a class only on a card-USABLE read, mirroring the engine's MulliganRead.usable
+            # (a real class AND cards in {3,4}) and its once-per-game class_distribution tally. A
+            # whiff-then-recover game journals the same class TWICE -- the unusable first read
+            # (class OK, cards miscounted to 0) and the recovering re-read -- and without this gate
+            # both were counted, printing "Mage×2" for one game and contradicting the engine's own
+            # count shown elsewhere in the report. There is at most one usable read per game (the
+            # first usable one ends the re-read loop), so this is exactly one count per game, and
+            # zero when none ever resolves (the engine halts before counting it too). A legacy
+            # journal line lacking `cards` is treated as usable, so older reports are unchanged.
+            if opp and opp != "?" and d.get("cards", 3) in (3, 4):
                 classes[opp] = classes.get(opp, 0) + 1
                 if is_reread:
                     reread_recovered += 1
+                # the resolved read a following reject_plan pairs its class + coin to (updated on
+                # the reread too, so a whiff-then-recover game rejects against the RESOLVED class)
+                last_read_opp, last_read_second, have_read = opp, bool(d.get("second")), True
             elif opp == "?":
                 if is_reread:
                     reread_failed += 1
                 else:
                     unreadable_first += 1
+            # The coin is derived purely from the card count (we_go_second = cards>=4), so its
+            # truth lives in a read whose count is USABLE -- normally the first read, but when the
+            # first read's cards whiffed (num_cards not in {3,4} -> second forced False) a going-2nd
+            # game would mis-tally as 1st unless the recovering re-read supplies the coin. So tally
+            # the first valid-card read of each game (once-per-game guard, reset on each first
+            # read). Not gated on the class -- the coin reads even when the class OCR whiffs. A
+            # legacy line lacking `cards` is trusted as before.
+            if not is_reread:
+                coin_counted_game = False
+            cards_val = d.get("cards")
+            if not coin_counted_game and "second" in d and (cards_val is None or cards_val in (3, 4)):
+                if d.get("second"):
+                    went_second += 1
+                else:
+                    went_first += 1
+                coin_counted_game = True
+        if k == "reject_plan":
+            # Where the reject grammar chose to bail. Chosen at RANDOM, independent of the
+            # coin (journey.choose_concede_point) -- so a lopsided split here is just RNG,
+            # and NOT evidence the tool waits for a particular turn.
+            cp = str(d.get("concede_point", "?"))
+            concede_points[cp] = concede_points.get(cp, 0) + 1
+            # Recompute why THIS game was conceded, against the run criteria. Gated on crit_seen:
+            # without a run_criteria line the criteria default to "accept everything", under which
+            # every reject would spuriously read as a misfire. run_criteria is the journal's first
+            # line, so it is always in hand by the time a reject_plan is reached.
+            if have_read and crit_seen:
+                r = _reject_reason(last_read_opp, last_read_second,
+                                   crit_require_second, crit_targets, crit_avoid)
+                if r == "misfire":
+                    reject_misfires.append(
+                        f"{last_read_opp} (going {'2nd' if last_read_second else '1st'})")
+                else:
+                    reject_reasons[r] = reject_reasons.get(r, 0) + 1
+                have_read = False   # consume, so the next reject pairs with the next game's read
         if k == "anomaly":
             anomalies.append(str(d.get("reason", "?")))
+            # A pass_turn (End Turn) tap that changed nothing means End Turn was greyed --
+            # i.e. it was NOT our turn (we went second and it is still the opponent's turn).
+            # That is benign and expected: the concede itself follows via the gear menu on
+            # EITHER turn. Counting these separates "the End Turn beat no-opped" (fine) from
+            # a real stuck tap, and is the direct evidence for the "only concedes on my turn?"
+            # question -- the beat is turn-gated, the concede is not.
+            if last_tap_what == "pass_turn" and d.get("fault") == "no_change":
+                pass_turn_noops += 1
         if k == "sleep":
             reason = str(d.get("reason", "?"))
             seconds = d.get("seconds")
@@ -228,12 +489,63 @@ def summarize_journal(journal_text: str) -> str:
             if isinstance(ms, (int, float)):
                 classify_ms.append(float(ms))
                 seg_perception += float(ms) / 1000.0
+            # Track the trailing run of UNKNOWN looks and the named screen it followed, so a
+            # halt on an unknown can say WHERE in the flow it struck (see the context line below).
+            state = d.get("state")
+            if state:
+                # trailing run of the SAME classified state (any state, UNKNOWN included), so a
+                # halt can report the bounded wait it followed -- see the terminal_state_run block.
+                if state == terminal_state:
+                    terminal_state_run += 1
+                else:
+                    terminal_state, terminal_state_run = state, 1
+            if state == "unknown":
+                if unknown_run_len == 0:
+                    state_before_unknown_run = last_named_state
+                unknown_run_len += 1
+            elif state:
+                last_named_state = state
+                unknown_run_len = 0
+            if state and (not state_trail or state_trail[-1] != state):
+                state_trail.append(state)   # collapse consecutive repeats (queue x8 -> queue)
         if k == "tap":
-            tap_costs.append((str(d.get("what", "?")), seg_think, seg_perception))
+            what = str(d.get("what", "?"))
+            tap_costs.append((what, seg_think, seg_perception))
             seg_think = 0.0
             seg_perception = 0.0
+            if what == "pass_turn":
+                pass_turn_taps += 1
+            # reset the verified-then-halt trail for THIS tap's outcome
+            last_tap_what = what
+            last_tap_verified = ""
+            unknown_after_verify = False
+        if k == "verify_ok":
+            # the tap's OWN change-check passed: the screen provably moved after it.
+            last_tap_verified = str(d.get("change_kind", "?"))
+        if k == "classify" and last_tap_verified:
+            # verified a change, then couldn't name where we landed: the tell of a false
+            # halt whose *destination* is unrecognised (not a stuck source screen). Track the
+            # MOST RECENT post-verify look: a later NAMED frame means we DID recognise the
+            # destination (e.g. genuinely stuck back on the mulligan), so the latch must mean
+            # "the last look since the verify was UNKNOWN", not "at least one UNKNOWN ever".
+            unknown_after_verify = d.get("state") == "unknown"
         if k in ("stop", "halt") and d.get("message"):
             last_halt = d["message"]
+            # A button-transition stuck halt ("X did not dismiss/open/close") whose LAST tap
+            # verified OK and was then followed only by UNKNOWN frames is a FALSE halt: the
+            # action worked and we simply could not classify the screen it produced. The
+            # existing near-miss check (below) catches this only when the destination is a
+            # *marginal* miss (a known screen, new face); this catches the other case -- a
+            # genuinely un-anchored destination (all near-misses far away), which is exactly
+            # the "Opponent Still Choosing..." halt -- where the near-miss line stays silent.
+            if last_tap_verified and unknown_after_verify and _is_stuck_halt(last_halt):
+                verified_then_halt = (
+                    f"the last action before the halt ('{last_tap_what}') recorded verify_ok "
+                    f"({last_tap_verified}) -- its OWN change-check PASSED, so the tap WORKED. "
+                    f"The halt then came from being unable to NAME the screen it produced "
+                    f"(UNKNOWN), not from a stuck '{last_tap_what}'. Treat as a classification "
+                    f"miss on the DESTINATION: capture that screen's anchor (hop capture "
+                    f"--from-file), don't chase a missed tap.")
         if k == "unknown_screen" and d.get("near_misses"):
             # the anchor an unknown screen came CLOSEST to: a near-miss below its
             # threshold usually means "known screen, new visual face" -- the single
@@ -293,10 +605,46 @@ def summarize_journal(journal_text: str) -> str:
             targets = d.get("target_classes") or []
             criteria = (f"targets={targets or 'ANY'} require_second={d.get('require_second')} "
                         f"mode={d.get('mode')}")
+            crit_targets = list(targets)
+            crit_avoid = list(d.get("avoid_classes") or [])
+            crit_require_second = bool(d.get("require_second"))
+            crit_seen = True
+        if k == "target_found":
+            tf_opponent = str(d.get("opponent") or "?")
+            tf_second = bool(d.get("second"))
 
     out = [f"- events: {len(events)}"]
     if criteria:
         out.append(f"- criteria (this run): {criteria}")
+    if tf_opponent:
+        # Recompute whether the matchup the hunt STOPPED on actually satisfied the criteria,
+        # so "did it stop on the right thing?" is answered inline -- and a genuine misfire
+        # (a target_found the criteria should have rejected) is flagged loudly instead of
+        # read as correct. The common confusion this answers: an EMPTY class filter means ANY
+        # class is a target, so a stop on a class you didn't tick is correct, not a bug.
+        _norm = _norm_class   # shared with the reject-reason recompute (see _reject_reason)
+        coin = "going 2nd" if tf_second else "going 1st"
+        ok, why = True, []
+        if crit_require_second and not tf_second:
+            ok = False; why.append("require-going-2nd was set but this matchup went 1st")
+        if crit_targets:
+            if _norm(tf_opponent) in {_norm(t) for t in crit_targets}:
+                why.append(f"{tf_opponent} is in the target list")
+            else:
+                ok = False; why.append(f"{tf_opponent} is NOT in the target list {crit_targets}")
+        elif crit_avoid:
+            if _norm(tf_opponent) in {_norm(a) for a in crit_avoid}:
+                ok = False; why.append(f"{tf_opponent} is on the AVOID list")
+            else:
+                why.append(f"{tf_opponent} is not on the avoid list (any other class is a target)")
+        else:
+            why.append("no class filter is set, so ANY class is a target")
+        if crit_require_second and tf_second:
+            why.append("and the going-2nd requirement was met")
+        verdict = ("matches the criteria — working as configured, NOT a misfire" if ok
+                   else "does NOT match the criteria — a real MISFIRE; check evaluate_matchup/accepts")
+        out.append(f"- target found: {tf_opponent} ({coin}) — {verdict}. Why: "
+                   + "; ".join(why) + ".")
     if first_t is not None and prev_t is not None and prev_t > first_t:
         # The headline a "why is it slow?" report needs: where the wall-clock actually
         # went. Humanized waits are journalled (sleeps) and, since the capture-timing
@@ -326,6 +674,42 @@ def summarize_journal(journal_text: str) -> str:
     out.append("- kinds: " + ", ".join(f"{k}={n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
     if classes:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
+    if went_first or went_second or concede_points:
+        # The coin/turn story, so "does it only concede on my turn / wait till turn 2 going
+        # second?" is answered from the report instead of by hand-tracing. Concede is via the
+        # gear menu and fires on EITHER turn; only the pass_turn *beat* is turn-gated (a no-op
+        # when End Turn is greyed on the opponent's turn). A no-op End Turn going second is
+        # therefore expected, not a stuck tap, and the concede still follows it.
+        bits = [f"coin: {went_second} went 2nd / {went_first} went 1st"]
+        if concede_points:
+            bits.append("concede points " + ", ".join(
+                f"{p}×{n}" for p, n in sorted(concede_points.items(), key=lambda kv: -kv[1]))
+                + " (random, independent of the coin)")
+        if pass_turn_taps:
+            bits.append(f"End Turn beats {pass_turn_taps}, of which {pass_turn_noops} no-op'd "
+                        "(End Turn did nothing -- typically greyed because it was not our turn; "
+                        "benign, and the concede that follows is NOT turn-gated)")
+        out.append("- coin/turn: " + "; ".join(bits))
+    if reject_reasons or reject_misfires:
+        # Why the conceded games were conceded, recomputed against the criteria -- the mirror of
+        # the target_found "did it stop on the right thing?" line, for the far commoner run that
+        # only ever concedes. This is the line that answers "were these the right concedes, or is
+        # the class read / require_second logic broken?" directly, instead of leaving the reader to
+        # cross the coin split against require_second by hand (the reasoning THIS report needed).
+        # A misfire -- a reject the criteria say to KEEP -- is flagged as loudly as a target_found
+        # misfire, since it means the tool conceded a matchup it was told to stop on.
+        total = sum(reject_reasons.values()) + len(reject_misfires)
+        parts = [f"{n}× {_REJECT_LABELS.get(r, r)}"
+                 for r, n in sorted(reject_reasons.items(), key=lambda kv: -kv[1])]
+        if reject_misfires:
+            out.append(
+                f"- rejects vs criteria: {total} conceded, but MISFIRED on {len(reject_misfires)} "
+                f"({'; '.join(reject_misfires)}) -- the criteria say to KEEP these, so this is a "
+                "real MISFIRE; check evaluate_matchup/accepts. Correct rejects: "
+                + ("; ".join(parts) if parts else "none") + ".")
+        else:
+            out.append(f"- rejects vs criteria: {total} conceded, all correct per the criteria -- "
+                       + "; ".join(parts) + ".")
     if reread_recovered or reread_failed or unreadable_first:
         # The whiff-then-recover story. A first-read miss that a re-read resolves is
         # normal perception fallibility, NOT a fault -- say so, so a recovered run
@@ -384,8 +768,50 @@ def summarize_journal(journal_text: str) -> str:
                 f"{a}->{b} {seconds:.1f}s" for seconds, a, b in biggest_gaps))
     if closest:
         out.append(f"- closest known screen (unknown near-miss): {closest}")
+    if last_halt and "unknown screen" in last_halt and unknown_run_len:
+        # Where in the flow the halting unknown struck. The near-miss line says which anchor
+        # it came closest to (often meaningless for a genuinely novel screen); this says which
+        # KNOWN screen preceded it, which is what actually locates the gap.
+        ctx = (f"the halting UNKNOWN first appeared after "
+               f"{state_before_unknown_run or 'an unnamed screen'} and persisted "
+               f"{unknown_run_len} look(s) before failing closed")
+        if state_before_unknown_run == "queue":
+            ctx += ("; an UNKNOWN that won't settle right after QUEUE is the match-start "
+                    "transition -- the VS 'match found' splash, or the board fading in. Some "
+                    "clients show a distinct VS splash (the Pixel 7a does), others fade "
+                    "queue->black->mulligan. If yours shows one, capture a vs_splash anchor "
+                    "from the saved frame: `hop capture --from-file <that PNG> --state "
+                    "vs_splash --glyph xf,yf,wf,hf` (aim the glyph at the red 'VS'). The engine "
+                    "already has the vs_splash wait-branch; it only needs the anchor.")
+        out.append(f"- unknown-halt context: {ctx}")
     if false_halt_note:
         out.append(f"- likely FALSE halt: {false_halt_note}")
+    if verified_then_halt:
+        out.append(f"- likely FALSE halt (verified-then-stuck): {verified_then_halt}")
+    mulligan_read_note = _diagnose_mulligan_read_halt(last_halt)
+    if mulligan_read_note:
+        # Name a "could not read mulligan" halt's cause (class blank vs garbled vs card
+        # miscount) inline, so it is self-diagnosing instead of a raw message to decode.
+        out.append(f"- likely cause: {mulligan_read_note}")
+    halt_guidance = _classify_halt(last_halt)
+    if halt_guidance:
+        # Name the terminal halt as a DELIBERATE fail-closed stop (not a malfunction) and say what
+        # to do -- the single line that answers "is this a bug?" for the whole guard family, so a
+        # reader doesn't have to know the engine to tell a designed stop from a crash. When the
+        # halt followed a run of the same screen (deck_select polled N times, queue polled N
+        # times), include that bounded-wait shape: a designed guard polls its budget then stops,
+        # where a crash bails mid-action, so "looked N×, then failed closed" is itself the tell.
+        prefix = "- halt is a DELIBERATE fail-closed stop, not a malfunction: "
+        if terminal_state and terminal_state_run >= 2:
+            prefix += (f"hop looked at '{terminal_state}' {terminal_state_run}× (a bounded wait) "
+                       "then failed closed -- ")
+        out.append(prefix + halt_guidance)
+    if last_halt and len(state_trail) >= 2:
+        # The screens the run passed through just before the halt. This is what a truncated
+        # journal tail hides: in this report it reads "... -> queue -> error_dialog ->
+        # deck_select", which names the transient error dialog as the thing that dropped hop
+        # to the deck list (the deliberate DECK_SELECT halt) -- no journal archaeology needed.
+        out.append("- state trail into the halt: " + " -> ".join(state_trail[-6:]))
     if last_halt:
         out.append(f"- ended: {last_halt}")
     return "\n".join(out)
@@ -408,6 +834,59 @@ def _read(path: Path, limit_bytes: int = 512 * 1024) -> str:
         return data.decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _ocr_unknown_frames(unknowns_dir: Path, names: list[str], *,
+                        max_frames: int = 3, max_chars: int = 260) -> dict[str, str]:
+    """Best-effort OCR of the newest unrecognised-screen frames. Returns ``{name: text}``.
+
+    The one fact that actually NAMES an unknown screen -- a banner reading "Opponent Still
+    Choosing...", "You are currently offline", "There was an error starting your game" --
+    lives in the frame's pixels, invisible in a report that lists only the filename. Reading
+    it here (tesseract is already a hop dependency) puts that banner in front of the diagnosis
+    instead of behind a "go open the PNG" step: the single highest-value line for an
+    unrecognised-screen halt, because it tells you which anchor to build.
+
+    Only the newest ``max_frames`` (the ones nearest the failure), truncated, so this never
+    bloats the report or the runtime. Guarded end to end -- no OCR engine, an unreadable
+    frame, or a decode error simply yields no text for that file, never a broken report.
+    """
+    try:  # optional deps; a report must build without them
+        from io import BytesIO
+
+        import numpy as np
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return {}
+
+    def _read_text(im, cfg=""):
+        return " ".join(pytesseract.image_to_string(im, config=cfg).split())
+
+    out: dict[str, str] = {}
+    for name in list(names)[-max_frames:]:
+        try:
+            png = (Path(unknowns_dir) / name).read_bytes()
+            img = Image.open(BytesIO(png)).convert("L")
+            # The top banner is what NAMES most screens ("Opponent Still Choosing...", "You
+            # are currently offline", "There was an error starting your game"), but it is
+            # ornate glowing text a plain full-frame scan misses. Isolate the bright pixels
+            # in the top band and read them as one block -- that recovers the banner; then a
+            # full-frame pass adds any other identifying text (card names, portraits, dialog
+            # bodies). Banner first so it leads the (truncated) line.
+            w, h = img.size
+            band = np.asarray(img.crop((0, 0, w, int(h * 0.25))))
+            banner = Image.fromarray(np.where(band > 180, 255, 0).astype("uint8"))
+            banner_text = _read_text(banner, "--psm 6")
+            body_text = _read_text(img)
+            text = banner_text
+            if body_text and body_text != banner_text:
+                text = (banner_text + " | " + body_text).strip(" |")
+            if text:
+                out[name] = text[:max_chars] + ("…" if len(text) > max_chars else "")
+        except Exception:
+            continue
+    return out
 
 
 def latest_run_dir(runs_root: Path) -> Path | None:
@@ -468,14 +947,48 @@ def format_status(status: dict) -> str:
     return "\n".join(lines)
 
 
-def tooling_summary(*, which=None, env=None) -> str:
+def perception_env(*, probe=None) -> list[str]:
+    """Whether the numpy-accelerated perception path is live -- the single biggest
+    determinant of how long a screen classify takes, and until now absent from the report.
+
+    Classification is a sliding-window NCC over ~19 screen anchors on a full-resolution
+    capture. WITH numpy it is one vectorized FFT + summed-area pass (~45 ms/frame here);
+    WITHOUT it, classify falls back to a pure-Python per-window loop that is ~80x slower --
+    multiple seconds per look, which makes every closed-loop state check the dominant cost
+    of a run. That is exactly the shape of an "each cycle is unacceptably slow" report, and
+    the two cases have opposite fixes (optimize the vectorized path vs. `pip install numpy`),
+    so a report that never says which path is live leaves the root cause to guesswork.
+    Pillow decodes the screencap PNG at all; without it perception cannot run.
+
+    Pure import probes (no subprocess, cannot hang); ``probe`` is injectable for tests.
+    """
+    def _default_probe(mod):
+        import importlib
+        try:
+            return getattr(importlib.import_module(mod), "__version__", "present")
+        except Exception:
+            return None
+    probe = probe or _default_probe
+    npv, pilv = probe("numpy"), probe("PIL")
+    lines = []
+    if npv:
+        lines.append(f"- numpy: {npv}  (vectorized NCC active — ~45 ms/classify)")
+    else:
+        lines.append("- numpy: NOT INSTALLED  <-- classify runs the ~80x-slower pure-Python "
+                     "per-window loop (seconds/look); `pip install numpy` is the likely fix "
+                     "for a slow run")
+    lines.append(f"- Pillow: {pilv or 'NOT INSTALLED — screencaps cannot decode; perception is dead'}")
+    return lines
+
+
+def tooling_summary(*, which=None, env=None, perception=None) -> str:
     """The external tools hop shells out to, and whether they resolve on PATH.
 
     A .app launched from Finder gets a minimal PATH; when ``adb`` or ``tesseract`` fall
     off it, Start Search dies with "No such file: 'adb'" and OCR can't read the class.
     Surfacing the resolved paths + PATH makes that root cause obvious from the report
     rather than something to infer. Pure lookups (no subprocess), so it can't hang;
-    ``which``/``env`` are injectable for tests.
+    ``which``/``env``/``perception`` are injectable for tests.
     """
     import shutil
     import sys
@@ -484,51 +997,70 @@ def tooling_summary(*, which=None, env=None) -> str:
     lines = [f"- python: {sys.executable}"]
     for tool in ("adb", "tesseract"):
         lines.append(f"- {tool} on PATH: {which(tool) or 'NOT FOUND'}")
+    # The perception accelerator governs classify cost far more than any PATH lookup does.
+    lines.extend(perception_env() if perception is None else perception)
     lines.append(f"- PATH: {environ.get('PATH', '')}")
     return "\n".join(lines)
 
 
-def _fit_line_budget(description: str, sections: list[Section], *, meta: dict,
-                     max_lines: int | None = None) -> str:
-    """Assemble, and if the report exceeds ``max_lines``, drop the oldest lines of the
+def _fit_report_budget(description: str, sections: list[Section], *, meta: dict,
+                       max_chars: int | None = None) -> str:
+    """Assemble, and if the report exceeds ``max_chars``, drop the OLDEST lines of the
     biggest log sections (see :data:`_TRIMMABLE_TITLES`) until it fits.
 
-    Oldest-first because the newest log/journal lines are the ones nearest the failure.
-    Everything else (the self-improve prompt, description, live status, config) is
-    preserved. Idempotent for a report already under budget. ``max_lines`` defaults to
-    :data:`MAX_REPORT_LINES`, resolved at call time so it stays overridable.
+    Budgeted in CHARACTERS, because that is what actually truncates a report pasted into
+    Claude Code (a ~50k-character message cap) -- and an external truncation lands
+    mid-journal, cutting the NEWEST lines, which are the ones nearest the failure. So we
+    trim ourselves, oldest-first: the self-improve prompt, description, live status, config
+    and run summary are preserved, and the run journal keeps its tail. A hard-truncation
+    backstop guarantees we never hand back something over budget even if the fixed sections
+    alone are large (it eats the app-log tail, which is emitted last, never the journal).
+    ``max_chars`` defaults to :data:`MAX_REPORT_CHARS`, resolved at call time so it stays
+    overridable. Idempotent for a report already under budget.
     """
-    if max_lines is None:
-        max_lines = MAX_REPORT_LINES
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
     report = assemble(description, sections, meta=meta)
-    over = len(report.splitlines()) - max_lines
-    if over <= 0:
+    if len(report) <= max_chars:
         return report
 
     sections = list(sections)  # don't mutate the caller's list
     for title in _TRIMMABLE_TITLES:
-        if over <= 0:
+        report = assemble(description, sections, meta=meta)
+        if len(report) <= max_chars:
             break
         for i, sec in enumerate(sections):
             if sec.title != title:
                 continue
             body_lines = sec.body.splitlines()
-            # +1: the omission note we add back is itself a line, so to shed `over`
-            # net lines we must drop `over + 1` of the body's oldest lines.
-            drop = min(over + 1, max(0, len(body_lines) - 10))  # keep the last few lines
+            note = f"... (oldest lines dropped to fit the {max_chars:,}-character report cap) ..."
+            # Shed enough oldest lines (their chars, +1 each for the newline) to get under
+            # budget, plus room for the note we add back; keep the last 10 (nearest failure).
+            over = len(report) - max_chars + len(note) + 1
+            shed = drop = 0
+            max_drop = max(0, len(body_lines) - 10)
+            while drop < max_drop and shed < over:
+                shed += len(body_lines[drop]) + 1
+                drop += 1
             if drop > 0:
-                note = (f"... ({drop} more oldest lines dropped to fit the "
-                        f"{max_lines:,}-line report cap) ...")
                 sections[i] = Section(sec.title, note + "\n" + "\n".join(body_lines[drop:]),
                                       fenced=sec.fenced, lang=sec.lang)
-                over -= drop
             break
-    return assemble(description, sections, meta=meta)
+
+    report = assemble(description, sections, meta=meta)
+    if len(report) > max_chars:
+        # Backstop: the fixed sections alone still overflow (a huge config, say). Hard-cut
+        # so the pasted report can NEVER be silently truncated mid-line by the 50k limit.
+        # This eats the END of the document -- the app log / unknowns, emitted after the
+        # journal -- so the summary and the journal tail (the diagnosis) always survive.
+        note = "\n\n... (report hard-truncated to the character cap) ...\n"
+        report = report[: max(0, max_chars - len(note))] + note
+    return report
 
 
 def collect(description: str, paths: ReportPaths, *, version: str,
             journal_tail_lines: int = 500, log_tail_lines: int = 2000,
-            clock=time.time, device_probe=None, status_probe=None) -> str:
+            clock=time.time, device_probe=None, status_probe=None, ocr_probe=None) -> str:
     """Gather every artifact and assemble the report. Best-effort: a missing or
     unreadable file drops its section rather than failing the whole report.
 
@@ -537,7 +1069,12 @@ def collect(description: str, paths: ReportPaths, *, version: str,
     module importing the transport, and so tests can run without a phone.
     ``status_probe`` is an optional callable returning a live engine-status string (see
     :func:`format_status`); the dashboard supplies it since it holds the controller.
+    ``ocr_probe(unknowns_dir, names) -> {name: text}`` reads the banner text off the newest
+    unrecognised-screen frames (defaults to :func:`_ocr_unknown_frames`); injectable so
+    tests need no tesseract and no real PNGs.
     """
+    if ocr_probe is None:
+        ocr_probe = _ocr_unknown_frames
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(clock()))
     meta = {"version": version, "when": when,
             "platform": f"{platform.system()} {platform.release()} ({platform.machine()})"}
@@ -583,13 +1120,25 @@ def collect(description: str, paths: ReportPaths, *, version: str,
     except OSError:
         unknown_files = []
     if unknown_files:
+        try:  # OCR is diagnostic sugar; never let it break the report
+            ocr = ocr_probe(paths.unknowns_dir, unknown_files) or {}
+        except Exception:
+            ocr = {}
+        lines = []
+        for n in unknown_files:
+            lines.append(f"- {n}")
+            if ocr.get(n):
+                # The banner text that NAMES the screen -- e.g. "Opponent Still Choosing..."
+                # -- so the anchor to build is obvious without opening the PNG.
+                lines.append(f'    reads: "{ocr[n]}"')
         sections.append(Section(
             "Unrecognized screens (need anchors)",
             "The hunt hit screens no anchor covers. These frames are kept for building "
             "anchors (`hop capture --from-file`); their existence means something is "
-            "unhandled:\n\n" + "\n".join(f"- {n}" for n in unknown_files)))
+            "unhandled. Any OCR'd banner text is shown to name the screen:\n\n"
+            + "\n".join(lines)))
 
-    return _fit_line_budget(description, sections, meta=meta)
+    return _fit_report_budget(description, sections, meta=meta)
 
 
 def copy_to_clipboard(markdown: str, *, runner=None) -> bool:

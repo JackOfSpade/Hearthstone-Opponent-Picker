@@ -42,6 +42,22 @@ def test_stop_during_construction_is_applied_after_the_engine_exists():
     assert engine.stops == 1   # the deferred stop was applied, not dropped
 
 
+def test_status_shows_the_day_distribution_while_idle(tmp_path):
+    """An idle controller (app just opened, no Search yet) must still report the day-scoped
+    observed distribution -- that is what lets the dashboard chart show the day's games on
+    open instead of only after Start. The per-run stats ('games', ...) stay absent while
+    idle, which is exactly why the frontend must draw the chart OUTSIDE its games guard."""
+    from hop.observed import ObservedDistribution
+
+    store = ObservedDistribution(tmp_path / "obs.json", date="2026-07-10",
+                                 counts={"Mage": 3, "Paladin": 2})
+    c = EngineController(lambda o: _FakeEngine(), observed=store)
+    st = c.status()                                   # never started
+    assert st["running"] is False
+    assert st["class_distribution"] == {"Mage": 3, "Paladin": 2}
+    assert "games" not in st                          # per-run stats absent while idle
+
+
 def test_stop_after_the_engine_exists_calls_request_stop():
     engine = _FakeEngine()
     c = EngineController(lambda overrides: engine)

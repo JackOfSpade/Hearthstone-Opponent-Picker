@@ -3,7 +3,6 @@
 Endpoints:
 * ``GET  /``            - the single-page dashboard (HTML below)
 * ``GET  /status``      - JSON status from the EngineController
-* ``GET  /screen.png``  - latest phone screencap (throttled by the client)
 * ``POST /start``       - start the hunt (optional JSON criteria overrides)
 * ``POST /stop``        - request a clean stop
 * ``GET  /criteria``    - current criteria + risk summary (for the risk meter)
@@ -72,12 +71,6 @@ class DashboardServer:
                     self._json(200, server.controller.status())
                 elif self.path.startswith("/criteria"):
                     self._json(200, server._criteria_summary())
-                elif self.path.startswith("/screen.png"):
-                    png = server.controller.latest_png()
-                    if png:
-                        self._send(200, png, "image/png")
-                    else:
-                        self._send(503, b"no frame", "text/plain")
                 else:
                     self._send(404, b"not found", "text/plain")
 
@@ -222,7 +215,6 @@ _INDEX_HTML = """<!doctype html>
   .stat{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;border-bottom:1px solid #23272f}
   .stat b{font-weight:600}
   .risk-high{color:var(--bad)} .risk-elevated{color:var(--warn)} .risk-moderate{color:var(--ok)}
-  img#screen{width:100%;border-radius:8px;background:#000;min-height:120px;object-fit:contain}
   .mut{color:var(--mut);font-size:12px}
   #banner{display:none;padding:12px 16px;background:var(--ok);color:#04231a;font-weight:700;border-radius:10px;margin-bottom:12px}
   #banner.err{background:var(--bad);color:#2a0508}
@@ -261,7 +253,7 @@ _INDEX_HTML = """<!doctype html>
     <div class="card">
       <h2>Observed class distribution</h2>
       <svg id="dist" viewBox="0 0 320 200" width="100%" role="img" aria-label="opponent class distribution"></svg>
-      <div class="mut" id="disttot">no games yet this session</div>
+      <div class="mut" id="disttot">no games yet today</div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2>Session</h2>
@@ -356,6 +348,12 @@ async function poll(){
     }else{
       b.className=''; b.style.display='none';
     }
+    // The observed class distribution is day-scoped and persists across runs (see
+    // runner.observed_distribution), so status always carries it -- render it on EVERY
+    // poll, including on app open before any Search has started. The fields below are
+    // per-run stats that only exist once a run has begun (games, budget, human_state),
+    // so they stay behind the guard; the chart must not.
+    drawDistribution(s.class_distribution||{});
     if(s.games!==undefined){
       document.getElementById('games').textContent=s.games;
       document.getElementById('concedes').textContent=s.concedes;
@@ -363,7 +361,6 @@ async function poll(){
       document.getElementById('coin').textContent=(s.going_first||0)+' / '+(s.going_second||0);
       document.getElementById('stopreason').textContent=s.stop_reason||(s.last_error||'–');
       document.getElementById('lastopp').textContent=s.last_opponent||'–';
-      drawDistribution(s.class_distribution||{});
       if(s.budget){
         document.getElementById('ratio').textContent=s.budget.committing_ratio;
         document.getElementById('actions').textContent=s.budget.actions_run;
@@ -378,22 +375,33 @@ async function poll(){
     }
   }catch(e){ document.getElementById('conn').textContent='offline'; }
 }
+// Hearthstone hero identity colours -- each class's own card-frame colour (per
+// hearthstone.wiki.gg/wiki/Class), NOT the WoW class palette (they differ: Paladin is
+// yellow not pink, Rogue is black/stealth not yellow, Druid brown, Hunter/Demon Hunter
+// greens). 'Black' Rogue and the 'almost-black blue' Death Knight are lifted so they read
+// on the dark card. Keys are the DISPLAY_NAMES the engine emits; each bar AND its class
+// label draw in the class colour so the matchup mix reads at a glance; an unrecognised
+// label ("?") falls back to the neutral accent.
+const CLASS_COLORS={
+  "Warrior":"#D33A2C","Paladin":"#F4C531","Druid":"#C77C33","Hunter":"#4CAF50",
+  "Demon Hunter":"#8BC53F","Mage":"#3FC7EB","Shaman":"#3B7DE0","Death Knight":"#8FCADD",
+  "Priest":"#E9EBEE","Warlock":"#A15DD0","Rogue":"#8A8F99"};
 // Dependency-free horizontal bar chart of the opponent class distribution, built from
 // SVG <rect>/<text> so it needs no charting library and no CDN (the server is local).
 function drawDistribution(dist){
   const svg=document.getElementById('dist');
   const entries=Object.entries(dist).sort((a,b)=>b[1]-a[1]);
   const total=entries.reduce((n,[,v])=>n+v,0);
-  document.getElementById('disttot').textContent=total?(total+' game'+(total==1?'':'s')+' this session'):'no games yet this session';
+  document.getElementById('disttot').textContent=total?(total+' game'+(total==1?'':'s')+' today'):'no games yet today';
   const W=320, rowH=22, gap=6, labelW=96, x0=labelW+6, maxW=W-x0-34;
   const max=Math.max(1,...entries.map(([,v])=>v));
   const H=Math.max(40, entries.length*(rowH+gap));
   svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
   let out='';
   entries.forEach(([cls,v],i)=>{
-    const y=i*(rowH+gap), w=Math.max(2,maxW*v/max);
-    out+=`<text x="0" y="${y+rowH*0.7}" fill="#9aa0ad" font-size="12">${cls}</text>`;
-    out+=`<rect x="${x0}" y="${y}" width="${w}" height="${rowH}" rx="4" fill="#4da3ff"/>`;
+    const y=i*(rowH+gap), w=Math.max(2,maxW*v/max), col=CLASS_COLORS[cls]||'#4da3ff';
+    out+=`<text x="0" y="${y+rowH*0.7}" fill="${col}" font-size="12">${cls}</text>`;
+    out+=`<rect x="${x0}" y="${y}" width="${w}" height="${rowH}" rx="4" fill="${col}"/>`;
     out+=`<text x="${x0+w+5}" y="${y+rowH*0.7}" fill="#e6e8ee" font-size="12">${v}</text>`;
   });
   svg.innerHTML=out || '<text x="0" y="20" fill="#9aa0ad" font-size="12">no games yet</text>';
@@ -409,6 +417,7 @@ document.getElementById('bugBtn').onclick=async()=>{
   btn.disabled=false;
 };
 loadCriteria();
+poll();                 // render the day's distribution + status immediately on open, not after the first 1 s tick
 setInterval(poll,1000);
 </script>
 </body></html>

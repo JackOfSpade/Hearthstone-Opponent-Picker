@@ -62,7 +62,7 @@ class StopRequested(Exception):
 #: dashboard shows what the hunt is doing right now instead of a bare "running".
 _PHASE_LABELS = {
     ScreenState.MENU: "at main menu",
-    ScreenState.DECK_SELECT: "at deck select",
+    ScreenState.DECK_SELECT: "at the deck list — re-select your deck to resume",
     ScreenState.PLAY_SCREEN: "at Play — queuing",
     ScreenState.QUEUE: "in queue — waiting for a match",
     ScreenState.ERROR_DIALOG: "clearing an error dialog",
@@ -173,6 +173,9 @@ class Engine:
         self._in_game_polls = 0
         #: consecutive top-level dispatches that saw the matchmaking queue
         self._queue_polls = 0
+        #: consecutive top-level dispatches that saw the deck LIST (waiting, never tapping,
+        #: for the user to re-select their deck after an error dropped us there)
+        self._deck_select_polls = 0
         #: did THIS hunt queue the game currently in progress? Only a game we started
         #: may be conceded from the board - a board we found ourselves in is the user's.
         self._own_game = False
@@ -537,7 +540,8 @@ class Engine:
         return satisfied, cls, frame
 
     def _wait_until_screen_leaves(self, state: ScreenState, *, where: str, stuck: str,
-                                  arrivals=()) -> Classification:
+                                  arrivals=(), attempts: int | None = None,
+                                  timeout_s: float | None = None) -> Classification:
         """Wait until the screen *positively* shows something other than ``state``.
 
         **UNKNOWN is never proof that we left.** A frame we could not read is a frame
@@ -555,11 +559,18 @@ class Engine:
         winner, and during a cross-fade it can out-score the arriving screen -- omitting
         it would let a scoped look call "left" one poll early. Still result-identical to
         an unscoped wait (any un-listed arrival just full-scans on its frame).
+
+        ``attempts``/``timeout_s`` override the generic ``wait_until`` budget for the rare
+        wait whose semantics are not a button transition. The mulligan-confirm wait uses
+        this: it must also outlast the OPPONENT's mulligan (an anchorless "Opponent Still
+        Choosing..." banner that reads UNKNOWN), for which the ~20 s transition budget is
+        far too short. Since UNKNOWN never counts as "left" and this never taps, a larger
+        budget only postpones failing closed -- it cannot turn a wait into a misdirected tap.
         """
         expected = frozenset({state}) | frozenset(arrivals)
         ok, cls, frame = self._wait_until(
             lambda c, _f: c.state not in (state, ScreenState.UNKNOWN), what=where,
-            expected=expected)
+            expected=expected, attempts=attempts, timeout_s=timeout_s)
         if ok:
             return cls
         if cls.state == ScreenState.UNKNOWN:
@@ -586,6 +597,7 @@ class Engine:
                 c = self.cfg.criteria
                 self.debug.record("run_criteria",
                                   target_classes=[hc.name for hc in c.target_classes],
+                                  avoid_classes=[hc.name for hc in c.avoid_classes],
                                   require_second=c.require_second, mode=c.mode)
             if not self.classifier.has_templates:
                 raise Halt("no screen templates loaded; run `hop capture` first (refusing to run blind)")
@@ -633,6 +645,11 @@ class Engine:
             self._in_game_polls = 0
         if st != ScreenState.QUEUE:
             self._queue_polls = 0
+        if st != ScreenState.DECK_SELECT:
+            # left the deck list (the user re-selected, or we never landed there): the pause
+            # counter resets so the next drop-back starts a fresh wait budget and the hunt
+            # resumes with no memory of the interruption.
+            self._deck_select_polls = 0
         if st == ScreenState.ERROR_DIALOG:
             # "There was an error starting your game." - a transient network blip.
             # Dismiss and let the loop requeue; no long backoff is warranted, the
@@ -649,14 +666,33 @@ class Engine:
             self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
                             "reconnecting_wait")
         elif st == ScreenState.DECK_SELECT:
-            # Dropped back to the deck list (e.g. after an error). hop does NOT reopen a
-            # deck: it cannot reliably tell which deck was in play (the grid names render
-            # too soft/stylised to OCR, and any other pick could open the WRONG deck or
-            # an incomplete one), and re-selecting a *different* deck than the user chose
-            # is worse than stopping. Pause and let the user re-select. See ScreenState.
-            raise Halt("dropped back to the deck list; hop won't reopen a deck (it can't "
-                       "tell which one you were playing). Re-select your deck and restart "
-                       "the hunt from its Play screen.")
+            # Dropped back to the deck LIST (Hearthstone lands here after dismissing an
+            # "error starting your game", among others). hop still does NOT reopen a deck: it
+            # cannot reliably tell which deck was in play (the grid names render too
+            # soft/stylised to OCR, and any other pick could open the WRONG deck or an
+            # incomplete one), and re-selecting a *different* deck than the user chose is
+            # worse than stopping -- so it NEVER taps the list. But rather than hard-HALT the
+            # whole hunt on a transient blip (which forced a full restart), it PAUSES: alert
+            # once, then wait -- re-looking, never tapping -- and let the loop resume by
+            # itself the moment the user is back on a deck's Play screen (the reset above
+            # clears this counter and the play branch queues again, stats intact). Bounded
+            # like the queue wait: if nobody re-selects within the budget, fail closed
+            # exactly as before, so a walked-away session still stops cleanly.
+            self._deck_select_polls += 1
+            if self._deck_select_polls > max(1, self.cfg.vision.deck_select_wait_attempts):
+                raise Halt("dropped back to the deck list and nobody re-selected a deck; hop "
+                           "won't reopen one (it can't tell which you were playing). Re-select "
+                           "your deck and restart the hunt from its Play screen.")
+            if self._deck_select_polls == 1:
+                # Alert ONCE (a silent Mac notification, per the alert design -- only a target
+                # match makes a sound); the dashboard phase also reads "re-select your deck".
+                if self.debug:
+                    self.debug.record("deck_select_pause")
+                if self.alerts:
+                    self.alerts.info("hop dropped back to the deck list (a game error). "
+                                     "Re-select your deck to resume the hunt.")
+            self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
+                            "deck_select_wait", poll=self._deck_select_polls)
         elif st == ScreenState.INCOMPLETE_DECK:
             # The "Complete deck automatically?" dialog (hop started on it, say). NEVER
             # auto-complete: decline it (No, never Yes). That returns to the deck list,
@@ -862,26 +898,38 @@ class Engine:
 
         decision = evaluate_matchup(read, self.cfg)
         if decision == "unusable":
-            # a single re-read before halting (perception fallibility, one correction)
-            self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
-                            "mulligan_reread")
-            frame2 = self._capture()
-            read = self._read_mulligan(frame2, self.layout, self.reader, self.cfg.vision)
-            decision = evaluate_matchup(read, self.cfg)
-            if self.debug:
-                # Journal the re-read's own result. Only the first read was logged, so a
-                # frame the re-read *recovered* (the common case: first OCR whiffs to
-                # opponent "?"/conf 0.0, the re-read resolves the real class) left the
-                # report showing pure failure -- "opponents seen: ?×1" -- while the engine
-                # had quietly gone on to concede the correct matchup. `reread=True` lets
-                # the summary tell "whiffed then recovered" from a clean first read. Pure
-                # observability: no observe_confidence (that would perturb HumanState and
-                # the timing stream), no control-flow change.
-                self.debug.record(
-                    "mulligan_read", reread=True,
-                    opponent=DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?",
-                    second=read.we_go_second, cards=read.num_cards,
-                    conf=round(read.class_confidence, 3), method=read.method)
+            # The classifier has already confirmed the mulligan is up, so a blank/garbled
+            # read is a transient -- the opponent's nameplate still drawing in, or the
+            # "Opponent Still Choosing..." banner sitting over the class region (class='')
+            # while our cards count fine -- not a lost screen. Re-read a few times before
+            # failing closed; a single re-read alone halted a healthy hunt on one
+            # slow-rendering nameplate. The extra RNG draws and looks happen ONLY on this
+            # recover-or-halt path, never on a clean first read.
+            for attempt in range(1, max(1, self.cfg.vision.mulligan_read_attempts)):
+                self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
+                                "mulligan_reread")
+                frame = self._capture()
+                read = self._read_mulligan(frame, self.layout, self.reader, self.cfg.vision)
+                decision = evaluate_matchup(read, self.cfg)
+                if self.debug:
+                    # Journal each re-read's own result. Only the first read was logged, so a
+                    # frame a re-read *recovered* (the common case: first OCR whiffs to
+                    # opponent "?"/conf 0.0, a re-read resolves the real class) left the report
+                    # showing pure failure -- "opponents seen: ?×1" -- while the engine had
+                    # quietly gone on to concede the correct matchup. `reread`/`attempt` let
+                    # the summary tell "whiffed then recovered" (and how patient it had to be)
+                    # from a clean first read, and `class_raw` distinguishes a blank class
+                    # (still-choosing) from a garbled one. Pure observability: no
+                    # observe_confidence (that would perturb HumanState and the timing
+                    # stream), no control-flow change.
+                    self.debug.record(
+                        "mulligan_read", reread=True, attempt=attempt,
+                        opponent=DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?",
+                        second=read.we_go_second, cards=read.num_cards,
+                        conf=round(read.class_confidence, 3), method=read.method,
+                        class_raw=read.class_raw)
+                if decision != "unusable":
+                    break
             if decision == "unusable":
                 raise Halt(f"could not read mulligan (class={read.class_raw!r}, cards={read.num_cards})")
 
@@ -959,7 +1007,16 @@ class Engine:
             # the board draws in (in_game); an opponent who concedes in the window lands us
             # on an end banner. mulligan (the from-state) is kept in scope by the helper so
             # a cross-fade where both clear resolves exactly as a full classify would.
-            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT})
+            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT},
+            # ...but the wait must ALSO outlast the opponent's own mulligan. Until they
+            # confirm, this client shows an "Opponent Still Choosing..." banner in place of
+            # our "Starting Hand" anchor -- an anchorless frame that reads UNKNOWN. The
+            # generic transition budget (~20 s) is far shorter than a roping opponent, so it
+            # false-halted here ("Confirm did not dismiss the mulligan") even though Confirm
+            # worked (the tap's own verify_ok fired the frame before). Wait to the mulligan
+            # rope instead; the wait never taps, so the larger budget only defers a Halt.
+            attempts=self.cfg.vision.mulligan_resolve_attempts,
+            timeout_s=self.cfg.vision.mulligan_resolve_timeout_s)
 
     def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
         """Mark one mulligan card for replacement. Returns whether it took.

@@ -197,9 +197,32 @@ class VisionConfig:
     in_game_wait_attempts: int
     #: Polls of the matchmaking queue before declaring it soft-locked.
     queue_wait_attempts: int
+    #: Polls of the deck LIST (waiting for the user to re-select their deck) before failing
+    #: closed. hop lands here after a dismissed "error starting your game" and cannot itself
+    #: reopen a deck (it can't tell which one was in play), so it PAUSES -- alerting and
+    #: waiting, never tapping the list -- and resumes when the user is back on a Play screen.
+    #: Bounded so a walked-away session still stops cleanly rather than polling forever.
+    deck_select_wait_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
     mulligan_card_tap_attempts: int
+    #: The wait for the mulligan to leave after we tap Confirm is NOT a normal button
+    #: transition: it must also absorb the OPPONENT finishing THEIR mulligan. While they
+    #: deliberate, this client swaps the "Starting Hand" banner (our mulligan anchor) for
+    #: an "Opponent Still Choosing..." banner that carries no anchor -> the frame classifies
+    #: UNKNOWN. The generic ``screen_wait_timeout_s`` (a ~20 s transition budget) is far too
+    #: short for that, so an opponent who ropes their mulligan tripped a FALSE "Confirm did
+    #: not dismiss the mulligan" halt even though the Confirm registered (its own verify_ok
+    #: fired). These size that one wait to the mulligan rope instead. The wait NEVER taps, so
+    #: a generous budget only delays failing closed -- it can never cause a misdirected tap.
+    mulligan_resolve_timeout_s: float
+    mulligan_resolve_attempts: int
+    #: Total tries to READ the opponent's class off the mulligan before failing closed.
+    #: The classifier has already confirmed the mulligan is up; a blank class is the same
+    #: transient the resolve wait covers -- the nameplate still drawing in, or an "Opponent
+    #: Still Choosing..." banner over it -- so we re-read a few times, not just once, before
+    #: halting. (>=1; 1 restores the old single-read-no-retry behaviour.)
+    mulligan_read_attempts: int
     glow_green_bias: int
     glow_min_green: int
     glow_col_min_frac: float
@@ -348,3 +371,36 @@ def save_criteria(
 
     user_path.write_text(text)
     return user_path
+
+
+def clear_target_classes(path: str | Path | None = None) -> None:
+    """Erase any persisted target classes so the app opens with a clean slate.
+
+    Target classes are treated as *session-only*: the control app clears them on launch
+    so every start has nothing selected and you re-pick each time. They still persist
+    *within* a session (the running hunt and a bug report see the picks you make), but a
+    restart does not carry them over. ``require_second``, ``avoid_classes`` and every
+    config comment are left untouched -- only the one scalar is rewritten to ``[]``, via
+    :func:`hop.tomledit.upsert_toml_scalar`, so provenance notes survive.
+
+    Best-effort: no config file (targets already default to ``[]``) or an unwritable one
+    just means there is nothing to clear.
+    """
+    from .tomledit import upsert_toml_scalar
+
+    user_path = Path(path) if path else _default_user_path()
+    if not user_path.exists():
+        return
+    try:
+        text = user_path.read_text()
+        new_text = upsert_toml_scalar(text, "criteria", "target_classes", "[]")
+        # Never persist a config we cannot read back. tomledit is line-based, so a
+        # hand-edited *multi-line* target_classes array would be corrupted into invalid
+        # TOML (only its first line is replaced), and this runs automatically on every
+        # app launch -- a corrupted write there would brick every later `load_config`.
+        # If the rewrite doesn't round-trip, skip the disk write; the caller still drops
+        # the picks from the in-memory config, so the clean-slate behavior is preserved.
+        tomllib.loads(new_text)
+        user_path.write_text(new_text)
+    except (OSError, tomllib.TOMLDecodeError):
+        pass

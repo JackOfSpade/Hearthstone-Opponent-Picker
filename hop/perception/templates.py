@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .image import Frame, ncc
+from .image import Frame, ncc, ncc_best_window
 
 
 @dataclass(frozen=True)
@@ -54,13 +54,22 @@ def _scan_best(frame: Frame, template: Template, stride: int = 2) -> Match | Non
     """Best NCC match of ``template`` in its region, ignoring the threshold gate.
 
     None only when the template is larger than its region. ``stride`` trades speed
-    for precision; the region filter already bounds the cost. Uses the numpy path
-    in :func:`hop.perception.image.ncc` when available.
+    for precision; the region filter already bounds the cost.
+
+    The whole sliding window is one vectorized pass (:func:`hop.perception.image.ncc_best_window`,
+    ~86x faster and result-identical) when numpy is present; the per-window loop below is the
+    pure-Python fallback, kept because it is the reference the fast path is validated against
+    and the only path when numpy is unavailable. Both score the identical stride grid with the
+    identical NCC and take the same first-max, so they return the same :class:`Match`.
     """
     rx, ry, rw, rh = template.region.to_px(frame)
     tw, th = template.image.width, template.image.height
     if tw > rw or th > rh:
         return None
+    fast = ncc_best_window(frame, template.image, (rx, ry, rw, rh), stride)
+    if fast is not None:
+        col, row, score = fast
+        return Match(template.name, rx + col + tw // 2, ry + row + th // 2, score)
     best: Match | None = None
     y = ry
     while y + th <= ry + rh:

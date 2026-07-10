@@ -1,10 +1,9 @@
 """EngineController - run the engine in a background thread with shared status.
 
 The dashboard (and any future controller) drives the engine through this small
-interface: :meth:`start`, :meth:`stop`, :meth:`status`, and
-:meth:`latest_png`. The engine's hunt loop is blocking, so it runs on a daemon
-thread; status is aggregated from the live ``HumanState``, limiter counters and
-:class:`~hop.engine.RunStats`.
+interface: :meth:`start`, :meth:`stop`, and :meth:`status`. The engine's hunt loop
+is blocking, so it runs on a daemon thread; status is aggregated from the live
+``HumanState``, limiter counters and :class:`~hop.engine.RunStats`.
 """
 
 from __future__ import annotations
@@ -17,9 +16,20 @@ from .engine import Engine
 
 
 class EngineController:
-    def __init__(self, engine_factory: Callable[[dict], Engine], alerter=None):
+    def __init__(self, engine_factory: Callable[[dict], Engine], alerter=None,
+                 observed=None):
         self.engine_factory = engine_factory
         self.alerter = alerter
+        #: day-scoped observed-class tally that outlives individual runs, so the dashboard
+        #: chart survives an app restart within the same day (see hop.observed). None
+        #: disables persistence (tests, and the headless CLI, which owns no store).
+        self._observed = observed
+        #: the run currently accruing into `_observed`, and how much of its counts we have
+        #: already folded in -- so re-reading the same engine adds only the new delta, and
+        #: a fresh run (a different engine object) starts its accrual from zero.
+        self._accrued_engine: Engine | None = None
+        self._accrued: dict[str, int] = {}
+        self._observed_lock = threading.Lock()
         self._engine: Engine | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -52,6 +62,9 @@ class EngineController:
         with self._lock:
             if self.running:
                 return False
+            # Fold the just-finished run's opponent counts into the day tally before we
+            # drop its engine, so its games are not lost when the next run replaces it.
+            self._accrue_observed()
             # Drop the previous run's finished engine so a restart takes the light
             # status path ("connecting to phone…") during the slow reconnect/enumerate
             # window instead of reporting the OLD run's stats and a stale phase. Safe:
@@ -96,16 +109,54 @@ class EngineController:
         if eng is not None:
             eng.request_stop()
 
-    def latest_png(self) -> bytes | None:
+    # ── observed class distribution (day-scoped, persistent) ──────────────────
+
+    def _accrue_observed(self) -> None:
+        """Fold the live run's opponent counts into the day tally and persist.
+
+        The engine only ever *grows* its per-run ``class_distribution`` (one increment per
+        game), so we add the delta since we last looked -- keyed on the engine object, so a
+        fresh run starts its accrual from zero rather than double-counting the day total.
+        Called on each status tick (the app polls ~1 Hz; games are minutes apart, so writes
+        are rare) and on quit, so a day's progress survives even an unclean exit.
+        """
+        if self._observed is None:
+            return
         eng = self._engine
-        if eng is None:
-            return None
-        try:
-            return eng.adb.screencap_png()
-        except Exception:
-            return None
+        stats = getattr(eng, "stats", None)
+        if stats is None:
+            return
+        with self._observed_lock:
+            if eng is not self._accrued_engine:
+                self._accrued_engine = eng
+                self._accrued = {}
+            changed = False
+            for name, n in dict(stats.class_distribution).items():
+                prev = self._accrued.get(name, 0)
+                if n > prev:
+                    self._observed.counts[str(name)] = (
+                        self._observed.counts.get(str(name), 0) + (n - prev))
+                    self._accrued[name] = n
+                    changed = True
+            if changed:
+                self._observed.write()
+
+    def observed_distribution(self) -> dict:
+        """The class distribution the dashboard charts: the persisted day tally when a
+        store is configured (survives a same-day restart), else the live run's own counts.
+        """
+        if self._observed is not None:
+            return dict(self._observed.counts)
+        stats = getattr(self._engine, "stats", None)
+        return dict(stats.class_distribution) if stats is not None else {}
+
+    def flush_observed(self) -> None:
+        """Persist the current run's counts on the way out (clean quit / Ctrl-C), so the
+        day's tally is not lost when the app closes mid-run."""
+        self._accrue_observed()
 
     def status(self) -> dict:
+        self._accrue_observed()   # keep the day tally current + persisted on each poll
         eng = self._engine
         base = {
             "running": self.running,
@@ -113,6 +164,9 @@ class EngineController:
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_tb,
             "uptime_s": round(time.time() - self._started_at, 1) if self._started_at else 0,
+            # the day-scoped distribution shows even before the first run / while idle, so
+            # the chart carries yesterday-cleared, same-day-restored counts on app open.
+            "class_distribution": self.observed_distribution(),
         }
         if eng is None:
             return base
@@ -133,8 +187,9 @@ class EngineController:
             "concedes_until_target": s.concedes_until_target,
             "last_opponent": s.last_opponent,
             "stop_reason": s.stop_reason,
-            # the observed class distribution + coin split, for the dashboard charts
-            "class_distribution": dict(s.class_distribution),
+            # the observed class distribution (day-scoped; see observed_distribution) +
+            # the coin split, for the dashboard charts
+            "class_distribution": self.observed_distribution(),
             "going_first": s.going_first,
             "going_second": s.going_second,
             # Non-fatal, but a rising count means our touch profile is drifting from

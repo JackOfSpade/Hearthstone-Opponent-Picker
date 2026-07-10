@@ -45,10 +45,14 @@ class ScreenState(str, Enum):
     # dead space, so this must be a distinct, wait-only state - and it must outrank
     # RECONNECT_DIALOG, whose title-banner anchor still matches during it.
     RECONNECTING = "reconnecting"
-    # The VS intro. **No anchor is shipped for it**: this client fades queue->black->
-    # mulligan with no distinct splash frame, and `_classify_settled` absorbs the
-    # black frames as a transient UNKNOWN. The state and its wait-branch remain for
-    # clients that do show one; if yours does, capture an anchor and it just works.
+    # The "match found" VS intro (hero vs hero, a red "VS" between the portraits). Whether
+    # it appears is client-dependent: some fade queue->black->mulligan with no distinct
+    # splash (then `_classify_settled` absorbs the black frames as a transient UNKNOWN), but
+    # others -- the Pixel 7a among them (LIVE-VERIFIED 2026-07-10) -- hold a distinct VS
+    # splash for several seconds, long enough to outlast the settle re-looks and halt as
+    # UNKNOWN if it is unanchored. The state and its wait-branch are always present; ship an
+    # anchor on the invariant red "VS" glyph (`hop capture --state vs_splash --glyph ...`) and
+    # the existing wait-for-the-board branch just works.
     VS_SPLASH = "vs_splash"
     # The card Collection / deck manager. hop is never *supposed* to be here - the
     # end_dismiss geometry + END_SCREENS whitelist keep it from tapping "My Collection"

@@ -2,9 +2,99 @@ import random
 
 from hop.perception.capture import FrameDeduper
 from hop.perception.diffing import classify_change
-from hop.perception.image import Frame, mean_abs_diff, ncc
-from hop.perception.templates import Region, Template, best_match, match_all
+from hop.perception.image import Frame, mean_abs_diff, ncc, ncc_best_window
+from hop.perception.templates import Region, Template, _scan_best, best_match, match_all
 from hop.transport import hid_descriptor as hd
+
+
+def _scalar_scan_best(frame, template, stride):
+    """The per-window reference scan the vectorized fast path must reproduce exactly.
+
+    A copy of the pre-vectorization ``_scan_best`` loop, kept in the test so the fast
+    path is pinned to it regardless of which one the library picks at runtime.
+    """
+    rx, ry, rw, rh = template.region.to_px(frame)
+    tw, th = template.image.width, template.image.height
+    if tw > rw or th > rh:
+        return None
+    best = None
+    y = ry
+    while y + th <= ry + rh:
+        x = rx
+        while x + tw <= rx + rw:
+            score = ncc(frame.crop(x, y, tw, th), template.image)
+            if best is None or score > best[2]:
+                best = (x + tw // 2, y + th // 2, score)
+            x += stride
+        y += stride
+    return best
+
+
+def test_vectorized_ncc_scan_matches_scalar_reference():
+    """`ncc_best_window` (the FFT/summed-area fast path that drops a ~4 s classify to
+    ~46 ms) must be RESULT-IDENTICAL to the scalar per-window scan: same winning pixel,
+    same score to floating-point noise. That identity is the whole reason the speed-up is
+    safe -- it leaves every classification decision, confidence and RNG draw unchanged."""
+    rnd = random.Random(7)
+    glyph = Frame.from_gray_bytes(12, 9, bytes(rnd.randint(0, 255) for _ in range(108)))
+    for W, H in [(200, 120), (97, 61)]:
+        bg = bytearray(rnd.randint(20, 60) for _ in range(W * H))
+        gx, gy = 71, 33
+        for yy in range(9):
+            for xx in range(12):
+                bg[(gy + yy) * W + (gx + xx)] = glyph.data[yy, xx] if hasattr(glyph.data, "shape") else glyph.get(xx, yy)
+        frame = Frame.from_gray_bytes(W, H, bytes(bg))
+        tmpl = Template("g", glyph, Region(0.0, 0.0, 1.0, 1.0), 0.5)
+        rx, ry, rw, rh = tmpl.region.to_px(frame)
+        for stride in (1, 2, 3):
+            ref = _scalar_scan_best(frame, tmpl, stride)
+            fast = ncc_best_window(frame, glyph, (rx, ry, rw, rh), stride)
+            assert fast is not None
+            col, row, score = fast
+            fx, fy = rx + col + tmpl.image.width // 2, ry + row + tmpl.image.height // 2
+            assert (fx, fy) == (ref[0], ref[1]), f"pos {(fx, fy)} != {ref[:2]} (stride {stride})"
+            assert abs(score - ref[2]) < 1e-9, f"score {score} != {ref[2]} (stride {stride})"
+        # and the public _scan_best (which routes through the fast path) agrees too
+        m = _scan_best(frame, tmpl, stride=2)
+        r2 = _scalar_scan_best(frame, tmpl, 2)
+        assert (m.x, m.y) == (r2[0], r2[1]) and abs(m.score - r2[2]) < 1e-9
+
+
+def test_vectorized_ncc_scan_matches_scalar_reference_offset_region():
+    """The same bit-identity guard, but for a NONZERO-origin search region -- the only kind
+    production anchors use (every screens.json region is a sub-rectangle). It pins the
+    region-origin crop inside ``ncc_best_window`` (``fd[ry:ry+rh, rx:rx+rw]``): with rx=ry=0
+    that crop is the whole frame, so a dropped origin is invisible and no other test in the
+    suite catches it, yet every real classify runs exclusively through this offset path."""
+    rnd = random.Random(19)
+    glyph = Frame.from_gray_bytes(12, 9, bytes(rnd.randint(0, 255) for _ in range(108)))
+    W, H = 200, 120
+    bg = bytearray(rnd.randint(20, 60) for _ in range(W * H))
+    gx, gy = 95, 70                                   # well inside the region below
+    for yy in range(9):
+        for xx in range(12):
+            bg[(gy + yy) * W + (gx + xx)] = glyph.get(xx, yy)
+    frame = Frame.from_gray_bytes(W, H, bytes(bg))
+    tmpl = Template("g", glyph, Region(0.3, 0.2, 0.6, 0.6), 0.5)   # rx=60, ry=24
+    rx, ry, rw, rh = tmpl.region.to_px(frame)
+    assert rx > 0 and ry > 0                           # the offset path is actually exercised
+    for stride in (1, 2, 3):
+        ref = _scalar_scan_best(frame, tmpl, stride)
+        fast = ncc_best_window(frame, glyph, (rx, ry, rw, rh), stride)
+        assert fast is not None
+        col, row, score = fast
+        fx, fy = rx + col + tmpl.image.width // 2, ry + row + tmpl.image.height // 2
+        assert (fx, fy) == (ref[0], ref[1]), f"pos {(fx, fy)} != {ref[:2]} (stride {stride})"
+        assert abs(score - ref[2]) < 1e-9, f"score {score} != {ref[2]} (stride {stride})"
+
+
+def test_vectorized_ncc_flat_region_scores_zero():
+    """A flat (zero-variance) window has an undefined correlation; both paths report 0.0,
+    and the argmax over an all-zero map takes the first window -- matching the scalar scan."""
+    flat = Frame.from_gray_bytes(40, 40, bytes([50]) * 1600)
+    glyph = Frame.from_gray_bytes(8, 8, bytes([50]) * 64)   # flat template -> zero norm
+    out = ncc_best_window(flat, glyph, (0, 0, 40, 40), 2)
+    assert out is not None and out == (0, 0, 0.0)
 
 
 def test_ncc_brightness_invariant():

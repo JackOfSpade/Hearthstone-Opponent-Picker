@@ -68,7 +68,7 @@ class Adb:
         return (f"adb not found (tried {self.adb_bin!r}). Install Android platform-tools "
                 "(brew install --cask android-platform-tools) or add adb to your PATH.")
 
-    def _run(self, args: list[str], binary: bool = False) -> bytes:
+    def _run(self, args: list[str]) -> bytes:
         try:
             proc = subprocess.run(
                 self._base() + args,
@@ -80,13 +80,13 @@ class Adb:
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise AdbError(f"adb {' '.join(args)} failed: {err.strip()}")
-        return proc.stdout if binary else proc.stdout
+        return proc.stdout
 
     def shell(self, cmd: str) -> str:
         return self._run(["shell", cmd]).decode(errors="replace")
 
     def exec_out(self, cmd: str) -> bytes:
-        return self._run(["exec-out", cmd], binary=True)
+        return self._run(["exec-out", cmd])
 
     def popen_shell(self, cmd: str) -> subprocess.Popen:
         """Long-lived shell process with binary stdin/stdout (for the UHID FIFO

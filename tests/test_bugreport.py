@@ -99,6 +99,31 @@ def test_summarize_empty_journal_is_empty():
     assert br.summarize_journal("not json\n{bad") == ""
 
 
+def test_could_not_read_mulligan_halt_is_self_diagnosed():
+    """The 'class=\'\' cards=3' halt (the one this feature was built for) must name its own
+    cause -- class blank but cards fine -> the opponent nameplate / still-choosing transient --
+    so the next such report is actionable without decoding the raw message."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "cards": 3, "conf": 0.0}},
+        {"kind": "mulligan_read", "detail": {"reread": True, "attempt": 1,
+                                             "opponent": "?", "cards": 3, "class_raw": ""}},
+        {"kind": "halt", "detail": {"message": "HALTED: could not read mulligan (class='', cards=3)"}},
+    ]
+    summary = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "likely cause:" in summary
+    assert "BLANK" in summary and "Still Choosing" in summary
+    assert "mulligan_read_attempts" in summary        # points at the knob that governs it
+
+
+def test_mulligan_read_halt_diagnosis_distinguishes_the_three_failure_modes():
+    d = br._diagnose_mulligan_read_halt
+    assert "BLANK" in d("could not read mulligan (class='', cards=3)")          # class missing
+    assert "GARBLED" in d("could not read mulligan (class='WARRIQR', cards=4)")  # class present, unresolved
+    assert "CARD count" in d("could not read mulligan (class='MAGE', cards=1)")  # card miscount
+    assert d("some other halt entirely") == ""                                   # not our halt
+
+
 def test_summarize_journal_surfaces_the_runs_active_criteria():
     """A run journal's first line records what it hunted for; the summary must show it."""
     import json
@@ -347,6 +372,134 @@ def test_summarize_journal_does_not_flag_false_halt_when_awaited_screen_is_prese
     assert "FALSE halt" not in s
 
 
+def test_summarize_journal_flags_a_verified_then_stuck_halt():
+    """The false halt the near-miss check CAN'T see: the destination is a genuinely
+    un-anchored screen (all near-misses far away), so the marginal-miss heuristic stays
+    silent. But the Confirm tap's OWN verify_ok fired, then only UNKNOWN frames followed --
+    proof the tap worked and only the destination is unnamed. The real 'Opponent Still
+    Choosing...' halt, which had NO near-miss line to catch it."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "mulligan_confirm"}},
+        {"kind": "verify_ok", "detail": {"change_kind": "full_transition"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "FALSE halt (verified-then-stuck)" in s
+    assert "mulligan_confirm" in s and "verify_ok" in s
+
+
+def test_summarize_journal_does_not_cry_false_halt_without_a_verify():
+    """A tap that did NOT verify (a genuine missed tap / stuck source) has no verify_ok, so
+    it must not be mislabelled a false halt -- the tap did not provably work."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "mulligan_confirm"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "verified-then-stuck" not in s
+
+
+def test_summarize_journal_does_not_cry_false_halt_on_a_reconnect_timeout():
+    """Regression: the 'verified-then-stuck' detector must NOT fire on genuine external
+    failures. Reconnect taps Reconnect (verify_ok), its wait tolerates UNKNOWN mid-reconnect
+    redraws, then halts 'Hearthstone never came back online' -- a network outage, not an
+    unnamed destination. The 'capture the anchor' advice would be actively wrong here."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "reconnect"}},
+        {"kind": "verify_ok", "detail": {"change_kind": "full_transition"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},
+        {"kind": "halt", "detail": {"message": "stuck on 'Reconnecting...'; Hearthstone never came back online"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "verified-then-stuck" not in s
+
+
+def test_summarize_journal_false_halt_ignores_a_named_destination_after_the_verify():
+    """If a NAMED frame follows the verify (we DID recognise where we landed -- e.g. genuinely
+    stuck back on the mulligan), a trailing transient UNKNOWN must not flip it to a false halt.
+    The latch means 'the last look since the verify was UNKNOWN', not 'any UNKNOWN ever'."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "mulligan_confirm"}},
+        {"kind": "verify_ok", "detail": {"change_kind": "full_transition"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},   # transient
+        {"kind": "classify", "detail": {"ms": 3000, "state": "mulligan"}},  # NAMED, genuinely stuck
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "verified-then-stuck" not in s
+
+
+def test_summarize_journal_surfaces_the_coin_and_concede_timing():
+    """Answers 'does it only concede on MY turn / wait till turn 2 going second?': the coin
+    split, where the reject grammar chose to bail (random, not coin-driven), and how many
+    End Turn beats no-op'd because the button was greyed (not our turn). The concede itself
+    is via the gear menu and fires on EITHER turn -- the report must make that legible."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": True}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn2"}},
+        {"kind": "tap", "detail": {"what": "pass_turn"}},
+        {"kind": "anomaly", "detail": {"reason": "no screen change", "fault": "no_change"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Rogue", "second": False}},
+        {"kind": "reject_plan", "detail": {"concede_point": "mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "1 went 2nd / 1 went 1st" in s
+    assert "turn2×1" in s and "mulligan×1" in s
+    assert "End Turn beats 1, of which 1 no-op" in s
+    assert "NOT turn-gated" in s
+
+
+def test_summarize_journal_coin_ignores_a_reread_so_the_split_is_once_per_game():
+    """The coin is tallied on the FIRST read of a game only; a re-read (perception retry)
+    must not double-count it."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "second": True}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": True, "reread": True}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "1 went 2nd / 0 went 1st" in s   # one game, not two
+
+
+def test_summarize_journal_opponents_seen_counts_a_whiff_then_recover_game_once():
+    """Regression: a first read that OCRs the class fine (Mage) but MISCOUNTS the cards (0 ->
+    unusable) is journalled, then a re-read recovers (Mage, cards=3). The class must be counted
+    ONCE -- mirroring the engine's own class_distribution, which counts a game once -- not twice
+    ('Mage×2') off the unusable first read plus the recovering re-read."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": False, "cards": 0}},
+        {"kind": "mulligan_read", "detail": {"reread": True, "opponent": "Mage",
+                                             "second": False, "cards": 3}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "opponents seen: Mage×1" in s
+    assert "Mage×2" not in s
+
+
+def test_summarize_journal_coin_uses_the_first_valid_card_read_not_a_whiffed_one():
+    """Regression: the coin is derived from the card count, so a first read whose cards whiffed
+    to 0 records second=False regardless of the true coin. A game that actually went 2nd (its
+    re-read counts 4 cards) must be tallied '2nd', not inverted to '1st' off the unusable first
+    read -- the same card-validity gate the engine's own going_second tally uses."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "second": False, "cards": 0}},
+        {"kind": "mulligan_read", "detail": {"reread": True, "opponent": "Mage",
+                                             "second": True, "cards": 4}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "1 went 2nd / 0 went 1st" in s   # the RESOLVED coin, not the whiffed first read's
+
+
 def test_summarize_journal_breaks_down_per_tap_think_vs_perception():
     """The recurring 'why is <step> so slow?' answer: for each tap, split the wall-clock to
     reach+fire it into humanized think vs perception (screencap+classify). Perception should
@@ -432,6 +585,64 @@ def test_collect_bundles_config_journal_log_and_unknowns(tmp_path):
     assert "unknown_x_dispatch.png" in md                 # unknowns listed
 
 
+def test_summarize_journal_names_the_state_before_an_unknown_halt():
+    """A halt on an unknown that first appeared right after QUEUE is the match-start
+    transition (VS splash / board fade-in). The summary must say so and point at the
+    vs_splash anchor -- the near-miss line alone ('deck_select 0.302') doesn't locate it."""
+    journal = "\n".join([
+        '{"kind":"classify","detail":{"ms":40,"state":"queue"}}',
+        '{"kind":"classify","detail":{"ms":40,"state":"queue"}}',
+        '{"kind":"classify","detail":{"ms":80,"state":"unknown"}}',
+        '{"kind":"classify","detail":{"ms":80,"state":"unknown"}}',
+        '{"kind":"classify","detail":{"ms":80,"state":"unknown"}}',
+        '{"kind":"unknown_screen","detail":{"where":"dispatch","near_misses":['
+        '{"state":"deck_select","score":0.302,"thr":0.72}]}}',
+        '{"kind":"halt","detail":{"message":"HALTED: unknown screen (best confidence 0.00)"}}',
+    ])
+    out = br.summarize_journal(journal)
+    assert "unknown-halt context:" in out
+    assert "after queue" in out and "persisted 3 look(s)" in out
+    assert "vs_splash" in out and "match found" in out.lower()
+
+
+def test_summarize_journal_unknown_context_names_a_non_queue_predecessor():
+    """The context is general: an unknown halt after some other screen names THAT screen
+    (and withholds the queue-specific vs_splash hint, which wouldn't apply)."""
+    journal = "\n".join([
+        '{"kind":"classify","detail":{"ms":40,"state":"in_game"}}',
+        '{"kind":"classify","detail":{"ms":80,"state":"unknown"}}',
+        '{"kind":"halt","detail":{"message":"unknown screen (best confidence 0.00)"}}',
+    ])
+    out = br.summarize_journal(journal)
+    assert "unknown-halt context:" in out and "after in_game" in out
+    assert "vs_splash" not in out
+
+
+def test_perception_env_flags_the_active_numpy_fast_path():
+    """With numpy present the report says the vectorized NCC path is live -- the fact that
+    tells a 'slow cycle' reader the classify cost is the FFT pass, not a missing dependency."""
+    lines = br.perception_env(probe=lambda mod: {"numpy": "2.4.4", "PIL": "12.2.0"}.get(mod))
+    body = "\n".join(lines)
+    assert "numpy: 2.4.4" in body and "vectorized NCC active" in body
+    assert "Pillow: 12.2.0" in body
+
+
+def test_perception_env_calls_out_a_missing_numpy_as_the_slow_path():
+    """Without numpy, classify is the ~80x-slower pure-Python loop; the report must name
+    that as the likely cause and point at the fix rather than leave it to be inferred."""
+    lines = br.perception_env(probe=lambda mod: None)
+    body = "\n".join(lines)
+    assert "numpy: NOT INSTALLED" in body
+    assert "pure-Python" in body and "pip install numpy" in body
+
+
+def test_tooling_summary_includes_the_perception_accelerator():
+    out = br.tooling_summary(which=lambda t: f"/usr/bin/{t}", env={"PATH": "/usr/bin"},
+                             perception=["- numpy: 2.4.4  (vectorized NCC active)"])
+    assert "adb on PATH: /usr/bin/adb" in out
+    assert "numpy: 2.4.4" in out          # the accelerator sits alongside the PATH tools
+
+
 def test_collect_survives_missing_everything(tmp_path):
     """An offline machine with no runs/logs still yields a valid report, not a crash."""
     md = br.collect("nothing here", _paths(tmp_path), version="2.0.0", clock=lambda: 0.0)
@@ -444,6 +655,29 @@ def test_a_failing_device_probe_never_breaks_the_report(tmp_path):
         raise RuntimeError("adb exploded")
     md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0, device_probe=boom)
     assert "device probe failed" in md and "adb exploded" in md
+
+
+def test_collect_ocrs_unknown_frames_and_shows_the_banner(tmp_path):
+    """The banner text that NAMES an unrecognised screen is put in front of the diagnosis,
+    so 'Opponent Still Choosing...' is legible without opening the PNG."""
+    (tmp_path / "unknowns").mkdir()
+    (tmp_path / "unknowns" / "unknown_x_mulligan_confirm.png").write_bytes(b"x")
+    md = br.collect(
+        "x", _paths(tmp_path), version="1", clock=lambda: 0.0,
+        ocr_probe=lambda d, names: {"unknown_x_mulligan_confirm.png": "Opponent Still Choosing..."})
+    assert "unknown_x_mulligan_confirm.png" in md
+    assert 'reads: "Opponent Still Choosing..."' in md
+
+
+def test_a_failing_ocr_probe_never_breaks_the_report(tmp_path):
+    """OCR is diagnostic sugar; a broken engine drops the text, never the report or the
+    filename list."""
+    (tmp_path / "unknowns").mkdir()
+    (tmp_path / "unknowns" / "unknown_x_dispatch.png").write_bytes(b"x")
+    def boom(d, names):
+        raise RuntimeError("ocr down")
+    md = br.collect("x", _paths(tmp_path), version="1", clock=lambda: 0.0, ocr_probe=boom)
+    assert "unknown_x_dispatch.png" in md   # still listed, just without the banner text
 
 
 def test_write_report_names_by_timestamp(tmp_path):
@@ -565,31 +799,237 @@ def test_format_status_omits_the_traceback_block_when_absent():
     assert "Last error traceback" not in out
 
 
-# ── 50k-line cap ──────────────────────────────────────────────────────────────
+# ── 50k-CHARACTER cap (what actually truncates a pasted report) ─────────────────
 
-def test_fit_line_budget_trims_oldest_log_lines_first():
-    big = "\n".join(f"log{i}" for i in range(200))
+def test_fit_report_budget_trims_oldest_log_lines_first():
+    big = "\n".join(f"log-line-number-{i:04d}-padding-padding" for i in range(400))
     secs = [br.Section("Live engine status", "- running: False"),
             br.Section("App log (~/Library/Logs/hop.log)", big, fenced=True, lang="text")]
-    out = br._fit_line_budget("desc", secs, meta={"version": "1"}, max_lines=40)
-    assert len(out.splitlines()) <= 40
-    assert "log199" in out                    # newest log line survives
-    assert "\nlog0\n" not in out              # oldest log line is dropped
+    out = br._fit_report_budget("desc", secs, meta={"version": "1"}, max_chars=1500)
+    assert len(out) <= 1500                   # the CHARACTER budget is honoured
+    assert "0399" in out                      # newest log line survives
+    assert "log-line-number-0000" not in out  # oldest log line is dropped
     assert "- running: False" in out          # non-log sections are untouched
     assert "oldest lines dropped" in out
 
 
-def test_fit_line_budget_is_a_noop_under_the_cap():
+def test_fit_report_budget_is_a_noop_under_the_cap():
     secs = [br.Section("App log (~/Library/Logs/hop.log)", "a\nb\nc", fenced=True, lang="text")]
-    out = br._fit_line_budget("d", secs, meta={"version": "1"}, max_lines=1000)
+    out = br._fit_report_budget("d", secs, meta={"version": "1"}, max_chars=10_000)
     assert "oldest lines dropped" not in out and "a\nb\nc" in out
 
 
-def test_collect_never_exceeds_the_line_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(br, "MAX_REPORT_LINES", 60)
-    (tmp_path / "hop.log").write_text("\n".join(f"line{i}" for i in range(500)) + "\n")
+def test_fit_report_budget_hard_truncates_when_fixed_sections_alone_overflow():
+    """The last-resort backstop: when even the UN-trimmable sections exceed the cap (a huge
+    live-status block, say), trimming the log/journal cannot get under budget, so the report
+    is hard-cut. This guarantees the pasted report is NEVER silently truncated mid-line by the
+    external 50k limit -- and the cut eats the END of the document (emitted after the summary
+    and journal), so the diagnosis survives. Nothing else exercises this path."""
+    big_status = "\n".join(f"status-line-{i:04d}" for i in range(500))   # non-trimmable
+    secs = [br.Section("Live engine status", big_status)]
+    out = br._fit_report_budget("desc", secs, meta={"version": "1"}, max_chars=1_200)
+    assert len(out) <= 1_200                       # the cap is honoured even here
+    assert "hard-truncated" in out                 # the backstop fired and said so
+    assert out.startswith(br.SELF_IMPROVE_PROMPT)  # the fixed head (the diagnosis) survives
+
+
+def test_collect_never_exceeds_the_char_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "MAX_REPORT_CHARS", 4_000)
+    # a journal whose tail alone is far over budget: the newest lines must survive, oldest go
+    (tmp_path / "hop.log").write_text("\n".join(f"applog{i}" for i in range(50)) + "\n")
+    run = tmp_path / "runs" / "20260710-020000"
+    run.mkdir(parents=True)
+    run.joinpath("journal.jsonl").write_text(
+        "\n".join('{"kind":"classify","detail":{"ms":40,"state":"queue","i":%d}}' % i
+                  for i in range(400)) + "\n")
     md = br.collect("halp", _paths(tmp_path), version="2.0.0", clock=lambda: 0.0,
-                    log_tail_lines=500)
-    assert len(md.splitlines()) <= 60
-    assert "line499" in md                    # the most recent log line is kept
-    assert md.startswith(br.SELF_IMPROVE_PROMPT)
+                    journal_tail_lines=400, log_tail_lines=50)
+    assert len(md) <= 4_000                    # never exceeds the character cap
+    assert md.startswith(br.SELF_IMPROVE_PROMPT)   # the fixed head always survives
+    assert '"i":399' in md                     # the most recent journal line is kept
+    assert "oldest lines dropped" in md
+
+
+def test_summarize_journal_confirms_a_target_found_matches_empty_class_criteria():
+    """The 'wrong target found, unless bug?' answer: with no class filter set, ANY class is a
+    target, so a stop on Paladin going 2nd is CORRECT. The summary must say so, not leave it
+    to be re-derived."""
+    journal = "\n".join([
+        '{"kind":"run_criteria","detail":{"target_classes":[],"avoid_classes":[],"require_second":true,"mode":"casual"}}',
+        '{"kind":"target_found","detail":{"opponent":"Paladin","second":true}}',
+    ])
+    out = br.summarize_journal(journal)
+    assert "target found: Paladin (going 2nd)" in out
+    assert "NOT a misfire" in out
+    assert "no class filter is set" in out and "going-2nd requirement was met" in out
+
+
+def test_summarize_journal_flags_a_target_found_that_violates_the_criteria():
+    """A genuine misfire (stopped on a class NOT in the target list) must be flagged loudly
+    as a real bug, not blessed as correct."""
+    journal = "\n".join([
+        '{"kind":"run_criteria","detail":{"target_classes":["MAGE"],"avoid_classes":[],"require_second":false,"mode":"casual"}}',
+        '{"kind":"target_found","detail":{"opponent":"Warrior","second":false}}',
+    ])
+    out = br.summarize_journal(journal)
+    assert "real MISFIRE" in out and "Warrior is NOT in the target list" in out
+
+
+def test_summarize_journal_shows_the_state_trail_into_a_halt():
+    """The single line that would have surfaced THIS report's cause without journal
+    archaeology: a dismissed error dialog dropped hop to the deck list."""
+    journal = "\n".join([
+        '{"kind":"classify","detail":{"ms":40,"state":"play_screen"}}',
+        '{"kind":"classify","detail":{"ms":40,"state":"queue"}}',
+        '{"kind":"classify","detail":{"ms":40,"state":"queue"}}',
+        '{"kind":"classify","detail":{"ms":88,"state":"error_dialog"}}',
+        '{"kind":"classify","detail":{"ms":53,"state":"deck_select"}}',
+        '{"kind":"halt","detail":{"message":"HALTED: dropped back to the deck list; re-select your deck"}}',
+    ])
+    out = br.summarize_journal(journal)
+    assert "state trail into the halt:" in out
+    # consecutive repeats collapse, so the trigger reads cleanly
+    assert "queue -> error_dialog -> deck_select" in out
+
+
+# ── why were the games conceded? (reject-reason recompute) ─────────────────────
+
+def test_summarize_journal_explains_why_conceded_games_were_rejected():
+    """THIS report's missing line: with targets=ANY + require_second, two games that went 1st
+    were conceded. The summary must recompute and state that -- 'all correct: went 1st' -- so a
+    reader isn't left hand-crossing the coin split against require_second to tell a correct
+    concede from a class-read/logic bug."""
+    import json
+    events = [
+        {"kind": "run_criteria", "detail": {"target_classes": [], "avoid_classes": [],
+                                            "require_second": True, "mode": "casual"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Druid", "second": False}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn1"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Death Knight", "second": False}},
+        {"kind": "reject_plan", "detail": {"concede_point": "mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "rejects vs criteria: 2 conceded, all correct" in s
+    assert "2× went 1st" in s and "require_second is set" in s
+    assert "MISFIRE" not in s
+
+
+def test_summarize_journal_reject_reason_names_a_class_not_targeted():
+    """A class filter that rejects: the opponent class simply isn't on the target list."""
+    import json
+    events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["MAGE"], "avoid_classes": [],
+                                            "require_second": False, "mode": "casual"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Warrior", "second": True}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn2"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "rejects vs criteria: 1 conceded, all correct" in s
+    assert "opponent class not in the target list" in s
+
+
+def test_summarize_journal_flags_a_reject_the_criteria_say_to_keep_as_a_misfire():
+    """The mirror of the target_found misfire check: a game the criteria would KEEP (Mage is in
+    the target list, coin not required) that was conceded anyway is a real bug -- flag it loudly,
+    naming the matchup, instead of blessing it as a correct reject."""
+    import json
+    events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["MAGE"], "avoid_classes": [],
+                                            "require_second": False, "mode": "casual"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": True}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn1"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "real MISFIRE" in s
+    assert "Mage (going 2nd)" in s
+    assert "evaluate_matchup/accepts" in s
+
+
+def test_summarize_journal_reject_reason_matches_enum_name_to_display_name():
+    """run_criteria records enum tokens ("DEATHKNIGHT", no underscore); mulligan_read records the
+    display name ("Death Knight"). The recompute must normalize both so a Death Knight target is
+    KEPT (=> conceding it is a misfire), exactly as the target_found recompute matches names."""
+    import json
+    events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["DEATHKNIGHT"], "avoid_classes": [],
+                                            "require_second": False, "mode": "casual"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Death Knight", "second": True}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn1"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "real MISFIRE" in s and "Death Knight" in s
+
+
+def test_summarize_journal_reject_reason_needs_run_criteria_to_avoid_false_misfires():
+    """Without a run_criteria line the criteria default to 'accept everything', under which every
+    reject would spuriously read as a misfire. Gate on it: no criteria => no reject line at all."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": False}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn1"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "rejects vs criteria" not in s
+    assert "MISFIRE" not in s
+
+
+def test_reject_reason_mirrors_accepts_precedence():
+    """Unit-check the recompute against Criteria.accepts: require_second is checked FIRST and is
+    class-independent; then the target list; then the avoid list; a keep that was rejected is a
+    misfire."""
+    r = br._reject_reason
+    assert r("Druid", False, True, [], []) == "went_first"          # coin required, went 1st
+    assert r("Druid", False, True, ["MAGE"], []) == "went_first"    # ...checked before the class
+    assert r("Druid", True, True, [], []) == "misfire"              # coin ok, no filter -> keep
+    assert r("Warrior", True, False, ["MAGE"], []) == "not_targeted"
+    assert r("Mage", True, False, ["MAGE"], []) == "misfire"        # in targets -> keep
+    assert r("Rogue", False, False, [], ["ROGUE"]) == "avoided"
+    assert r("Mage", False, False, [], ["ROGUE"]) == "misfire"      # not avoided -> keep
+    assert r("Death Knight", True, False, ["DEATHKNIGHT"], []) == "misfire"  # name-normalized keep
+
+
+# ── is the halt a deliberate fail-closed stop, or a bug? ───────────────────────
+
+def test_summarize_journal_labels_the_deck_select_halt_as_a_deliberate_stop():
+    """THIS report's halt: hop dropped to the deck list and fail-closed after polling it. The
+    summary must certify it as a DELIBERATE stop (not a malfunction) with the action to take, and
+    show the bounded-poll shape (looked at deck_select N times) that distinguishes a guard from a
+    crash."""
+    import json
+    events = [
+        {"kind": "classify", "detail": {"ms": 50, "state": "deck_select"}},
+        {"kind": "classify", "detail": {"ms": 50, "state": "deck_select"}},
+        {"kind": "classify", "detail": {"ms": 50, "state": "deck_select"}},
+        {"kind": "halt", "detail": {"message": "HALTED: dropped back to the deck list and nobody "
+                                    "re-selected a deck; hop won't reopen one. Re-select your deck "
+                                    "and restart the hunt from its Play screen."}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "DELIBERATE fail-closed stop, not a malfunction" in s
+    assert "looked at 'deck_select' 3× (a bounded wait)" in s
+    assert "Re-select your deck" in s
+
+
+def test_summarize_journal_does_not_label_an_unknown_screen_halt_as_deliberate():
+    """A genuinely-unexpected halt (an unrecognized screen) must NOT be blessed as a deliberate
+    stop -- that would hide a real fault. It falls through to the unknown-halt diagnostics."""
+    import json
+    events = [
+        {"kind": "classify", "detail": {"ms": 80, "state": "unknown"}},
+        {"kind": "halt", "detail": {"message": "unknown screen (best confidence 0.00)"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "DELIBERATE fail-closed stop" not in s
+
+
+def test_classify_halt_recognizes_the_deliberate_family_and_rejects_faults():
+    """The deliberate fail-closed halts each map to actionable guidance; a real fault (or an
+    unrecognized message) maps to '' so it is not mislabelled as designed."""
+    c = br._classify_halt
+    assert "Re-select your deck" in c("dropped back to the deck list; Re-select your deck")
+    assert "main menu" in c("at the Hearthstone main menu; open Play first").lower()
+    assert "did not queue" in c("a game is in progress that this hunt did not start")
+    assert "soft-lock" in c("still queueing after 60 polls; matchmaking never matched")
+    assert "reconnect" in c("stuck on 'Reconnecting...'; Hearthstone never came back online").lower()
+    assert c("could not draw a non-repeating gesture in 8 attempts") == ""   # a real fault
+    assert c("") == ""
