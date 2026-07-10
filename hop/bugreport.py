@@ -277,6 +277,37 @@ def _classify_halt(message: str) -> str:
     return ""
 
 
+def _diagnose_last_error(last_error: str) -> str:
+    """Name the cause of a CRASH message the controller caught (``status['last_error']``), the
+    way :func:`_diagnose_mulligan_read_halt`/:func:`_classify_halt` name a halt. The one that
+    cost a round-trip to diagnose: a raw ``TimeoutExpired: ... screencap ...`` -- a pasted report
+    left the reader (and Claude) to work out that this is a wireless-link freeze, not a hop fault,
+    and that a locked-but-awake Mac does NOT cause it. Returns "" for an unrecognized error.
+    """
+    m = (last_error or "").lower()
+    if not m:
+        return ""
+    is_timeout = "timed out" in m or "timeoutexpired" in m
+    if "screencap" in m and is_timeout:
+        return ("the screencap over wireless ADB HUNG to its timeout -- the link to the phone "
+                "froze; this is a transport stall, NOT a hop logic fault. A locked-but-awake Mac "
+                "keeps ADB and the network alive, so a bare lock screen does NOT cause this. A "
+                "screencap hangs to the full timeout only when the connection actually drops: the "
+                "Mac SLEEPING (caffeinate blocks idle sleep only on AC power, and only for the "
+                "assertion type it holds -- see the Host power section), the phone's Wi-Fi "
+                "entering Doze/power-save, or the AP dropping the phone. Corroborate with the "
+                "capture-time trend (a mean that rises through the run = a degrading link) and the "
+                "Host power/network section. NOTE: as of this build a stall like this no longer "
+                "crashes the hunt -- it reconnects and retries (vision.capture_retry_attempts); "
+                "only a link that stays down through every retry stops the run, cleanly "
+                "(stop_reason=adb_error, stats intact).")
+    if is_timeout and "adb" in m:
+        return ("an ADB command timed out -- the wireless link to the phone stalled (device "
+                "asleep/Doze, Wi-Fi power-save, or the Mac slept). See the Host power/network "
+                "section for which. Transient stalls now self-heal (capture_retry_attempts).")
+    return ""
+
+
 def summarize_journal(journal_text: str) -> str:
     """A human summary of a run journal: counts, the class distribution, and the tail.
 
@@ -314,6 +345,12 @@ def summarize_journal(journal_text: str) -> str:
     longest_sleeps: list[tuple[float, str]] = []
     captures_ms: list[float] = []
     classify_ms: list[float] = []
+    # Transient screencap stalls that were retried instead of crashing the hunt (the new
+    # capture-retry resilience). A nonzero count is a wireless-link wobble; a RISING count over
+    # a run is a link going bad -- exactly the precursor to the timeout that this harness was
+    # improved to explain. Surfaced so a healthy-looking run that quietly limped is visible.
+    capture_retry_ms: list[float] = []
+    capture_retry_last_err = ""
     gaps: list[tuple[float, str, str]] = []
     last_halt = ""
     criteria = ""
@@ -484,6 +521,13 @@ def summarize_journal(journal_text: str) -> str:
             if isinstance(ms, (int, float)):
                 captures_ms.append(float(ms))
                 seg_perception += float(ms) / 1000.0
+        if k == "capture_retry":
+            ms = d.get("ms")
+            if isinstance(ms, (int, float)):
+                capture_retry_ms.append(float(ms))
+                seg_perception += float(ms) / 1000.0   # the hung time WAS wall-clock spent
+            if d.get("error"):
+                capture_retry_last_err = str(d.get("error"))
         if k == "classify":
             ms = d.get("ms")
             if isinstance(ms, (int, float)):
@@ -656,18 +700,26 @@ def summarize_journal(journal_text: str) -> str:
         slept = sum(sleeps.values())
         if captures_ms:
             cap_s = sum(captures_ms) / 1000.0
+            # Retry stalls are hung TRANSPORT time (a screencap that timed out), not OCR/logic.
+            # Keep them out of captures_ms (so the healthy per-frame mean/max stay clean) but
+            # subtract them here as their own term, else a 20 s stall lands in the "OCR/logic"
+            # residual and points a reader at the wrong subsystem -- the very transport stall
+            # this report exists to diagnose. Emitted only when nonzero, so healthy runs read
+            # exactly as before.
+            retry_s = sum(capture_retry_ms) / 1000.0
+            stalled = f" + {retry_s:.0f}s stalled I/O" if retry_s >= 0.5 else ""
             if classify_ms:
                 # Classification is journalled separately, so split it out of the residual:
                 # it is the second-biggest cost and lumping it into "logic" hid that.
                 cls_s = sum(classify_ms) / 1000.0
-                other = max(0.0, wall - slept - cap_s - cls_s)
+                other = max(0.0, wall - slept - cap_s - cls_s - retry_s)
                 out.append(f"- time: {wall:.0f}s wall = {slept:.0f}s humanized waits + "
-                           f"{cap_s:.0f}s screencap I/O + {cls_s:.0f}s classification + "
+                           f"{cap_s:.0f}s screencap I/O + {cls_s:.0f}s classification{stalled} + "
                            f"{other:.0f}s OCR/logic")
             else:
-                other = max(0.0, wall - slept - cap_s)
+                other = max(0.0, wall - slept - cap_s - retry_s)
                 out.append(f"- time: {wall:.0f}s wall = {slept:.0f}s humanized waits + "
-                           f"{cap_s:.0f}s screencap I/O + {other:.0f}s classify/OCR/logic")
+                           f"{cap_s:.0f}s screencap I/O{stalled} + {other:.0f}s classify/OCR/logic")
         else:
             out.append(f"- time: {wall:.0f}s wall, {slept:.0f}s of it humanized waits "
                        "(the rest is screencap + classify/OCR; a pre-capture-journal run)")
@@ -752,9 +804,33 @@ def summarize_journal(journal_text: str) -> str:
     if captures_ms:
         total = sum(captures_ms) / 1000.0
         mean_ms = total * 1000.0 / len(captures_ms)
-        out.append(f"- captures: {len(captures_ms)} screencaps, {total:.1f}s total "
-                   f"(mean {mean_ms:.0f}ms, max {max(captures_ms):.0f}ms) - wireless-ADB "
-                   "frame I/O; ~1.0s USB / ~1.4s Wi-Fi per frame is normal for this phone")
+        line = (f"- captures: {len(captures_ms)} screencaps, {total:.1f}s total "
+                f"(mean {mean_ms:.0f}ms, max {max(captures_ms):.0f}ms) - wireless-ADB "
+                "frame I/O; ~1.0s USB / ~1.4s Wi-Fi per frame is normal for this phone")
+        if len(captures_ms) >= 6:
+            # First-third vs last-third mean: a link degrading through the run is the classic
+            # precursor to the stall/timeout that kills a capture. A one-number mean hides it
+            # (a run that started fast and ended crawling reads "fine on average"); the trend
+            # is what would have foretold THIS report's timeout. Only flagged when the rise is
+            # both large in ratio AND absolute, so ordinary jitter stays quiet.
+            third = len(captures_ms) // 3
+            early = sum(captures_ms[:third]) / third
+            late = sum(captures_ms[-third:]) / third
+            if late > early * 1.4 and late - early > 800:
+                line += (f". TREND: mean rose {early:.0f}ms -> {late:.0f}ms (first third -> last "
+                         "third) -- the link was DEGRADING through the run, the classic precursor "
+                         "to a stall/timeout")
+        out.append(line)
+    if capture_retry_ms:
+        # Transient screencap stalls that the new capture-retry recovered from instead of
+        # crashing. Their existence means the link wobbled; their hung time is real wall-clock.
+        hung = sum(capture_retry_ms) / 1000.0
+        note = (f"- capture retries: {len(capture_retry_ms)} screencap(s) stalled/failed and were "
+                f"retried after a forced reconnect ({hung:.1f}s hung total) -- a wireless-link "
+                "wobble the hunt rode through; a rising count means the link is going bad")
+        if capture_retry_last_err:
+            note += f". Last retry error: {capture_retry_last_err}"
+        out.append(note)
     if classify_ms:
         total = sum(classify_ms) / 1000.0
         mean_ms = total * 1000.0 / len(classify_ms)
@@ -922,6 +998,12 @@ def format_status(status: dict) -> str:
         lines.append(f"- stop_reason: {g('stop_reason')}")
     if g("last_error"):
         lines.append(f"- last_error: {g('last_error')}")
+        # Name a recognized crash cause inline (screencap timeout = wireless-link freeze, not a
+        # hop fault), so the report SAYS what the raw message means instead of leaving it decoded
+        # by hand -- the same self-diagnosing treatment the halt messages already get.
+        why = _diagnose_last_error(str(g("last_error")))
+        if why:
+            lines.append(f"  ↳ likely cause: {why}")
     if "games" in status:
         lines.append(f"- games: {g('games')}   concedes: {g('concedes')}   "
                      f"target_found: {g('target_found')}   last_opponent: {g('last_opponent')}")
@@ -1003,6 +1085,117 @@ def tooling_summary(*, which=None, env=None, perception=None) -> str:
     return "\n".join(lines)
 
 
+def _bounded_run(args: list[str], timeout: float, run) -> str | None:
+    """Run a diagnostic command, returning its decoded stdout+stderr, or ``None`` on any
+    failure. Never raises and never hangs past ``timeout`` -- a report probe must be safe even
+    when the tool is missing, slow, or the device is exactly the thing that's wedged. stderr is
+    folded in because the useful text for a *failed* probe (``adb get-state`` on a dead link:
+    ``error: device offline``) lives there."""
+    try:
+        proc = run(args, capture_output=True, timeout=timeout)
+    except Exception:
+        return None
+    parts = []
+    for stream in (getattr(proc, "stdout", b""), getattr(proc, "stderr", b"")):
+        if not stream:
+            continue
+        if isinstance(stream, (bytes, bytearray)):
+            stream = bytes(stream).decode("utf-8", errors="replace")
+        parts.append(str(stream))
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _host_diagnostics(adb_address: str = "", *, run=None, system=None) -> str:
+    """macOS power / sleep / network facts, so a report can answer 'was it the Mac?' itself.
+
+    The exact question a screencap-timeout report could NOT answer -- was the Mac asleep, was
+    ``caffeinate`` actually holding a sleep assertion (and the right *type*), is the phone even
+    reachable now -- lives in ``pmset`` and a ping, in no hop artifact. A wireless screencap
+    hangs to its timeout only when the link genuinely drops, and the top cause on an unattended
+    Mac is the machine sleeping: ``caffeinate`` prevents *idle* sleep only on AC power and only
+    for the assertion type it holds, so "caffeinate was on" is NOT proof the Mac stayed awake.
+    This gathers the deciding facts best-effort: every command is timeout-bounded and guarded
+    (see :func:`_bounded_run`), so a slow or missing tool drops its line rather than hanging or
+    breaking the report. ``run``/``system`` are injectable so tests need no real pmset/ping.
+
+    Emits nothing off macOS (``pmset`` is macOS-only; the tool ships as a mac ``.app``).
+    """
+    import subprocess as _sp
+    run = run or _sp.run
+    system = system or platform.system
+    if system() != "Darwin":
+        return ""
+    lines: list[str] = []
+
+    # Power source: caffeinate -s prevents sleep ONLY on AC, so AC-vs-battery is load-bearing
+    # for "could it have slept despite caffeinate?".
+    batt = _bounded_run(["pmset", "-g", "batt"], 3, run)
+    if batt:
+        src = next((ln.strip() for ln in batt.splitlines() if "drawing from" in ln.lower()), "")
+        if src:
+            lines.append(f"- power source: {src}")
+
+    # Sleep timers (minutes; 0 = never). displaysleep is the lock/screensaver-adjacent one.
+    settings = _bounded_run(["pmset", "-g"], 3, run)
+    if settings:
+        picks = [f"{key}={m.group(1)}m"
+                 for key in ("sleep", "displaysleep", "disksleep")
+                 for m in [re.search(rf"^\s*{key}\s+(\d+)", settings, re.MULTILINE)] if m]
+        if picks:
+            lines.append("- sleep timers: " + " ".join(picks) + " (0 = never)")
+
+    # Sleep-preventing assertions held right now. If nothing holds PreventUserIdleSystemSleep,
+    # an unattended Mac WILL idle-sleep and freeze wireless ADB -- the exact failure mode. A
+    # caffeinate holder confirms the assertion is (still) live at report time.
+    assertions = _bounded_run(["pmset", "-g", "assertions"], 3, run)
+    if assertions:
+        held = [f"{key}={m.group(1)}"
+                for key in ("PreventUserIdleSystemSleep", "PreventSystemSleep",
+                            "PreventUserIdleDisplaySleep")
+                for m in [re.search(rf"\b{key}\s+(\d+)", assertions)] if m]
+        if held:
+            lines.append("- sleep assertions: " + " ".join(held)
+                         + " (1 = held/blocked, 0 = NOT blocked)")
+        if "caffeinate" in assertions.lower():
+            lines.append("- caffeinate: an assertion is held by a caffeinate process (active now)")
+        else:
+            lines.append("- caffeinate: no caffeinate assertion visible at report time "
+                         "(it may have exited, or never held a system-sleep assertion)")
+
+    # Recent sleep/wake history: a Sleep/Wake pair straddling the crash time is the smoking gun
+    # for "the Mac slept". pmset -g log is large, so bound it hard and keep only sleep/wake rows.
+    plog = _bounded_run(["pmset", "-g", "log"], 6, run)
+    if plog:
+        evts = [ln.strip() for ln in plog.splitlines()
+                if re.search(r"\b(Sleep|Wake|DarkWake)\b", ln)
+                and not ln.lstrip().startswith("*")]
+        tail = [ln[:160] for ln in evts[-10:]]
+        if tail:
+            lines.append("- recent power events (pmset -g log; a Sleep/Wake around the crash "
+                         "time = the Mac slept):")
+            lines.extend("    " + ln for ln in tail)
+
+    # Is the phone reachable NOW? Distinguishes "still down" (network/phone) from "recovered"
+    # (a transient stall, or a Mac-side sleep that has since woken).
+    host = (adb_address or "").split(":", 1)[0].strip()
+    if host:
+        ping = _bounded_run(["ping", "-c", "1", "-t", "2", host], 4, run)
+        if ping is not None:
+            reachable = "1 packets received" in ping or "1 received" in ping or " 0.0% packet loss" in ping
+            lines.append(f"- phone {host} ICMP ping: "
+                         + ("reachable" if reachable else "NO reply (unreachable right now)"))
+        try:
+            from .adb import resolve_adb
+            state = _bounded_run([resolve_adb(), "-s", adb_address, "get-state"], 4, run)
+        except Exception:
+            state = None
+        if state is not None:
+            lines.append(f"- adb get-state ({adb_address}): "
+                         + (state.strip().replace("\n", " ") or "(no output / not connected)"))
+
+    return "\n".join(lines)
+
+
 def _fit_report_budget(description: str, sections: list[Section], *, meta: dict,
                        max_chars: int | None = None) -> str:
     """Assemble, and if the report exceeds ``max_chars``, drop the OLDEST lines of the
@@ -1060,7 +1253,8 @@ def _fit_report_budget(description: str, sections: list[Section], *, meta: dict,
 
 def collect(description: str, paths: ReportPaths, *, version: str,
             journal_tail_lines: int = 500, log_tail_lines: int = 2000,
-            clock=time.time, device_probe=None, status_probe=None, ocr_probe=None) -> str:
+            clock=time.time, device_probe=None, status_probe=None, ocr_probe=None,
+            host_probe=None) -> str:
     """Gather every artifact and assemble the report. Best-effort: a missing or
     unreadable file drops its section rather than failing the whole report.
 
@@ -1100,6 +1294,19 @@ def collect(description: str, paths: ReportPaths, *, version: str,
     cfg_text = _read(paths.config)
     if cfg_text:
         sections.append(Section("Config (secrets redacted)", redact_toml(cfg_text), fenced=True, lang="toml"))
+
+    # Host power/sleep/network -- answers "was it the Mac (lock/sleep), or the phone/net?" from
+    # the report itself, the gap a screencap-timeout crash exposed. The phone's address is
+    # derived from the config we just read, so BOTH the CLI and the app path get this with no
+    # new call-site wiring. Best-effort; a failed/empty probe drops the section (assemble()).
+    if host_probe is None:
+        host_probe = _host_diagnostics
+    addr_m = re.search(r'^\s*adb_address\s*=\s*"([^"]+)"', cfg_text or "", re.MULTILINE)
+    try:
+        host = host_probe(addr_m.group(1) if addr_m else "") or ""
+    except Exception as e:  # never let a host probe break the report
+        host = f"(host diagnostics failed: {e})"
+    sections.append(Section("Host power / sleep / network (macOS)", host))
 
     run_dir = latest_run_dir(paths.runs_root)
     if run_dir is not None:

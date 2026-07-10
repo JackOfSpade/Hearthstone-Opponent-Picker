@@ -77,6 +77,27 @@ class Adb:
             )
         except FileNotFoundError:
             raise AdbError(self._missing_adb_msg())
+        except subprocess.TimeoutExpired:
+            # A wireless-ADB link that dropped (screen lock, Doze, a Wi-Fi power-save blip, or
+            # the Mac sleeping) does NOT error fast -- `exec-out screencap` HANGS on the dead
+            # socket until this timeout. Convert it to our own typed error at the boundary, the
+            # same way the missing-binary case is: this is the one place that shells out, and a
+            # raw subprocess exception must never escape it. A single stalled frame used to
+            # propagate a bare TimeoutExpired up through every handler in Engine.run and kill
+            # the whole hunt (see hop.engine._capture_resilient, which now retries these).
+            raise AdbError(
+                f"adb {' '.join(args)} timed out after {self.timeout:.0f}s -- device "
+                "unreachable (Wi-Fi ADB drops on screen lock / Doze / Mac sleep)")
+        except (OSError, subprocess.SubprocessError) as e:
+            # Any OTHER spawn-time failure: an OSError from posix_spawn/fork under memory pressure
+            # (ENOMEM / EAGAIN "Resource temporarily unavailable" -- e.g. a Mac thrashing as it
+            # wakes from the very sleep that drops the link), a present-but-non-executable adb_bin
+            # (PermissionError), etc. FileNotFoundError and TimeoutExpired are handled above for
+            # their specific messages (both are subclasses caught by the earlier clauses); this
+            # backstop makes good on this class's promise that NO raw subprocess/OS exception
+            # escapes the one place that shells out -- so every such failure reaches the engine as
+            # an AdbError it can retry/reconnect/halt-cleanly on, not a bare crash.
+            raise AdbError(f"adb {' '.join(args)} failed to run: {e}")
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace")
             raise AdbError(f"adb {' '.join(args)} failed: {err.strip()}")
@@ -135,6 +156,28 @@ class Adb:
         """Reconnect if the Wi-Fi ADB link dropped (screen lock / idle)."""
         if not self.is_connected():
             self.connect()
+
+    def disconnect(self) -> None:
+        """Drop the cached wireless endpoint. A Wi-Fi link that dropped often lingers as a
+        zombie 'device' whose ``exec-out`` still HANGS on the dead socket; a plain reconnect
+        reuses that zombie, so we disconnect first to force a fresh handshake. Best-effort and
+        never raises -- it is only ever a prelude to :meth:`reconnect`."""
+        try:
+            subprocess.run([self.adb_bin, "disconnect", self.address],
+                           capture_output=True, timeout=self.timeout)
+        except Exception:  # pragma: no cover - network/binary; reconnect() reports real failure
+            pass
+
+    def reconnect(self) -> None:
+        """Force a fresh wireless link after a drop: disconnect the (possibly zombie) endpoint,
+        then connect with a SINGLE attempt (no long exponential backoff). On the healthy path
+        (``adb connect``/``disconnect`` are local adb-server ops) this returns in a second or two,
+        cheap enough to sit inside the per-frame capture-retry loop. Worst case, against a truly
+        dead host, each subprocess can block up to ``self.timeout`` -- so a single reconnect is
+        bounded by ~disconnect(timeout) + connect (2*timeout + one 2 s backoff), not instant.
+        Raises :class:`AdbError` if the connect fails; the caller decides whether to retry."""
+        self.disconnect()
+        self.connect(retries=1)
 
     # ── device probing ──────────────────────────────────────────────────────
 

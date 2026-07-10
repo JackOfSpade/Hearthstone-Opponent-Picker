@@ -543,6 +543,139 @@ def test_reconnect_taps_reconnect_and_never_cancel(cfg):
     assert max(xs) / panel_w < 0.5, "tap drifted past center toward Cancel"
 
 
+# ── capture resilience: a transient screencap stall must not crash the hunt ──────────
+
+class _FlakyCapturer:
+    """Raises ``exc`` on the first ``fail_times`` captures, then returns a normal frame.
+
+    Models a wireless-ADB stall (screen lock / Doze / Wi-Fi blip / Mac sleep) that clears."""
+
+    def __init__(self, exc, fail_times=1):
+        self.exc = exc
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def capture(self):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise self.exc
+        return gray_frame(80, 40)
+
+
+class _AlwaysFailCapturer:
+    """Every capture raises: models a link that never comes back."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def capture(self):
+        raise self.exc
+
+
+class _ReconnectingAdb(FakeAdb):
+    """FakeAdb that counts forced reconnects, so a test can prove the retry re-handshakes."""
+
+    def __init__(self):
+        super().__init__()
+        self.reconnects = 0
+
+    def reconnect(self):
+        self.reconnects += 1
+
+
+def test_capture_recovers_from_a_transient_stall(cfg):
+    """Regression: a single screencap TimeoutExpired (as AdbError) crashed the whole hunt.
+    Now a transient failure is retried and the frame is captured on a later attempt."""
+    from hop.adb import AdbError
+
+    eng, _ = _engine(cfg, [ScreenState.MENU],
+                     capturer=_FlakyCapturer(AdbError("timed out after 20s"), fail_times=1))
+    frame = eng._capture()          # would raise without the in-capture retry
+    assert frame is not None
+
+
+def test_capture_retry_forces_a_reconnect_between_attempts(cfg):
+    """Each retry disconnects+reconnects first, since a dropped link lingers as a zombie."""
+    from hop.adb import AdbError
+
+    adb = _ReconnectingAdb()
+    eng, _ = _engine(cfg, [ScreenState.MENU],
+                     capturer=_FlakyCapturer(AdbError("stall"), fail_times=2))
+    eng.adb = adb                    # _capture reads self.adb for the reconnect
+    eng._capture()
+    assert adb.reconnects == 2       # one reconnect before each of the two retries
+
+
+def test_run_halts_cleanly_when_the_adb_link_stays_down(cfg):
+    """A link that stays down through every retry must end the run with a named stop_reason,
+    NOT escape as a raw error to the controller thread (a bare traceback, stats lost)."""
+    from hop.adb import AdbError
+
+    eng, _ = _engine(cfg, [ScreenState.MENU],
+                     capturer=_AlwaysFailCapturer(AdbError("timed out after 20s -- unreachable")))
+    stats = eng.run()                # must NOT raise
+    assert stats.stop_reason == "adb_error"
+
+
+def test_capture_retry_count_is_bounded_by_the_config_knob(cfg):
+    """The retry is bounded: with N attempts a permanently-dead link tries exactly N times."""
+    from hop.adb import AdbError
+
+    class _Counting(_AlwaysFailCapturer):
+        def __init__(self, exc):
+            super().__init__(exc)
+            self.calls = 0
+
+        def capture(self):
+            self.calls += 1
+            raise self.exc
+
+    cap = _Counting(AdbError("dead"))
+    eng, _ = _engine(cfg, [ScreenState.MENU], capturer=cap)
+    with pytest.raises(AdbError):
+        eng._capture()
+    assert cap.calls == cfg.vision.capture_retry_attempts
+
+
+def test_capture_retry_honours_a_stop_mid_storm(cfg):
+    """A Stop pressed during a dead-link retry storm must unwind cleanly, not grind through
+    every remaining attempt (each of which can hang the full adb timeout)."""
+    from hop.adb import AdbError
+    from hop.engine import StopRequested
+
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+
+    class _StopOnFirstFailure:
+        calls = 0
+
+        def capture(_self):
+            _self.calls += 1
+            eng.request_stop()               # user presses Stop during the first hung capture
+            raise AdbError("stall")
+
+    eng.capturer = cap = _StopOnFirstFailure()
+    with pytest.raises(StopRequested):
+        eng._capture()
+    assert cap.calls == 1                     # bailed after one attempt via the stop-aware backoff
+
+
+def test_capture_retry_does_not_perturb_the_rng_stream(cfg):
+    """Cardinal invariant: the retry path must draw ZERO from self.rng, so a capture that
+    fails-then-recovers leaves the humanization stream byte-for-byte identical to a clean one."""
+    from hop.adb import AdbError
+
+    clean, _ = _engine(cfg, [ScreenState.MENU])
+    before = clean.rng.getstate()
+    clean._capture()
+    assert clean.rng.getstate() == before             # a clean capture draws no rng
+
+    retried, _ = _engine(cfg, [ScreenState.MENU],
+                         capturer=_FlakyCapturer(AdbError("stall"), fail_times=1))
+    before = retried.rng.getstate()
+    retried._capture()                                # fails once, reconnects, succeeds
+    assert retried.rng.getstate() == before           # ...and STILL draws no rng
+
+
 class _StuckCardCapturer:
     """Captures never change: every card tap looks ignored."""
 

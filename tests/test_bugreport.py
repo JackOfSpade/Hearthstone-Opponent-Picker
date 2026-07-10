@@ -6,7 +6,123 @@ Pure assembly and the log/journal/redaction helpers are unit-tested here; the I/
 
 from pathlib import Path
 
+import pytest
+
 from hop import bugreport as br
+
+#: The real host probe, captured before the autouse stub below replaces it, so the tests that
+#: exercise the probe itself can still reach it while collect() tests stay hermetic.
+_REAL_HOST_DIAGNOSTICS = br._host_diagnostics
+
+
+@pytest.fixture(autouse=True)
+def _stub_host_diagnostics(monkeypatch):
+    """collect() shells out to pmset/ping by default (macOS power/sleep/network facts). Stub it
+    so collection tests stay fast and hermetic on any host; tests that assert on the real probe
+    call :data:`_REAL_HOST_DIAGNOSTICS` (or pass an explicit ``host_probe``)."""
+    monkeypatch.setattr(br, "_host_diagnostics", lambda *a, **k: "")
+
+
+# ── host diagnostics / last-error diagnosis (answer "was it the Mac lock screen?") ──────
+
+class _Proc:
+    def __init__(self, stdout=b"", stderr=b""):
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _router(rules):
+    """A fake subprocess.run dispatching on the arg list. ``rules`` is a list of
+    (predicate(args)->bool, _Proc); a command matching nothing raises (tool absent)."""
+    def run(args, capture_output=True, timeout=None):
+        for pred, proc in rules:
+            if pred(args):
+                return proc
+        raise FileNotFoundError(" ".join(args))
+    return run
+
+
+def test_diagnose_last_error_names_a_screencap_timeout():
+    why = br._diagnose_last_error(
+        "TimeoutExpired: Command '[... exec-out screencap -p]' timed out after 20.0 seconds")
+    assert why
+    assert "wireless" in why.lower() and "lock screen does not cause this" in why.lower()
+    assert "capture_retry_attempts" in why      # points at the new self-heal + knob
+
+
+def test_diagnose_last_error_blank_for_unrecognized():
+    assert br._diagnose_last_error("") == ""
+    assert br._diagnose_last_error("ValueError: bad thing") == ""
+
+
+def test_format_status_surfaces_the_timeout_cause_inline():
+    status = {"running": False, "uptime_s": 651,
+              "last_error": "TimeoutExpired: adb ... screencap -p timed out after 20.0 seconds"}
+    out = br.format_status(status)
+    assert "last_error:" in out
+    assert "likely cause:" in out and "wireless" in out.lower()
+
+
+def test_host_diagnostics_reads_power_sleep_and_reachability():
+    rules = [
+        (lambda a: a[:3] == ["pmset", "-g", "batt"],
+         _Proc(b"Now drawing from 'Battery Power'\n -InternalBattery-0 (id=...) 88%; discharging\n")),
+        (lambda a: a[:3] == ["pmset", "-g", "assertions"],
+         _Proc(b"Assertion status system-wide:\n   PreventUserIdleSystemSleep    0\n"
+               b"   PreventUserIdleDisplaySleep   0\n   PreventSystemSleep            0\n")),
+        (lambda a: a[:3] == ["pmset", "-g", "log"],
+         _Proc(b"2026-07-10 15:18:39 -0600 Sleep               Entering Sleep state\n"
+               b"2026-07-10 15:22:10 -0600 Wake                Wake from Normal Sleep\n")),
+        (lambda a: a[:2] == ["pmset", "-g"] and len(a) == 2,
+         _Proc(b" System-wide power settings:\n sleep                1\n"
+               b" displaysleep         2\n disksleep            10\n")),
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"1 packets transmitted, 1 packets received, 0.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device offline\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555",
+                                 run=_router(rules), system=lambda: "Darwin")
+    assert "Battery Power" in out                       # AC-vs-battery is load-bearing
+    assert "PreventUserIdleSystemSleep=0" in out        # nothing was blocking idle sleep
+    assert "sleep=1m" in out and "displaysleep=2m" in out
+    assert "Entering Sleep state" in out                # the smoking-gun sleep/wake pair
+    assert "ICMP ping: reachable" in out                # ping parsed (not a substring of "unreachable")
+    assert "device offline" in out                      # adb get-state stderr folded in
+
+
+def test_host_diagnostics_flags_a_held_caffeinate_and_unreachable_phone():
+    """The two branches that directly answer the user's question ('caffeinate was on' / is the
+    phone up): a HELD caffeinate assertion, and a phone that does NOT answer ping."""
+    rules = [
+        (lambda a: a[:3] == ["pmset", "-g", "assertions"],
+         _Proc(b"   PreventUserIdleSystemSleep    1\n"
+               b"   pid 742(caffeinate): PreventUserIdleSystemSleep named: 'caffeinate'\n")),
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"2 packets transmitted, 0 packets received, 100.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device offline\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555",
+                                 run=_router(rules), system=lambda: "Darwin")
+    assert "PreventUserIdleSystemSleep=1" in out                     # idle system sleep WAS blocked
+    assert "assertion is held by a caffeinate process" in out        # caffeinate-present branch
+    assert "NO reply (unreachable right now)" in out                 # unreachable branch
+
+
+def test_diagnose_last_error_names_a_non_screencap_adb_timeout():
+    """The second branch: an adb command that timed out but was NOT the screencap."""
+    why = br._diagnose_last_error("TimeoutExpired: adb -s 1.2.3.4 shell dumpsys timed out after 20s")
+    assert why and "adb command timed out" in why.lower()
+    assert "screencap over wireless" not in why.lower()             # not the first branch
+
+
+def test_host_diagnostics_is_empty_off_macos():
+    assert _REAL_HOST_DIAGNOSTICS("1.2.3.4:5555", run=_router([]), system=lambda: "Linux") == ""
+
+
+def test_host_diagnostics_survives_missing_tools():
+    # every command raises (tools absent) -> no lines, never an exception
+    out = _REAL_HOST_DIAGNOSTICS("1.2.3.4:5555", run=_router([]), system=lambda: "Darwin")
+    assert out == ""
 
 
 def test_the_self_improve_prompt_is_first_and_present():
@@ -196,6 +312,80 @@ def test_summarize_journal_splits_classification_out_of_the_residual():
     # wall 12s = 2s humanized + 3s screencap + 7s classification + 0s OCR/logic
     assert "time: 12s wall = 2s humanized waits + 3s screencap I/O + 7s classification + 0s OCR/logic" in s
     assert "classification: 2 scans, 7.0s total (mean 3500ms, max 3500ms)" in s
+
+
+def test_summarize_journal_attributes_retry_stalls_to_stalled_io_not_ocr():
+    """A screencap that HUNG (capture_retry) is transport time, not OCR/logic. It must appear as
+    a distinct 'stalled I/O' term, so a 20s stall isn't misread as slow classification/logic."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 2.0}},
+        {"t": 2.0, "kind": "capture", "detail": {"ms": 1400}},
+        {"t": 3.4, "kind": "capture_retry", "detail": {"attempt": 1, "of": 3, "ms": 20000,
+                                                        "error": "adb ... screencap timed out"}},
+        {"t": 23.4, "kind": "capture", "detail": {"ms": 1500}},
+        {"t": 24.9, "kind": "tap", "detail": {"what": "play"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    # wall 25s = 2s humanized + 3s screencap + 20s stalled I/O + 0s classify/OCR/logic
+    assert "20s stalled I/O" in s
+    assert "0s classify/OCR/logic" in s          # the stall is NOT dumped into the residual
+
+
+def test_summarize_journal_surfaces_capture_retries():
+    """The new capture-retry resilience: a transient stall the hunt rode through must be
+    visible (it means the link wobbled), with the hung time and the last error."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "capture", "detail": {"ms": 1400}},
+        {"t": 1.4, "kind": "capture_retry",
+         "detail": {"attempt": 1, "of": 3, "ms": 20000, "error": "adb ... timed out after 20s"}},
+        {"t": 21.4, "kind": "capture", "detail": {"ms": 1500}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "capture retries: 1 screencap(s) stalled/failed" in s
+    assert "20.0s hung total" in s
+    assert "timed out after 20s" in s
+
+
+def test_summarize_journal_flags_a_degrading_capture_trend():
+    """A one-number mean hides a link that started fast and ended crawling. When the last
+    third's mean is much higher than the first third's, the summary must flag the TREND -
+    the precursor that would have foretold a stall/timeout."""
+    import json
+    fast = [{"t": float(i), "kind": "capture", "detail": {"ms": 1000}} for i in range(6)]
+    slow = [{"t": float(6 + i), "kind": "capture", "detail": {"ms": 5000}} for i in range(6)]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in fast + slow))
+    assert "TREND" in s and "DEGRADING" in s
+
+
+def test_summarize_journal_does_not_flag_a_steady_capture_stream():
+    """Ordinary jitter must stay quiet: no TREND flag when captures are steady."""
+    import json
+    steady = [{"t": float(i), "kind": "capture", "detail": {"ms": 1400}} for i in range(12)]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in steady))
+    assert "TREND" not in s
+
+
+def test_summarize_journal_trend_needs_a_large_ABSOLUTE_rise():
+    """The compound guard is `late > early*1.4 AND late - early > 800`. A big RATIO but a small
+    absolute rise (100->300ms) must NOT flag -- else fast phones trip on sub-ms jitter. Pins the
+    absolute conjunct independently (deleting it would turn this green->flag)."""
+    import json
+    evs = ([{"t": float(i), "kind": "capture", "detail": {"ms": 100}} for i in range(6)]
+           + [{"t": float(6 + i), "kind": "capture", "detail": {"ms": 300}} for i in range(6)])
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in evs))
+    assert "TREND" not in s                          # ratio 3.0 but rise only 200ms (< 800)
+
+
+def test_summarize_journal_trend_needs_a_large_RATIO():
+    """A big absolute rise but a shallow ratio (3000->4000ms) must NOT flag -- an already-slow
+    link creeping is not the DEGRADING signature. Pins the ratio conjunct independently."""
+    import json
+    evs = ([{"t": float(i), "kind": "capture", "detail": {"ms": 3000}} for i in range(6)]
+           + [{"t": float(6 + i), "kind": "capture", "detail": {"ms": 4000}} for i in range(6)])
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in evs))
+    assert "TREND" not in s                          # rise 1000ms (> 800) but ratio 1.33 (< 1.4)
 
 
 def test_summarize_journal_flags_a_marginal_unknown_as_needing_an_anchor():
@@ -583,6 +773,23 @@ def test_collect_bundles_config_journal_log_and_unknowns(tmp_path):
     assert "Rogue×1" in md and "stuck" in md              # journal summarised
     assert "boom" in md                                   # app log tailed
     assert "unknown_x_dispatch.png" in md                 # unknowns listed
+
+
+def test_collect_includes_the_host_power_section(tmp_path):
+    """The host power/sleep/network section is added from the config's adb_address with no
+    extra call-site wiring, so both the CLI and the app path get it."""
+    (tmp_path / "config.toml").write_text('[device]\nadb_address = "10.0.0.5:5555"\n')
+    seen = {}
+
+    def probe(addr):
+        seen["addr"] = addr
+        return "- power source: Now drawing from 'Battery Power'\n- sleep assertions: none held"
+
+    md = br.collect("died on a screencap timeout", _paths(tmp_path), version="2.0.0",
+                    clock=lambda: 0.0, host_probe=probe)
+    assert "Host power / sleep / network" in md
+    assert "Battery Power" in md
+    assert seen["addr"] == "10.0.0.5:5555"                 # address parsed out of the config
 
 
 def test_summarize_journal_names_the_state_before_an_unknown_halt():

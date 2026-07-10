@@ -44,3 +44,63 @@ def test_shell_reports_missing_adb_clearly():
     with pytest.raises(AdbError) as ei:
         a.shell("echo hi")
     assert "adb not found" in str(ei.value)
+
+
+def test_screencap_timeout_becomes_a_typed_adberror(monkeypatch):
+    """Regression: a wireless-ADB screencap that HANGS to the timeout used to raise a raw
+    subprocess.TimeoutExpired, which escaped every handler in Engine.run and killed the whole
+    hunt. It must convert to AdbError at the boundary (like the missing-binary case), so the
+    engine's capture-retry/clean-halt machinery can see it as an adb failure."""
+    import subprocess
+
+    a = Adb("1.2.3.4:5555", timeout=0.5)
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="adb exec-out screencap -p", timeout=0.5)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(AdbError) as ei:
+        a.screencap_png()
+    msg = str(ei.value).lower()
+    assert "timed out" in msg and "unreachable" in msg    # names the wireless-drop cause
+
+
+def test_spawn_time_oserror_becomes_a_typed_adberror(monkeypatch):
+    """The boundary promise is that NO raw subprocess/OS exception escapes _run. Besides
+    TimeoutExpired, subprocess.run can raise an OSError at spawn (ENOMEM/EAGAIN under memory
+    pressure -- a Mac thrashing on wake -- or PermissionError on a non-executable adb). That
+    must also convert to AdbError so the engine's retry/clean-halt machinery sees it."""
+    import subprocess
+
+    a = Adb("1.2.3.4:5555", timeout=0.5)
+
+    def boom(*args, **kwargs):
+        raise OSError(35, "Resource temporarily unavailable")   # EAGAIN from posix_spawn
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(AdbError) as ei:
+        a.screencap_png()
+    assert "failed to run" in str(ei.value).lower()
+
+
+def test_reconnect_disconnects_before_connecting(monkeypatch):
+    """A dropped Wi-Fi link often lingers as a zombie 'device' whose exec-out still hangs, so a
+    plain re-connect reuses the dead socket. reconnect() must disconnect FIRST, then connect."""
+    import subprocess
+
+    a = Adb("1.2.3.4:5555", timeout=0.5)
+    verbs = []
+
+    class _Proc:
+        stdout = b"connected to 1.2.3.4:5555\n"
+        stderr = b""
+        returncode = 0
+
+    def record(args, **kwargs):
+        verbs.append(args[1] if len(args) > 1 else args[0])   # connect / disconnect
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", record)
+    a.reconnect()
+    assert "disconnect" in verbs and "connect" in verbs
+    assert verbs.index("disconnect") < verbs.index("connect")   # zombie dropped before re-handshake

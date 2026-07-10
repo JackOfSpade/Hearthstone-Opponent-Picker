@@ -188,6 +188,14 @@ class VisionConfig:
     screen_wait_attempts: int
     screen_wait_timeout_s: float
     screen_wait_poll_s: float
+    #: How many times to re-attempt a SINGLE screencap that failed before surfacing it -- a
+    #: stalled/timed-out wireless-ADB frame, or an empty/undecodable one. Each retry forces a
+    #: fresh wireless link (disconnect+reconnect). A transient drop (screen lock, Doze, a Wi-Fi
+    #: power-save blip, the Mac briefly sleeping) recovers here instead of crashing the whole
+    #: hunt on one bad frame; a link that stays down exhausts these and fails closed cleanly
+    #: (stats intact). 1 = no retry (the old crash-on-first-stall behaviour). See
+    #: :meth:`hop.engine.Engine._capture_resilient`.
+    capture_retry_attempts: int
     #: Slice length for the stop-aware sleep. A stop request is honoured within about
     #: one slice instead of after the full (up to 12 s) delay, so "Stop" feels instant.
     stop_poll_s: float

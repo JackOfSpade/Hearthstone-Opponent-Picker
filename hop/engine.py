@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from random import Random
 
+from .adb import AdbError
 from .config import Config
 from .geometry import PanelGeometry
 from .hearthstone import GameLayout, MulliganRead, Point, read_mulligan
@@ -78,6 +79,14 @@ _PHASE_LABELS = {
 
 def _phase_label(state) -> str:
     return _PHASE_LABELS.get(state, state.value.replace("_", " "))
+
+
+#: Pause between capture retries (see :meth:`Engine._capture_resilient`), before forcing a
+#: fresh wireless link. A RAW, fixed sleep -- deliberately NOT a humanized ``timing`` delay --
+#: so a transient screencap stall self-heals without drawing from ``self.rng``, keeping the
+#: RNG stream bit-identical to a clean capture. Small: it only spaces the reconnect from the
+#: retry so the link has a beat to come back before we ask for the frame again.
+_CAPTURE_RETRY_BACKOFF_S = 1.0
 
 
 @dataclass
@@ -227,24 +236,87 @@ class Engine:
 
     def _capture(self) -> Frame:
         self.adb.ensure_connected()
-        t0 = self.clock()
-        frame = self.capturer.capture()
+        frame = self._capture_resilient()
         # When we last looked at the screen: the reference the next tap credits its
         # perception latency against (see `_tap`). Capture-*done*, not -start, so the
         # capture I/O itself is not credited -- deliberately conservative, biasing the
         # reaction slightly longer (never inhumanly fast).
         self._perceived_at = self.clock()
-        if self.debug:
-            # Screencap latency is the biggest, and until now invisible, cost of a run:
-            # ~1 s over USB / ~1.4 s over Wi-Fi on this phone (see `_await_screen_motion`),
-            # two-plus frames per tap, dozens per game, none of it journalled. A "why is
-            # it so slow" report was left subtracting timestamps and guessing whether a
-            # gap was a humanized wait or capture I/O. One ms line per frame makes the
-            # dominant cost attributable, and separable from the humanized delays that
-            # must NOT be "optimized" away. Timed on self.clock so it is 0 under the
-            # frozen test clock and adds no RNG draw.
-            self.debug.record("capture", ms=round((self.clock() - t0) * 1000.0))
         return frame
+
+    def _capture_resilient(self) -> Frame:
+        """One good frame, tolerating a *transient* capture failure instead of dying on it.
+
+        A wireless-ADB screencap that stalls or drops -- screen lock, Doze, a Wi-Fi power-save
+        blip, the Mac briefly sleeping -- raises ``CaptureError``/``AdbError``. A SINGLE such
+        stall used to crash the entire hunt: the raw ``TimeoutExpired`` escaped every handler in
+        :meth:`run` (it dispatched from inside a mid-mulligan ``_tap``). Instead we reconnect and
+        retry a bounded ``vision.capture_retry_attempts`` times; only a link that stays down
+        through all of them surfaces (as the last error, which :meth:`run` now halts on cleanly,
+        stats intact). The common transient -- one bad frame in a long session -- self-heals.
+
+        RNG-safety (this codebase is bit-identical-sensitive): the retry path draws NOTHING from
+        ``self.rng`` and never ticks ``HumanState``; its backoff is the stop-aware but RNG-free
+        ``self.sleep``. So a clean capture (one iteration, the overwhelming case) is byte-for-byte
+        the same sequence of RNG draws as before, and even a retried capture inserts zero draws.
+        A Stop is honoured between attempts (via the per-iteration ``self._stop`` check and the
+        stop-aware backoff), so the bounded recovery window can't swallow a Stop press.
+
+        Journalling: the ``capture`` ms is recorded for the SUCCESSFUL frame only, so the healthy
+        per-frame I/O stats the report leans on aren't skewed by a stall; each failed attempt
+        instead records its own ``capture_retry`` (how long it hung + the error) -- the exact
+        evidence a 'why did it die?' report needs, and the counter that shows a link going bad.
+        """
+        attempts = max(1, self.cfg.vision.capture_retry_attempts)
+        last_err: Exception | None = None
+        for i in range(attempts):
+            # Honour a Stop between attempts. A dead link makes each capturer.capture() hang the
+            # full adb timeout and each reconnect block too; without this a Stop pressed during a
+            # retry storm would go unobserved for the whole (bounded) recovery window. The raised
+            # StopRequested unwinds to run() -> stop_reason="user_stop" (the same clean unwind the
+            # in-tap sleeps use) and draws no RNG, so the clean path is unchanged.
+            if self._stop:
+                raise StopRequested()
+            t0 = self.clock()
+            try:
+                frame = self.capturer.capture()
+            except (CaptureError, AdbError) as e:
+                last_err = e
+                if self.debug:
+                    self.debug.record("capture_retry", attempt=i + 1, of=attempts,
+                                      ms=round((self.clock() - t0) * 1000.0),
+                                      error=str(e)[:200])
+                if i + 1 < attempts:
+                    self._recover_capture_link()
+                continue
+            if self.debug:
+                # Screencap latency is the biggest, and once-invisible, cost of a run:
+                # ~1 s over USB / ~1.4 s over Wi-Fi on this phone (see `_await_screen_motion`),
+                # two-plus frames per tap, dozens per game. One ms line per frame makes the
+                # dominant cost attributable, and separable from the humanized delays that must
+                # NOT be "optimized" away. Timed on self.clock so it is 0 under the frozen test
+                # clock and adds no RNG draw.
+                self.debug.record("capture", ms=round((self.clock() - t0) * 1000.0))
+            return frame
+        # Every attempt failed: hand the last error up. run() maps it to a clean stop.
+        assert last_err is not None  # attempts >= 1, so the loop ran and set this
+        raise last_err
+
+    def _recover_capture_link(self) -> None:
+        """Between capture retries: pause a beat, then force a fresh wireless link. Best-effort
+        and RNG-free -- the backoff is the STOP-AWARE ``self.sleep`` (``_interruptible_sleep``
+        draws nothing from ``self.rng`` and never ticks ``HumanState``, so it keeps bit-identity
+        while still honouring a Stop within one ``stop_poll_s`` slice), and the reconnect is
+        guarded so a failed reconnect doesn't abort the retry loop -- we still want the next
+        screencap attempt (the link may have come back on its own). ``getattr`` so a duck-typed
+        adb without ``reconnect`` (older test fakes) simply skips the reconnect."""
+        self.sleep(_CAPTURE_RETRY_BACKOFF_S)
+        recover = getattr(self.adb, "reconnect", None)
+        if recover is not None:
+            try:
+                recover()
+            except Exception:
+                pass
 
     def _tap(
         self,
@@ -632,6 +704,17 @@ class Engine:
         except CaptureError as e:
             self.stats.stop_reason = "capture_error"
             self._notify_halt(f"Capture failed: {e}")
+        except AdbError as e:
+            # A transport failure that survived the in-capture retry+reconnect
+            # (`_capture_resilient`): the Wi-Fi link stayed down through every attempt -- the
+            # Mac asleep, the phone off the network, the router gone. Not a hop fault and not a
+            # blind-tap risk. End the run cleanly with a named stop_reason and the stats intact,
+            # exactly like its CaptureError sibling, instead of letting a raw adb error escape to
+            # the controller thread -- which reported only a bare traceback and lost the clean
+            # stop. (Before the retry landed, this was the crash the user pasted: a screencap
+            # TimeoutExpired thrown from a mid-mulligan _tap, caught by nothing.)
+            self.stats.stop_reason = "adb_error"
+            self._notify_halt(f"ADB link failed: {e}")
         except Halt as e:
             self.stats.stop_reason = f"halt:{e.reason}"
             self._notify_halt(f"HALTED: {e.reason}")
