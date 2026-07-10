@@ -92,6 +92,29 @@ def think_time(
     return base * scale + reading
 
 
+def credit_latency(think_s: float, latency_s: float, floor_s: float) -> float:
+    """Absorb perception latency into an already-sampled think time instead of
+    *stacking* the wait on top of it.
+
+    The sampled ``think_s`` is the human's whole reaction budget for this decision.
+    But to a detector, the reaction clock starts when the screen becomes actionable,
+    and by the time we get here we have already spent ``latency_s`` of wall-clock
+    perceiving it (screencap ~1.4 s over Wi-Fi + a sliding-window NCC classification
+    ~3.7 s). Waiting the *full* ``think_s`` again makes the observable reaction
+    ``latency + think`` -- inhumanly slow (it overran the mulligan timer). So wait only
+    the remainder, never dropping below ``floor_s`` (the model's own shift -- the
+    irreducible reaction, so we never tap faster than a human can) and never
+    *lengthening* a reaction that was already quicker than that floor.
+
+    Only ever shortens: ``latency_s == 0`` returns ``think_s`` unchanged, so under the
+    frozen test clock (no latency) behavior is identical, and the ``think_s`` the caller
+    still feeds to ``HumanState.tick`` keeps the RNG-dependent stream bit-identical --
+    only the realized sleep shrinks, and only when a real clock is advancing.
+    """
+    floor = min(think_s, floor_s)
+    return max(floor, think_s - max(0.0, latency_s))
+
+
 def read_consider(rng: Random, cfg: TimingConfig, state: HumanState) -> float:
     """A per-item 'reading the board' consideration pause, HumanState-scaled."""
     anchor = cfg.read_consider_dwell_s * (1.0 + 0.5 * state.fatigue)

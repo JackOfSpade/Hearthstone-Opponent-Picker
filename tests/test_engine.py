@@ -109,6 +109,76 @@ def test_mulligan_read_accumulates_the_class_distribution(cfg):
     assert eng.stats.concedes_until_target is None   # no target yet
 
 
+def test_mulligan_reread_is_journalled_with_its_recovered_class(cfg):
+    """Report blind spot regression: when the first OCR whiffs (opponent None) and the
+    engine's single re-read resolves the class, that re-read must be journalled too --
+    else the report shows only the failed first read ('opponents seen: ?×1') while the
+    engine had correctly conceded the real matchup. Observability only: the second record
+    must not add an observe_confidence or otherwise perturb the run."""
+    from dataclasses import replace
+    from hop.geometry import PanelGeometry
+
+    class RecordingDebug:
+        def __init__(self):
+            self.events = []
+
+        def record(self, kind, /, **detail):
+            self.events.append((kind, detail))
+
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    dbg = RecordingDebug()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1),
+                 layout=GameLayout(),
+                 capturer=ScriptedCapturer([gray_frame(80, 40), gray_frame(80, 40)]),
+                 debug=dbg)
+    eng._execute_reject = lambda read: None    # skip the concede journey; we test the read
+    reads = iter([
+        MulliganRead(None, False, 0, 0.0, "??", "tesseract"),                 # first: unusable
+        MulliganRead(HeroClass.DRUID, False, 3, 0.61, "DRUID", "tesseract"),  # re-read: recovered
+    ])
+    eng._read_mulligan = lambda *a, **k: next(reads)
+
+    eng._handle_mulligan(gray_frame(80, 40))
+
+    logged = [d for k, d in dbg.events if k == "mulligan_read"]
+    assert len(logged) == 2                                 # the whiff AND the recovery
+    assert logged[0]["opponent"] == "?" and not logged[0].get("reread")
+    assert logged[1]["reread"] is True and logged[1]["opponent"] == "Druid"
+    # the recovered read is what drove the stats (the run conceded the real matchup)
+    assert eng.stats.class_distribution == {"Druid": 1}
+    assert eng.stats.last_opponent == "Druid"
+
+
+def test_queue_dispatch_sets_the_scoped_prior_for_the_next_look(cfg):
+    """The dominant heartbeat: after a QUEUE poll the next top-loop look is scoped to
+    {queue, mulligan} (still-queueing or matched-in) -- the interrupt floor still catches a
+    disconnect. A wrong guess only costs the full scan back (classify_expected)."""
+    from hop.perception.screens import Classification
+    eng, _ = _engine(cfg, [ScreenState.QUEUE])
+    eng._dispatch(Classification(ScreenState.QUEUE, 0.9), gray_frame(80, 40))
+    assert eng._expected_next == {ScreenState.QUEUE, ScreenState.MULLIGAN}
+
+
+def test_in_game_poll_sets_the_scoped_prior(cfg):
+    """A board at the top of the loop scopes its next look to {in_game}; the floor's
+    victory/defeat still catch the tail of a concede animation."""
+    eng, _ = _engine(cfg, [ScreenState.IN_GAME])
+    eng._own_game = True
+    eng._handle_in_game()        # first poll: reads the board, leaves a scoped prior
+    assert eng._expected_next == {ScreenState.IN_GAME}
+
+
+def test_run_consumes_and_resets_the_scoped_prior_each_iteration(cfg):
+    """`_expected_next` is consume-once: read at the top of the loop and cleared, so a
+    branch that leaves no prior falls back to a full classify (never a stale scope)."""
+    eng, _ = _engine(cfg, [ScreenState.MENU])   # MENU halts; one iteration runs first
+    eng._expected_next = {ScreenState.QUEUE}
+    eng.run(max_iterations=1)
+    assert eng._expected_next is None            # consumed at the top of the iteration
+
+
 def test_unknown_screen_halts(cfg):
     """A *persistently* unrecognized screen must fail closed."""
     eng, backend = _engine(cfg, [ScreenState.UNKNOWN])
@@ -568,3 +638,61 @@ def test_tap_records_timing_evidence_for_delay_reports(cfg):
     assert "tap_timing" in kinds
     assert any(k == "sleep" and d["reason"] == "tap_think" and d["what"] == "play"
                for k, d in dbg.events)
+
+
+class _RecordingDebug:
+    def __init__(self):
+        self.events = []
+
+    def record(self, kind, /, **detail):
+        self.events.append((kind, detail))
+
+
+def _tap_think(events):
+    return next(d for k, d in events if k == "sleep" and d.get("reason") == "tap_think")
+
+
+def test_tap_credits_perception_latency_against_the_think(cfg):
+    """A wireless run spends ~5 s perceiving each frame before it can tap; that latency is
+    part of the reaction a detector times, so the tap credits it against the sampled think
+    instead of stacking. When the latency already exceeds the think budget the *added* wait
+    collapses to the human reaction floor -- not latency+think piled on top."""
+    from hop.geometry import PanelGeometry
+
+    dbg = _RecordingDebug()
+    layout = GameLayout()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 100.0, rng=Random(1), debug=dbg,
+                 capturer=ScriptedCapturer([gray_frame(80, 40, 20), gray_frame(80, 40, 220)]))
+    eng._perceived_at = 0.0     # the actionable frame was perceived "100 s" of latency ago
+    eng._tap(layout.card_point(0.5), committing=False, decision_type="reject",
+             verify_region=layout.card_region(0.5), allow_correction=False,
+             what="mulligan_card[0]")
+
+    ts = _tap_think(dbg.events)
+    assert ts["credited_s"] > 0                       # latency was credited, not ignored
+    assert ts["seconds"] < ts["think_s"]              # waited less than the full sampled think
+    # latency (100 s) dwarfs the think, so the added wait sits exactly on the floor
+    assert ts["seconds"] == round(min(ts["think_s"], cfg.timing.think_reject_shift), 3)
+
+
+def test_tap_credits_nothing_under_the_frozen_clock(cfg):
+    """Bit-identical guard: with no elapsed latency (the frozen test clock) the tap waits
+    the FULL sampled think and credits nothing, so existing timing behavior is unchanged."""
+    from hop.geometry import PanelGeometry
+
+    dbg = _RecordingDebug()
+    layout = GameLayout()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1), debug=dbg,
+                 capturer=ScriptedCapturer([gray_frame(80, 40, 20), gray_frame(80, 40, 220)]))
+    eng._perceived_at = 0.0
+    eng._tap(layout.card_point(0.5), committing=False, decision_type="reject",
+             verify_region=layout.card_region(0.5), allow_correction=False,
+             what="mulligan_card[0]")
+
+    ts = _tap_think(dbg.events)
+    assert ts["credited_s"] == 0.0
+    assert ts["seconds"] == ts["think_s"]

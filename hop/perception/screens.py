@@ -98,9 +98,75 @@ class Classification:
     at: tuple[int, int] | None = None
 
 
+#: Anchors that can legitimately draw *over* another screen: modals/dialogs and the
+#: end-of-game banners that fade in while the board is still drawn. Every scoped check
+#: (:meth:`ScreenClassifier.classify_expected`) scans these UNCONDITIONALLY on top of the
+#: states it expects, so narrowing the scan can never blind the loop to an interruption a
+#: full :meth:`classify` would have caught -- a disconnect dialog over the queue, a
+#: reconnect dialog over the open Game Menu, an opponent-concede banner over the board.
+#: This fixed floor is what makes scoping safe: the original "scan anything strictly
+#: higher-priority than the expected set" rule scanned the EMPTY set when the expected
+#: anchor was itself top-priority (e.g. concede_menu), and would have tapped Concede's
+#: fixed coordinate straight into a co-drawn reconnect dialog's Cancel.
+INTERRUPT_FLOOR = frozenset({
+    ScreenState.RECONNECT_DIALOG, ScreenState.RECONNECTING, ScreenState.ERROR_DIALOG,
+    ScreenState.INCOMPLETE_DECK, ScreenState.QUEST_POPUP, ScreenState.CONCEDE_MENU,
+    ScreenState.VICTORY, ScreenState.DEFEAT,
+})
+
+
 class ScreenClassifier:
     def __init__(self, anchors: list[Anchor]):
         self.anchors = anchors
+
+    def classify_expected(self, frame: Frame, expected) -> Classification:
+        """A cost-scoped :meth:`classify` for sites with a strong prior on the next screen.
+
+        A full ``classify`` NCC-scans every anchor (~3.8 s on this phone). Where the loop
+        already knows what should be on screen (still-queueing, the mulligan about to
+        leave to the board, the gear about to open the Game Menu), we needn't re-ask
+        "which of all 19 screens is this?". Scan only ``expected`` (the states we trust a
+        hit on here) plus the fixed :data:`INTERRUPT_FLOOR`, and resolve by the SAME
+        ``(priority, score)`` argmax ``classify`` uses over exactly those anchors.
+
+        **Result-identical to** :meth:`classify` **by construction**, which is what lets
+        scoping be a pure speed-up that leaves the loop's decisions, journal and RNG
+        stream bit-identical (see the co-match fixtures in the tests):
+
+        * A win by a trusted ``expected`` state is returned directly. It is ``classify``'s
+          winner too: anchor glyphs sit in disjoint screen regions, so no *un-scanned*
+          base anchor can out-score it on a frame showing this screen, and every
+          higher-priority modal that could is in the floor and *is* scanned. (The known
+          cross-fade where two base anchors co-clear -- mulligan+in_game, defeat+in_game --
+          is handled by the caller putting BOTH in ``expected``, so the argmax matches.)
+        * ANY other outcome -- a floor modal wins, nothing clears, or UNKNOWN -- forces a
+          full :meth:`classify` on the SAME frame (no second screencap, no RNG, no sleep).
+
+        So a wrong or missing ``expected`` only costs the full scan back; it can never
+        return a screen ``classify`` wouldn't have. ``expected`` is any iterable of
+        :class:`ScreenState`; an empty one degrades to a plain ``classify``.
+        """
+        expected = frozenset(expected)
+        scan = expected | INTERRUPT_FLOOR
+        best_state = ScreenState.UNKNOWN
+        best_rank: tuple[int, float] | None = None
+        winner = None
+        for anchor in self.anchors:
+            if anchor.state not in scan:
+                continue
+            m = best_match(frame, anchor.template)
+            if not m:
+                continue
+            rank = (anchor.priority, m.score)
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_state = anchor.state
+                winner = m
+        if winner is not None and best_state in expected:
+            return Classification(best_state, winner.score, (winner.x, winner.y))
+        # Floor-modal win / nothing cleared / UNKNOWN: we cannot be sure the scoped scan
+        # saw the real winner, so pay the authoritative full scan on this same frame.
+        return self.classify(frame)
 
     def classify(self, frame: Frame) -> Classification:
         """Return the best-matching screen state and *its* confidence.

@@ -131,6 +131,90 @@ def test_summarize_journal_surfaces_sleep_budget_and_gaps():
     assert "largest journal gaps" in summary and "tap->tap 4.6s" in summary
 
 
+def test_summarize_journal_accounts_for_screencap_latency():
+    """Screencap I/O is the dominant, previously-invisible cost of a run. Once the engine
+    journals a `capture` ms per frame, the summary must split the wall-clock into humanized
+    waits vs screencap vs the rest, and stat the frames - so "why is it slow" is answered
+    at a glance instead of by subtracting timestamps."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "run_criteria",
+         "detail": {"target_classes": ["MAGE"], "require_second": False, "mode": "casual"}},
+        {"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 2.0}},
+        {"t": 2.0, "kind": "capture", "detail": {"ms": 1400}},
+        {"t": 3.4, "kind": "tap", "detail": {"what": "play"}},
+        {"t": 3.4, "kind": "capture", "detail": {"ms": 1600}},
+        {"t": 10.0, "kind": "verify_ok", "detail": {"change_kind": "full_transition"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    s = br.summarize_journal(text)
+    # wall 10s = 2s humanized + 3s screencap + 5s other
+    assert "time: 10s wall = 2s humanized waits + 3s screencap I/O + 5s classify/OCR/logic" in s
+    assert "captures: 2 screencaps, 3.0s total" in s
+    assert "mean 1500ms" in s and "max 1600ms" in s
+
+
+def test_summarize_journal_splits_classification_out_of_the_residual():
+    """Once the engine journals `classify` ms, the summary must break it out of the
+    'classify/OCR/logic' bucket - it is the second-biggest cost and lumping it hid that."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 2.0}},
+        {"t": 2.0, "kind": "capture", "detail": {"ms": 1500}},
+        {"t": 3.5, "kind": "classify", "detail": {"ms": 3500, "state": "queue"}},
+        {"t": 7.0, "kind": "capture", "detail": {"ms": 1500}},
+        {"t": 8.5, "kind": "classify", "detail": {"ms": 3500, "state": "unknown"}},
+        {"t": 12.0, "kind": "tap", "detail": {"what": "play"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    s = br.summarize_journal(text)
+    # wall 12s = 2s humanized + 3s screencap + 7s classification + 0s OCR/logic
+    assert "time: 12s wall = 2s humanized waits + 3s screencap I/O + 7s classification + 0s OCR/logic" in s
+    assert "classification: 2 scans, 7.0s total (mean 3500ms, max 3500ms)" in s
+
+
+def test_summarize_journal_flags_a_marginal_unknown_as_needing_an_anchor():
+    """The exact halt this report caught: the board classified UNKNOWN at in_game 0.686
+    vs a 0.72 threshold. A miss that small is a known screen with an uncovered face; the
+    summary must say so with the margin, not leave it as a bare near-miss."""
+    import json
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "mulligan_confirm", "near_misses": [
+            {"state": "in_game", "score": 0.686, "thr": 0.72}]}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    s = br.summarize_journal(text)
+    assert "MARGINAL: missed by 0.034" in s
+    assert "another anchor" in s
+
+
+def test_summarize_journal_does_not_flag_a_far_off_unknown_as_marginal():
+    """A genuinely novel screen (top anchor far below threshold) must NOT be mislabelled
+    'almost known' - that would send the fix in the wrong direction."""
+    import json
+    events = [{"kind": "unknown_screen", "detail": {"near_misses": [
+        {"state": "collection", "score": 0.20, "thr": 0.72}]}}]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "collection 0.2 (thr 0.72)" in s
+    assert "MARGINAL" not in s
+
+
+def test_summarize_journal_time_split_degrades_without_capture_events():
+    """A journal written before capture-timing has no `capture` events; the summary still
+    reports the wall/humanized split rather than a misleading 0s of screencap."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 2.0}},
+        {"t": 9.0, "kind": "tap", "detail": {"what": "play"}},
+    ]
+    text = "\n".join(json.dumps(e) for e in events)
+    s = br.summarize_journal(text)
+    assert "time: 9s wall, 2s of it humanized waits" in s
+    assert "screencap I/O +" not in s          # no fabricated screencap term
+    assert "captures:" not in s
+
+
 def test_summarize_journal_surfaces_the_unknown_screen_near_miss():
     """The closest known screen is the single most actionable line for an unknown halt."""
     import json
@@ -144,6 +228,145 @@ def test_summarize_journal_surfaces_the_unknown_screen_near_miss():
     s = br.summarize_journal(text)
     assert "closest known screen" in s
     assert "in_game 0.539 (thr 0.72)" in s
+
+
+def test_summarize_journal_credits_a_reread_that_recovered_the_class():
+    """The whiff-then-recover case: the first OCR reads opponent '?' (conf 0.0), the
+    engine's single re-read resolves the real class and the run concedes correctly.
+    The report must show the resolved class and say the miss was recovered -- NOT count
+    '?' as an opponent, which made a healthy run read like class detection had died."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Druid", "conf": 0.61, "reread": True}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "opponents seen: Druid×1" in s   # the resolved class, not "?×1"
+    assert "?×" not in s                      # the failed first read is not an opponent
+    assert "recovered by a re-read" in s      # the story is told, framed as not-a-fault
+
+
+def test_summarize_journal_flags_a_reread_that_stayed_unreadable():
+    """A re-read that itself comes back '?' is the line that precedes a
+    'could not read mulligan' halt -- the summary must call it out, not swallow it."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0}},
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0, "reread": True}},
+        {"kind": "halt", "detail": {"message": "could not read mulligan (class='', cards=0)"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "still unreadable after the re-read" in s
+    assert "opponents seen" not in s          # no class was ever resolved
+
+
+def test_summarize_journal_reports_think_absorbed_into_latency():
+    """The latency-credit's on-device proof: think seconds absorbed into perception
+    latency (credited_s on tap_think sleeps) are totalled so a slow wireless run can be
+    checked for the anti-stacking actually firing."""
+    import json
+    events = [
+        {"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.75, "credited_s": 2.1}},
+        {"t": 1.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.45, "credited_s": 1.3}},
+        {"t": 2.0, "kind": "sleep", "detail": {"reason": "tap_settle", "seconds": 0.6}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "think absorbed into latency: 3.4s" in s
+
+
+def test_summarize_journal_omits_absorbed_line_when_nothing_credited():
+    """No credit (e.g. a fast USB run, or the credit disabled) -> the line is absent, not
+    a misleading '0.0s'."""
+    import json
+    events = [{"t": 0.0, "kind": "sleep", "detail": {"reason": "tap_think", "seconds": 1.7, "credited_s": 0.0}}]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "think absorbed" not in s
+
+
+def test_summarize_journal_near_miss_reports_the_gap_to_decide_threshold_vs_anchor():
+    """A marginal near-miss can be fixed by lowering the threshold OR adding an anchor; the
+    deciding fact is the gap to the nearest DIFFERENT screen. A wide gap means the board owns
+    the score band, so lowering is safe -- the report should say so, not just 'add an anchor
+    or lower threshold'."""
+    import json
+    # in_game 0.69 missed by 0.03; next different screen concede_menu 0.28 -> 0.41 gap
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "mulligan_confirm", "waiting_to_leave": "mulligan",
+            "near_misses": [{"state": "in_game", "score": 0.690, "thr": 0.72},
+                            {"state": "in_game", "score": 0.484, "thr": 0.72},
+                            {"state": "concede_menu", "score": 0.282, "thr": 0.72}]}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "nearest DIFFERENT screen is concede_menu 0.282 (0.408 below)" in s
+    assert "lowering the threshold is safe" in s
+
+
+def test_summarize_journal_near_miss_warns_when_the_gap_is_narrow():
+    """A close runner-up means lowering the threshold could mis-ID -> recommend an anchor."""
+    import json
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "dispatch",
+            "near_misses": [{"state": "in_game", "score": 0.700, "thr": 0.72},
+                            {"state": "concede_menu", "score": 0.640, "thr": 0.72}]}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "prefer a new anchor" in s
+
+
+def test_summarize_journal_flags_a_false_halt_when_the_awaited_screen_is_gone():
+    """The misleading-halt case: we tapped Confirm, waited for 'mulligan' to leave, and it
+    DID -- the board (in_game) is up but scores just under threshold, so it reads UNKNOWN
+    and the halt message wrongly blames Confirm. The summary must flag it as a false halt
+    on the destination, since 'mulligan' isn't even among the near-misses."""
+    import json
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "mulligan_confirm", "waiting_to_leave": "mulligan",
+            "near_misses": [{"state": "in_game", "score": 0.662, "thr": 0.72},
+                            {"state": "in_game", "score": 0.504, "thr": 0.72},
+                            {"state": "concede_menu", "score": 0.216, "thr": 0.72}]}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "likely FALSE halt" in s
+    assert "'mulligan' is GONE" in s
+    assert "in_game" in s     # names the destination to fix
+
+
+def test_summarize_journal_does_not_flag_false_halt_when_awaited_screen_is_present():
+    """If the screen we're waiting to leave IS still a top near-miss, it may genuinely be
+    stuck -- do NOT cry false halt."""
+    import json
+    events = [
+        {"kind": "unknown_screen", "detail": {"where": "mulligan_confirm", "waiting_to_leave": "mulligan",
+            "near_misses": [{"state": "mulligan", "score": 0.71, "thr": 0.72},
+                            {"state": "in_game", "score": 0.30, "thr": 0.72}]}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "FALSE halt" not in s
+
+
+def test_summarize_journal_breaks_down_per_tap_think_vs_perception():
+    """The recurring 'why is <step> so slow?' answer: for each tap, split the wall-clock to
+    reach+fire it into humanized think vs perception (screencap+classify). Perception should
+    dominate, so a step that 'feels like it thinks too long' is exposed as I/O-bound."""
+    import json
+    events = [
+        # reaching the concede: a classify + captures, then a tiny credited think, then the tap
+        {"kind": "classify", "detail": {"ms": 3800, "state": "concede_menu"}},
+        {"kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.75, "credited_s": 2.78}},
+        {"kind": "capture", "detail": {"ms": 2100}},
+        {"kind": "tap", "detail": {"what": "concede"}},
+        # a cheaper tap for contrast
+        {"kind": "capture", "detail": {"ms": 1200}},
+        {"kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.45, "credited_s": 1.4}},
+        {"kind": "tap", "detail": {"what": "end_dismiss"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "per-tap reaction" in s
+    # concede: 0.75s think + (3.8+2.1)=5.9s perception -> think is the small part
+    assert "concede 6.7s = 0.8s think + 5.9s screencap/classify" in s
 
 
 def test_summarize_journal_shows_any_when_no_target_classes():

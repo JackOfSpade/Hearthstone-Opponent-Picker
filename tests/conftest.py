@@ -118,3 +118,8 @@ class FakeClassifier:
         st = self._states[min(self._i, len(self._states) - 1)]
         self._i += 1
         return self._Classification(st, 0.95)
+
+    def classify_expected(self, frame, expected):
+        # Scoping is result-identical to a full classify, and this fake is scripted by
+        # sequence, so a scoped look returns (and consumes) exactly what classify would.
+        return self.classify(frame)

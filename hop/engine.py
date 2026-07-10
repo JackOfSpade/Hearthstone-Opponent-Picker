@@ -158,6 +158,16 @@ class Engine:
 
         self.stats = RunStats()
         self._stop = False
+        #: monotonic time the most recent frame finished capturing. The reaction clock
+        #: a detector sees starts when the screen becomes actionable, so the capture +
+        #: classification latency spent perceiving it is credited against the next tap's
+        #: think time (see `_tap`) rather than stacked on top. None until the first look.
+        self._perceived_at: float | None = None
+        #: Scoped prior for the NEXT top-loop classify: the set of screens the branch we
+        #: just ran expects to see next (e.g. QUEUE sets {queue, mulligan}). Consumed and
+        #: reset to None every iteration, so a branch that sets nothing => full classify.
+        #: A wrong guess only costs the full scan back (see classify_expected).
+        self._expected_next = None
         self._reconnect_attempts = 0
         #: consecutive top-level dispatches that saw a live board
         self._in_game_polls = 0
@@ -214,7 +224,24 @@ class Engine:
 
     def _capture(self) -> Frame:
         self.adb.ensure_connected()
-        return self.capturer.capture()
+        t0 = self.clock()
+        frame = self.capturer.capture()
+        # When we last looked at the screen: the reference the next tap credits its
+        # perception latency against (see `_tap`). Capture-*done*, not -start, so the
+        # capture I/O itself is not credited -- deliberately conservative, biasing the
+        # reaction slightly longer (never inhumanly fast).
+        self._perceived_at = self.clock()
+        if self.debug:
+            # Screencap latency is the biggest, and until now invisible, cost of a run:
+            # ~1 s over USB / ~1.4 s over Wi-Fi on this phone (see `_await_screen_motion`),
+            # two-plus frames per tap, dozens per game, none of it journalled. A "why is
+            # it so slow" report was left subtracting timestamps and guessing whether a
+            # gap was a humanized wait or capture I/O. One ms line per frame makes the
+            # dominant cost attributable, and separable from the humanized delays that
+            # must NOT be "optimized" away. Timed on self.clock so it is 0 under the
+            # frozen test clock and adds no RNG draw.
+            self.debug.record("capture", ms=round((self.clock() - t0) * 1000.0))
+        return frame
 
     def _tap(
         self,
@@ -238,13 +265,26 @@ class Engine:
         thing I touched change?" is both the honest question and a stricter one: a
         tap that misses the card leaves the card unchanged, and still fails.
         """
-        # L4 think time (stateful)
+        # L4 think time (stateful). `think` is the human's whole reaction budget; the
+        # perception latency already burned on this frame (capture + classification, the
+        # ~5 s that dominate a wireless run) is part of that same reaction to a detector,
+        # so we credit it against the wait instead of stacking on top -- otherwise the
+        # observable reaction was `latency + think`, inhumanly slow (it overran the
+        # mulligan timer). The SAME `think` is sampled (one RNG draw, unchanged) and still
+        # feeds `state.tick` below, so HumanState and the whole RNG-dependent stream stay
+        # bit-identical; only the realized sleep shrinks, and only when a real clock runs
+        # (under the frozen test clock the credit is 0 and the wait is unchanged).
         think = timing.think_time(
             self.rng, decision_type, self.cfg.timing, self.state,
             visual_complexity=visual_complexity, novelty=novelty,
         )
-        self._sleep_for(think, "tap_think", what=what or "?",
-                        decision_type=decision_type, committing=committing)
+        latency = 0.0 if self._perceived_at is None else max(0.0, self.clock() - self._perceived_at)
+        floor = (self.cfg.timing.think_commit_shift if decision_type == "commit"
+                 else self.cfg.timing.think_reject_shift)
+        wait = timing.credit_latency(think, latency, floor)
+        self._sleep_for(wait, "tap_think", what=what or "?",
+                        decision_type=decision_type, committing=committing,
+                        think_s=round(think, 3), credited_s=round(think - wait, 3))
 
         tx, ty, radius = point.to_px(self.panel)
         before = self._capture()
@@ -390,11 +430,28 @@ class Engine:
 
     # ── screen handling ──────────────────────────────────────────────────────
 
-    def _classify(self) -> tuple[Classification, Frame]:
+    def _classify(self, expected=None) -> tuple[Classification, Frame]:
         frame = self._capture()
-        return self.classifier.classify(frame), frame
+        t0 = self.clock()
+        # `expected` (a set of ScreenStates) scopes the NCC scan to the screens this site
+        # actually expects, plus the fixed interrupt floor -- ~300 ms instead of ~3.8 s,
+        # and result-identical to a full classify (a missed expectation just full-scans on
+        # the same frame). None => full classify, so every unscoped caller is unchanged.
+        cls = (self.classifier.classify(frame) if expected is None
+               else self.classifier.classify_expected(frame, expected))
+        if self.debug:
+            # Classification is a sliding-window NCC scan over every anchor's region and,
+            # on this phone, the second-biggest cost after screencap (~3-4 s/call at the
+            # current frame size) - and until now it hid inside the delay report's
+            # "classify/OCR/logic" residual. Journal its ms and the state it resolved to,
+            # so the report can name it the way it now names capture latency, and so a
+            # sub-threshold UNKNOWN shows up inline. self.clock => 0 under the frozen test
+            # clock and adds no RNG draw.
+            self.debug.record("classify", ms=round((self.clock() - t0) * 1000.0),
+                              state=cls.state.value)
+        return cls, frame
 
-    def _classify_settled(self) -> tuple[Classification, Frame]:
+    def _classify_settled(self, expected=None) -> tuple[Classification, Frame]:
         """Classify, tolerating transient animation frames.
 
         Hearthstone animates between screens (the board blurs and fades out after
@@ -402,15 +459,18 @@ class Engine:
         we looked mid-transition rather than that we are lost. Re-look a bounded
         number of times - **never tapping** - and only then let UNKNOWN stand so
         the caller can fail closed.
+
+        ``expected`` scopes each look (see :meth:`_classify`); a transient UNKNOWN
+        already full-scans (nothing in the scoped set cleared), so settling is unaffected.
         """
         attempts = max(1, self.cfg.vision.unknown_settle_attempts)
-        cls, frame = self._classify()
+        cls, frame = self._classify(expected)
         for _ in range(attempts - 1):
             if cls.state != ScreenState.UNKNOWN:
                 break
             self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
                             "unknown_settle")
-            cls, frame = self._classify()
+            cls, frame = self._classify(expected)
         return cls, frame
 
     # ── waiting by looking, never by sleeping ────────────────────────────────
@@ -441,7 +501,8 @@ class Engine:
     def _wait_until(self, predicate, *, what: str,
                     attempts: int | None = None,
                     timeout_s: float | None = None,
-                    poll_s: float | None = None) -> tuple[bool, Classification, Frame]:
+                    poll_s: float | None = None,
+                    expected=None) -> tuple[bool, Classification, Frame]:
         """Poll the screen until ``predicate(cls, frame)`` holds. **Never taps.**
 
         Returns ``(satisfied, last_classification, last_frame)``; the caller decides
@@ -459,7 +520,7 @@ class Engine:
         timeout_s = v.screen_wait_timeout_s if timeout_s is None else timeout_s
         poll_s = v.screen_wait_poll_s if poll_s is None else poll_s
         deadline = self.clock() + timeout_s
-        cls, frame = self._classify()
+        cls, frame = self._classify(expected)
         for _ in range(attempts - 1):
             if self._stop:                       # bail before another ~1.4 s screencap
                 raise StopRequested()
@@ -469,13 +530,14 @@ class Engine:
                 break
             self._sleep_for(timing.human_delay(self.rng, poll_s, self.cfg.timing),
                             "wait_until_poll", what=what, state=cls.state.value)
-            cls, frame = self._classify()
+            cls, frame = self._classify(expected)
         satisfied = predicate(cls, frame)
         if not satisfied and self.debug:
             self.debug.record("wait_timeout", what=what, state=cls.state.value)
         return satisfied, cls, frame
 
-    def _wait_until_screen_leaves(self, state: ScreenState, *, where: str, stuck: str) -> Classification:
+    def _wait_until_screen_leaves(self, state: ScreenState, *, where: str, stuck: str,
+                                  arrivals=()) -> Classification:
         """Wait until the screen *positively* shows something other than ``state``.
 
         **UNKNOWN is never proof that we left.** A frame we could not read is a frame
@@ -486,9 +548,18 @@ class Engine:
 
         So UNKNOWN keeps us waiting, and if the budget runs out we fail closed and
         keep the pixels.
+
+        ``arrivals`` names the screens we expect to land on, so the wait can scope its
+        looks to ``{state} | arrivals`` (+ the interrupt floor). ``state`` (the FROM
+        screen) MUST be in the scoped set: while it is still up its anchor is the true
+        winner, and during a cross-fade it can out-score the arriving screen -- omitting
+        it would let a scoped look call "left" one poll early. Still result-identical to
+        an unscoped wait (any un-listed arrival just full-scans on its frame).
         """
+        expected = frozenset({state}) | frozenset(arrivals)
         ok, cls, frame = self._wait_until(
-            lambda c, _f: c.state not in (state, ScreenState.UNKNOWN), what=where)
+            lambda c, _f: c.state not in (state, ScreenState.UNKNOWN), what=where,
+            expected=expected)
         if ok:
             return cls
         if cls.state == ScreenState.UNKNOWN:
@@ -526,7 +597,11 @@ class Engine:
                 now = self.clock()
                 self.limiter.register_time(now - last)
                 last = now
-                cls, frame = self._classify_settled()
+                # Consume-once: the previous iteration's branch may have left a scoped
+                # prior for this look; clear it first so a branch that sets nothing this
+                # time falls back to a full classify next time.
+                expected, self._expected_next = self._expected_next, None
+                cls, frame = self._classify_settled(expected)
                 self.phase = _phase_label(cls.state)
                 self._dispatch(cls, frame)
                 # inter-action spacing (never burst)
@@ -594,6 +669,9 @@ class Engine:
             # ...and from here the game in progress is OURS to abandon. See
             # :meth:`_handle_in_game`.
             self._own_game = True
+            # Play was tapped: the next look is the queue (or still the play screen if
+            # the transition lags). Scope it; the floor still catches an error dialog.
+            self._expected_next = {ScreenState.PLAY_SCREEN, ScreenState.QUEUE}
         elif st == ScreenState.QUEUE:
             # Searching for an opponent - tapping here CANCELS the queue, so the only
             # safe move is to wait. That made this the loop's one reachable infinite
@@ -605,6 +683,11 @@ class Engine:
                            "matchmaking never matched")
             self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
                             "queue_wait")
+            # The dominant heartbeat: up to `queue_wait_attempts` polls, each a full
+            # ~3.8 s classify today. Next look is still-queue or the mulligan we matched
+            # into (this client fades queue->black->mulligan); the floor still catches a
+            # disconnect/error that struck while we waited -- the classic long-queue risk.
+            self._expected_next = {ScreenState.QUEUE, ScreenState.MULLIGAN}
         elif st == ScreenState.COLLECTION:
             # hop is never meant to be here; a stray navigation got us in. Back out to
             # the deck list (a home screen) rather than halt. See ScreenState.COLLECTION.
@@ -624,7 +707,9 @@ class Engine:
                     ScreenState.QUEST_POPUP):
             self._clear_end_screens()
         elif st == ScreenState.CONCEDE_MENU:
-            self._tap(self.layout.concede_button, committing=True, decision_type="reject",
+            # commit, not reject: the decision to concede was already made; tapping the
+            # Concede button is executing it, not deliberating it again (see _concede).
+            self._tap(self.layout.concede_button, committing=True, decision_type="commit",
                       expected_change="full_transition", what="concede")
         elif st == ScreenState.IN_GAME:
             self._handle_in_game()
@@ -656,6 +741,9 @@ class Engine:
         if self._in_game_polls <= max(1, self.cfg.vision.in_game_wait_attempts):
             self._sleep_for(timing.read_consider(self.rng, self.cfg.timing, self.state),
                             "in_game_read", poll=self._in_game_polls)
+            # still a board next iteration (or the end of a concede animation, which the
+            # floor's victory/defeat catches); scope the top-loop look.
+            self._expected_next = {ScreenState.IN_GAME}
             return
         if not self._own_game:
             raise Halt("a game is in progress that this hunt did not start; refusing to "
@@ -730,7 +818,10 @@ class Engine:
                   decision_type="commit", expected_change=None, allow_correction=False, what="reconnect")
 
         for _ in range(max(1, self.cfg.vision.reconnecting_wait_attempts)):
-            cls, _frame = self._classify()
+            # still-reconnecting polls resolve on the floor's own dialog anchors; a return
+            # to any real screen isn't in scope, so it full-scans and is named correctly.
+            cls, _frame = self._classify(
+                {ScreenState.RECONNECTING, ScreenState.RECONNECT_DIALOG})
             if cls.state == ScreenState.UNKNOWN:
                 # Mid-reconnect the client redraws; an unreadable frame is not
                 # evidence the reconnect resolved. Keep waiting (never tapping)
@@ -758,13 +849,16 @@ class Engine:
         raise Halt("stuck on 'Reconnecting...'; Hearthstone never came back online")
 
     def _handle_mulligan(self, frame: Frame) -> None:
+        t0 = self.clock()
         read = self._read_mulligan(frame, self.layout, self.reader, self.cfg.vision)
+        ocr_ms = round((self.clock() - t0) * 1000.0)   # tesseract is the other perception cost
         self.state.observe_confidence(read.class_confidence)
         self.stats.last_opponent = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
         if self.debug:
             self.debug.record("mulligan_read", opponent=self.stats.last_opponent,
                               second=read.we_go_second, cards=read.num_cards,
-                              conf=round(read.class_confidence, 3), method=read.method)
+                              conf=round(read.class_confidence, 3), method=read.method,
+                              ms=ocr_ms)
 
         decision = evaluate_matchup(read, self.cfg)
         if decision == "unusable":
@@ -774,6 +868,20 @@ class Engine:
             frame2 = self._capture()
             read = self._read_mulligan(frame2, self.layout, self.reader, self.cfg.vision)
             decision = evaluate_matchup(read, self.cfg)
+            if self.debug:
+                # Journal the re-read's own result. Only the first read was logged, so a
+                # frame the re-read *recovered* (the common case: first OCR whiffs to
+                # opponent "?"/conf 0.0, the re-read resolves the real class) left the
+                # report showing pure failure -- "opponents seen: ?×1" -- while the engine
+                # had quietly gone on to concede the correct matchup. `reread=True` lets
+                # the summary tell "whiffed then recovered" from a clean first read. Pure
+                # observability: no observe_confidence (that would perturb HumanState and
+                # the timing stream), no control-flow change.
+                self.debug.record(
+                    "mulligan_read", reread=True,
+                    opponent=DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?",
+                    second=read.we_go_second, cards=read.num_cards,
+                    conf=round(read.class_confidence, 3), method=read.method)
             if decision == "unusable":
                 raise Halt(f"could not read mulligan (class={read.class_raw!r}, cards={read.num_cards})")
 
@@ -847,7 +955,11 @@ class Engine:
                   expected_change=None, allow_correction=False, what="mulligan_confirm")
         self._wait_until_screen_leaves(
             ScreenState.MULLIGAN, where="mulligan_confirm",
-            stuck="mulligan Confirm did not dismiss the mulligan")
+            stuck="mulligan Confirm did not dismiss the mulligan",
+            # the board draws in (in_game); an opponent who concedes in the window lands us
+            # on an end banner. mulligan (the from-state) is kept in scope by the helper so
+            # a cross-fade where both clear resolves exactly as a full classify would.
+            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT})
 
     def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
         """Mark one mulligan card for replacement. Returns whether it took.
@@ -883,8 +995,21 @@ class Engine:
         point, region = self.layout.card_point(center_xf), self.layout.card_region(center_xf)
         attempts = max(1, self.cfg.vision.mulligan_card_tap_attempts)
         for attempt in range(attempts):
+            # The mulligan choice was deliberated once (plan_reject); attempt 0 reads and
+            # rejects the card at that pace. A retry is NOT a fresh decision - the game
+            # dropped the input and we are re-sending the same, already-made choice - so it
+            # must not re-pay the slow `reject` deliberation (median ~2.7 s). A human whose
+            # card-tap didn't register re-taps quickly; that is a `commit` (fast reaction,
+            # median ~1.7 s), not another `reject`. Same attempt count and same ignored-tap
+            # accounting. The RNG *draw stream* stays bit-identical (think_time draws one
+            # normal and state.tick the same draws regardless of decision_type), but this
+            # is a deliberate behavior change, not a no-op: a retry now ticks HumanState
+            # with the shorter commit `dt` and records last_action="commit", so the human
+            # trajectory diverges from the retry onward -- the intended, more-human shape
+            # (see the delay-report analysis of the card-retry loop).
+            tap_decision = decision_type if attempt == 0 else "commit"
             try:
-                self._tap(point, committing=False, decision_type=decision_type,
+                self._tap(point, committing=False, decision_type=tap_decision,
                           visual_complexity=0.5, verify_region=region,
                           allow_correction=False, what=f"mulligan_card[{slot}]")
                 return True
@@ -972,19 +1097,32 @@ class Engine:
         # most consequential tap, the concede, would fire on an unclassified screen at
         # a coordinate that on the board is not a button at all. Look first.
         ok, cls, frame = self._wait_until(
-            lambda c, _f: c.state == ScreenState.CONCEDE_MENU, what="gear")
+            lambda c, _f: c.state == ScreenState.CONCEDE_MENU, what="gear",
+            # still-board while the menu opens, then the menu itself; the floor still
+            # scans a reconnect dialog that co-draws over the menu (the fatal blind-tap).
+            expected={ScreenState.IN_GAME, ScreenState.CONCEDE_MENU})
         if not ok:
             if cls.state == ScreenState.UNKNOWN:
                 self._record_unknown(frame, where="gear", confidence=round(cls.confidence, 3))
             raise Halt(f"the gear did not open the Game Menu (saw {cls.state.value!r}); "
                        "refusing to tap Concede on a screen we did not identify")
 
-        self._tap(self.layout.concede_button, committing=True, decision_type="reject",
+        # commit, not reject: opening the Game Menu *was* the deliberation. By the time the
+        # Concede button is in front of us the choice is made (reject_plan decided it, and
+        # the reluctance already lives in hesitate_before_concede + the concede_point). A
+        # human who opened the menu to concede taps it quickly -- a commit reaction, not a
+        # fresh slow rejection. `committing=True` already books this as a commit for
+        # HumanState, so this only aligns the think to match. RNG-draw-identical (think_time
+        # draws one normal either way); only the think DURATION shrinks (~2.7s -> ~1.7s med).
+        self._tap(self.layout.concede_button, committing=True, decision_type="commit",
                   expected_change="full_transition", what="concede")
         self._wait_until_screen_leaves(
             ScreenState.CONCEDE_MENU, where="concede",
             stuck="Concede did not dismiss the Game Menu; refusing to tap again "
-                  "(the entry below Concede is Quit)")
+                  "(the entry below Concede is Quit)",
+            # while the menu is still up its anchor clears (fast still-polls); the concede
+            # drops us onto the dissolving board then the end banners.
+            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT})
         return True
 
     #: Screens ``_clear_end_screens`` is allowed to tap ``end_dismiss`` on. The tap is
@@ -1023,8 +1161,14 @@ class Engine:
         """
         taps = waits = 0
         max_waits = max(1, self.cfg.vision.screen_wait_attempts)
+        # Scope must be CLOSED under every branch below -- crucially IN_GAME, so a Defeat
+        # banner fading in over a still-drawn board (both anchors clear) resolves exactly
+        # as a full classify would and routes to the wait-it-out branch, NOT a blind
+        # end_dismiss into the dissolving board. Any un-listed screen just full-scans.
+        end_scope = (frozenset(self.END_SCREENS) | frozenset(self.HOME_SCREENS)
+                     | {ScreenState.IN_GAME})
         while True:
-            cls, frame = self._classify_settled()
+            cls, frame = self._classify_settled(end_scope)
             if cls.state in self.HOME_SCREENS:
                 return
             if cls.state == ScreenState.UNKNOWN:

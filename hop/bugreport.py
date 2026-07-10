@@ -149,13 +149,28 @@ def summarize_journal(journal_text: str) -> str:
 
     kinds: dict[str, int] = {}
     classes: dict[str, int] = {}
+    reread_recovered = 0   # first read unusable, re-read resolved a class
+    reread_failed = 0      # re-read still unreadable (this is what precedes a halt)
+    unreadable_first = 0   # first reads that came back "?" (OCR whiffed)
+    think_credited = 0.0   # think seconds absorbed into perception latency, not stacked
+    # Per-tap wall-clock, split think vs perception, so "why is <action> so slow?" is
+    # answered inline instead of by hand-tracing timestamps. Everything since the previous
+    # tap (screencaps + classifications to *reach* the action, plus its think) is charged
+    # to the tap it leads to.
+    tap_costs: list[tuple[str, float, float]] = []   # (what, think_s, perception_s)
+    seg_think = 0.0
+    seg_perception = 0.0
     anomalies: list[str] = []
     sleeps: dict[str, float] = {}
     longest_sleeps: list[tuple[float, str]] = []
+    captures_ms: list[float] = []
+    classify_ms: list[float] = []
     gaps: list[tuple[float, str, str]] = []
     last_halt = ""
     criteria = ""
     closest = ""
+    false_halt_note = ""   # "waited for X to leave; X is gone, destination just unnamed"
+    first_t: float | None = None
     prev_t: float | None = None
     prev_kind = ""
     for e in events:
@@ -164,12 +179,28 @@ def summarize_journal(journal_text: str) -> str:
         d = e.get("detail", {})
         t = e.get("t")
         if isinstance(t, (int, float)):
+            if first_t is None:
+                first_t = float(t)
             if prev_t is not None:
                 gaps.append((float(t) - prev_t, prev_kind, k))
             prev_t = float(t)
             prev_kind = k
-        if k == "mulligan_read" and d.get("opponent"):
-            classes[d["opponent"]] = classes.get(d["opponent"], 0) + 1
+        if k == "mulligan_read":
+            # "?" is a failed OCR, not a class -- counting it as an "opponent seen"
+            # made a recovered run read like a total failure. Count only real classes;
+            # track the whiff-then-recover story (reread=True) on its own line so the
+            # report answers "did class detection work?" instead of implying it didn't.
+            opp = d.get("opponent")
+            is_reread = bool(d.get("reread"))
+            if opp and opp != "?":
+                classes[opp] = classes.get(opp, 0) + 1
+                if is_reread:
+                    reread_recovered += 1
+            elif opp == "?":
+                if is_reread:
+                    reread_failed += 1
+                else:
+                    unreadable_first += 1
         if k == "anomaly":
             anomalies.append(str(d.get("reason", "?")))
         if k == "sleep":
@@ -178,6 +209,29 @@ def summarize_journal(journal_text: str) -> str:
             if isinstance(seconds, (int, float)):
                 sleeps[reason] = sleeps.get(reason, 0.0) + float(seconds)
                 longest_sleeps.append((float(seconds), reason))
+            # How much think was *absorbed* into perception latency instead of stacked on
+            # top (see engine `_tap` / `timing.credit_latency`). This is the proof the
+            # anti-stacking is firing on-device: a big number here means think was reduced
+            # to fit inside the screencap+classify time, not added to it.
+            credited = d.get("credited_s")
+            if reason == "tap_think" and isinstance(credited, (int, float)):
+                think_credited += float(credited)
+            if reason == "tap_think" and isinstance(seconds, (int, float)):
+                seg_think += float(seconds)   # ACTUAL waited think (post latency-credit)
+        if k == "capture":
+            ms = d.get("ms")
+            if isinstance(ms, (int, float)):
+                captures_ms.append(float(ms))
+                seg_perception += float(ms) / 1000.0
+        if k == "classify":
+            ms = d.get("ms")
+            if isinstance(ms, (int, float)):
+                classify_ms.append(float(ms))
+                seg_perception += float(ms) / 1000.0
+        if k == "tap":
+            tap_costs.append((str(d.get("what", "?")), seg_think, seg_perception))
+            seg_think = 0.0
+            seg_perception = 0.0
         if k in ("stop", "halt") and d.get("message"):
             last_halt = d["message"]
         if k == "unknown_screen" and d.get("near_misses"):
@@ -188,7 +242,51 @@ def summarize_journal(journal_text: str) -> str:
             # here, and a malformed entry must not sink the whole report.
             top = d["near_misses"][0]
             if isinstance(top, dict):
-                closest = f"{top.get('state')} {top.get('score')} (thr {top.get('thr')})"
+                st, sc, th = top.get("state"), top.get("score"), top.get("thr")
+                closest = f"{st} {sc} (thr {th})"
+                # A near-miss just under threshold is not a novel screen - it is a known
+                # one wearing a face the anchor doesn't cover (e.g. `in_game` while going
+                # second, END TURN greyed). Spell that out with the exact margin so the
+                # halt is self-diagnosing: it needs another anchor or a lower threshold,
+                # not head-scratching. Only for a *small* miss; a far-away top score is a
+                # genuinely unhandled screen and must not be mislabelled as "almost known".
+                if isinstance(sc, (int, float)) and isinstance(th, (int, float)) and 0 <= th - sc <= 0.1:
+                    closest += (f" - MARGINAL: missed by {th - sc:.3f}; that screen needs "
+                                "another anchor (hop capture --from-file) or a lower threshold")
+                    # Which of the two fixes? The deciding fact is the gap to the nearest
+                    # DIFFERENT screen: if the next state down is far below, the board owns
+                    # this score-band alone and simply LOWERING the threshold is safe (no
+                    # other screen can sneak in). A close runner-up means the band is
+                    # contested -> lowering risks a mis-ID, so add an anchor instead. Adding
+                    # anchors is whack-a-mole (one per visual variant); the gap is what tells
+                    # you when the one-line threshold fix will actually hold.
+                    other = next((m for m in d["near_misses"]
+                                  if isinstance(m, dict) and m.get("state") != st
+                                  and isinstance(m.get("score"), (int, float))), None)
+                    if other is not None:
+                        gap = sc - other["score"]
+                        verdict = ("wide gap -> lowering the threshold is safe (the board owns "
+                                   "this band)" if gap >= 0.2 else
+                                   "narrow gap -> prefer a new anchor over lowering the threshold")
+                        closest += (f"; nearest DIFFERENT screen is {other['state']} "
+                                    f"{other['score']:.3f} ({gap:.3f} below) -- {verdict}")
+                    # If we were waiting for a screen to LEAVE and it isn't even among the
+                    # near-misses -- while some OTHER known screen is the marginal top --
+                    # then the screen already changed: the action succeeded and we simply
+                    # cannot name where it landed. The halt message then blames the wrong
+                    # thing ("Confirm did not dismiss the mulligan" when Confirm worked and
+                    # the *board* is the unrecognised screen). Flag it so a false halt is
+                    # not chased as a stuck tap. Only when the top miss is marginal (above),
+                    # i.e. a known screen wearing a new face -- not a genuinely novel screen.
+                    waiting = d.get("waiting_to_leave")
+                    near_states = {ns.get("state") for ns in d["near_misses"]
+                                   if isinstance(ns, dict)}
+                    if waiting and waiting not in near_states:
+                        false_halt_note = (
+                            f"waited for '{waiting}' to leave; '{waiting}' is GONE (not among the "
+                            f"near-misses) and the top match '{st}' is only a marginal miss -- so the "
+                            f"action almost certainly SUCCEEDED and this is a classification miss on "
+                            f"the *destination*, not a stuck '{waiting}'. Fix the '{st}' anchor/threshold.")
             else:
                 closest = str(top)
         if k == "run_criteria":
@@ -199,9 +297,49 @@ def summarize_journal(journal_text: str) -> str:
     out = [f"- events: {len(events)}"]
     if criteria:
         out.append(f"- criteria (this run): {criteria}")
+    if first_t is not None and prev_t is not None and prev_t > first_t:
+        # The headline a "why is it slow?" report needs: where the wall-clock actually
+        # went. Humanized waits are journalled (sleeps) and, since the capture-timing
+        # change, so is screencap I/O (a `capture` ms per frame); the remainder is
+        # classification/OCR/logic. The split matters because the remedies differ - the
+        # humanized waits are deliberate anti-detection pacing and must NOT be trimmed,
+        # whereas screencap is pure transport latency (Wi-Fi ~1.4 s vs USB ~1.0 s/frame).
+        wall = prev_t - first_t
+        slept = sum(sleeps.values())
+        if captures_ms:
+            cap_s = sum(captures_ms) / 1000.0
+            if classify_ms:
+                # Classification is journalled separately, so split it out of the residual:
+                # it is the second-biggest cost and lumping it into "logic" hid that.
+                cls_s = sum(classify_ms) / 1000.0
+                other = max(0.0, wall - slept - cap_s - cls_s)
+                out.append(f"- time: {wall:.0f}s wall = {slept:.0f}s humanized waits + "
+                           f"{cap_s:.0f}s screencap I/O + {cls_s:.0f}s classification + "
+                           f"{other:.0f}s OCR/logic")
+            else:
+                other = max(0.0, wall - slept - cap_s)
+                out.append(f"- time: {wall:.0f}s wall = {slept:.0f}s humanized waits + "
+                           f"{cap_s:.0f}s screencap I/O + {other:.0f}s classify/OCR/logic")
+        else:
+            out.append(f"- time: {wall:.0f}s wall, {slept:.0f}s of it humanized waits "
+                       "(the rest is screencap + classify/OCR; a pre-capture-journal run)")
     out.append("- kinds: " + ", ".join(f"{k}={n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
     if classes:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
+    if reread_recovered or reread_failed or unreadable_first:
+        # The whiff-then-recover story. A first-read miss that a re-read resolves is
+        # normal perception fallibility, NOT a fault -- say so, so a recovered run
+        # isn't mistaken for a broken one. A re-read that itself failed is the line
+        # that precedes a "could not read mulligan" halt; call it out.
+        parts = []
+        if reread_recovered:
+            parts.append(f"{reread_recovered} recovered by a re-read (first OCR whiffed, "
+                         "class resolved on the retry -- expected, not a fault)")
+        if unreadable_first and not reread_recovered and not reread_failed:
+            parts.append(f"{unreadable_first} first read(s) came back '?'")
+        if reread_failed:
+            parts.append(f"{reread_failed} still unreadable after the re-read (this is what precedes a halt)")
+        out.append("- mulligan reads: " + "; ".join(parts))
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
     if sleeps:
@@ -211,6 +349,34 @@ def summarize_journal(journal_text: str) -> str:
         long_one = sorted(longest_sleeps, key=lambda x: -x[0])[:3]
         out.append("- longest single sleeps: " + ", ".join(
             f"{reason} {seconds:.1f}s" for seconds, reason in long_one))
+    if think_credited > 0:
+        # The anti-stacking at work: think time that was absorbed into perception latency
+        # rather than waited on top of it. 0 here on a slow wireless run would mean the
+        # credit is NOT firing (a regression); a large number means it is.
+        out.append(f"- think absorbed into latency: {think_credited:.1f}s not stacked on "
+                   "top of screencap+classify (would otherwise be added to the reaction)")
+    if tap_costs:
+        # Answers "why is <action> so slow?" directly: for the costliest taps, how much of
+        # the wall-clock to reach+fire them was humanized THINKING vs perception (screencap
+        # + classification). Almost always the think is small and perception dominates --
+        # so a step that "feels like it thinks too long" is really waiting on wireless I/O,
+        # which no timing change can fix (only fewer/cheaper captures + classifies can).
+        slow = sorted(tap_costs, key=lambda c: -(c[1] + c[2]))[:4]
+        out.append("- per-tap reaction (wall-clock to reach+fire; think vs perception): " + "; ".join(
+            f"{what} {think + perc:.1f}s = {think:.1f}s think + {perc:.1f}s screencap/classify"
+            for what, think, perc in slow))
+    if captures_ms:
+        total = sum(captures_ms) / 1000.0
+        mean_ms = total * 1000.0 / len(captures_ms)
+        out.append(f"- captures: {len(captures_ms)} screencaps, {total:.1f}s total "
+                   f"(mean {mean_ms:.0f}ms, max {max(captures_ms):.0f}ms) - wireless-ADB "
+                   "frame I/O; ~1.0s USB / ~1.4s Wi-Fi per frame is normal for this phone")
+    if classify_ms:
+        total = sum(classify_ms) / 1000.0
+        mean_ms = total * 1000.0 / len(classify_ms)
+        out.append(f"- classification: {len(classify_ms)} scans, {total:.1f}s total "
+                   f"(mean {mean_ms:.0f}ms, max {max(classify_ms):.0f}ms) - sliding-window "
+                   "NCC over every screen anchor; cost grows with frame size and anchor count")
     if gaps:
         biggest_gaps = [g for g in sorted(gaps, key=lambda x: -x[0])[:5] if g[0] >= 2.0]
         if biggest_gaps:
@@ -218,6 +384,8 @@ def summarize_journal(journal_text: str) -> str:
                 f"{a}->{b} {seconds:.1f}s" for seconds, a, b in biggest_gaps))
     if closest:
         out.append(f"- closest known screen (unknown near-miss): {closest}")
+    if false_halt_note:
+        out.append(f"- likely FALSE halt: {false_halt_note}")
     if last_halt:
         out.append(f"- ended: {last_halt}")
     return "\n".join(out)

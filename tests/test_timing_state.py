@@ -41,6 +41,33 @@ def test_familiarity_shortens_think(cfg):
     assert a < b
 
 
+def test_credit_latency_absorbs_instead_of_stacking():
+    """Latency already spent perceiving the screen is deducted from the think, not added
+    to it: the wait is the remainder, so total reaction (latency + wait) ~= the think."""
+    # 4.0 s think, 1.5 s latency already burned -> wait the remaining 2.5 s.
+    assert timing.credit_latency(4.0, 1.5, floor_s=0.45) == 2.5
+
+
+def test_credit_latency_clamps_to_the_floor_never_below():
+    """When latency exceeds the whole think budget the wait collapses to the human
+    reaction floor -- we never tap at machine-zero, however slow perception was."""
+    # 6 s of latency > 2 s think: don't go negative, hold at the 0.75 s floor.
+    assert timing.credit_latency(2.0, 6.0, floor_s=0.75) == 0.75
+
+
+def test_credit_latency_is_a_noop_without_latency():
+    """Zero latency (the frozen test clock) returns the think unchanged -- the invariant
+    that keeps every existing timing test and the RNG stream bit-identical."""
+    for think in (0.5, 1.7, 3.2):
+        assert timing.credit_latency(think, 0.0, floor_s=0.45) == think
+
+
+def test_credit_latency_never_lengthens_a_sub_floor_reaction():
+    """A think already quicker than the floor is left alone, not padded up to it."""
+    assert timing.credit_latency(0.30, 2.0, floor_s=0.45) == 0.30   # min(think, floor) floor
+    assert timing.credit_latency(0.30, 0.0, floor_s=0.45) == 0.30
+
+
 def test_human_delay_positive(cfg):
     for s in range(200):
         assert timing.human_delay(Random(s), 3.0, cfg.timing) >= 0
