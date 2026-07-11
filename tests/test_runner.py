@@ -22,6 +22,17 @@ class _FakeEngine:
         return None
 
 
+class _SpyAlerter:
+    """Records the audible-stop alerts the controller fires, so a test can pin that a caught
+    crash rings and a user stop does not."""
+
+    def __init__(self):
+        self.halts: list[str] = []
+
+    def halt(self, message: str) -> None:
+        self.halts.append(message)
+
+
 def test_stop_during_construction_is_applied_after_the_engine_exists():
     started = threading.Event()
     release = threading.Event()
@@ -148,6 +159,52 @@ def test_status_captures_a_traceback_when_construction_crashes():
     assert s["last_error"].startswith("TypeError:")
     assert "Traceback (most recent call last)" in s["last_error_traceback"]
     assert "boom" in s["last_error_traceback"]        # the failing frame is named
+
+
+def test_construction_crash_alerts_the_user():
+    """A crash that stops the hunt without the user asking must ring: the engine never got to
+    announce it (it failed before or outside run()'s own halt handling), so the controller
+    does -- otherwise the hunt dies silently and the user, not watching, waits on nothing."""
+    alerter = _SpyAlerter()
+
+    def boom(overrides):
+        raise RuntimeError("adb connect failed")
+
+    c = EngineController(boom, alerter=alerter)
+    c.start()
+    c._thread.join(2)
+    assert alerter.halts == ["RuntimeError: adb connect failed"]
+
+
+def test_a_crash_after_a_user_stop_stays_silent():
+    """If the user pressed Stop mid-construction, a construction failure is moot -- the user
+    already chose to stop, so no alert. A manual stop is never announced with a sound."""
+    alerter = _SpyAlerter()
+    started = threading.Event()
+    release = threading.Event()
+
+    def factory(overrides):
+        started.set()
+        release.wait(2)                 # hold construction so the stop lands first
+        raise RuntimeError("adb connect failed")
+
+    c = EngineController(factory, alerter=alerter)
+    c.start()
+    assert started.wait(2)
+    c.stop()                            # user asks to stop while we are still constructing
+    release.set()
+    c._thread.join(2)
+    assert alerter.halts == []          # the moot crash rang nothing
+
+
+def test_a_clean_run_never_alerts():
+    """The controller alerts only on a crash it had to catch. A run that returns normally --
+    the engine's own handled halts included -- must not ring again over the top of it."""
+    alerter = _SpyAlerter()
+    c = EngineController(lambda overrides: _FakeEngine(), alerter=alerter)
+    c.start()
+    c._thread.join(2)
+    assert alerter.halts == []
 
 
 def test_start_clears_a_stale_traceback():

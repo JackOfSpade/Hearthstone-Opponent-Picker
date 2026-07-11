@@ -55,6 +55,26 @@ def test_halt_still_notifies_and_pings_the_phone():
     assert "notify" in calls and "ntfy" in calls
 
 
+def test_halt_plays_the_sound_so_a_dead_hunt_is_heard():
+    """An unexpected stop is not user-requested, so it is audible like a target find -- the
+    user is not watching the screen. The sound leads; the banner + phone push still follow."""
+    a = Alerter(_cfg())
+    calls = _spy(a)
+    a.halt("stuck on an unknown screen")
+    assert calls[0] == "sound"                  # audible, and first
+    assert "notify" in calls and "ntfy" in calls
+
+
+def test_halt_sound_obeys_the_mac_sound_flag():
+    """mac_sound gates the halt sound exactly as it gates the target sound; the banner and
+    phone push are independent of it and still fire."""
+    a = Alerter(_cfg(mac_sound=False))
+    calls = _spy(a)
+    a.halt("stuck on an unknown screen")
+    assert "sound" not in calls                 # flag off -> no sound
+    assert "notify" in calls and "ntfy" in calls
+
+
 def test_mac_notification_flag_actually_suppresses_the_banner(monkeypatch):
     """Regression: mac_notification=false was parsed but never consulted, so banners
     still fired. The flag must gate the osascript call, like mac_sound gates afplay."""

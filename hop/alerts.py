@@ -6,8 +6,11 @@ deliberately minimal: **play the configured Mac sound exactly once** - no loopin
 no acknowledge/silence step, no phone push, no spoken announcement. One sound they'll
 hear over their audio, and the dashboard/menu-bar show which class.
 
-Halts and info still post a silent Mac notification (and a halt also pings the phone),
-since those are error conditions worth surfacing even if the window isn't focused.
+A halt (an unexpected stop - error, stuck screen, dropped link) is not user-requested, so
+it plays that same one sound too: the user isn't watching, and a hunt that quietly died is
+worth hearing as much as one that found a target. It also posts a Mac notification and
+pings the phone with the detail. A plain info() stays silent (banner only) - it carries
+non-stop notes like the deck-list pause, where the hunt keeps running.
 
 All of it degrades gracefully off macOS / without network to plain prints, so the tool
 never crashes because an alert channel is unavailable.
@@ -41,6 +44,12 @@ class Alerter:
         print(f"[hop] {message}")
 
     def halt(self, message: str) -> None:
+        # An unexpected stop must be *audible*, like a target find: the user is not watching
+        # the screen (earbuds in, YouTube on), so a silent banner alone is missed and a dead
+        # hunt sits unnoticed. Play the one target sound first, then the banner + phone push
+        # carry the detail. Gated by mac_sound, exactly as target_found is.
+        if self.cfg.mac_sound:
+            self._mac_play_sound_once()
         self._mac_notify("hop HALTED", message)
         self._ntfy("hop HALTED", message, priority="high", tags="warning")
         print(f"[hop][HALT] {message}")

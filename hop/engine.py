@@ -483,15 +483,21 @@ class Engine:
         The remedy is the one :func:`hop.humanize.motor._endpoint_inside` already uses
         for out-of-disc endpoints: **resample, don't clamp**. Each draw is a fresh
         endpoint, dwell and micro-slip, so a redraw is genuinely a different gesture,
-        not a nudged one. Eight draws take the emitted-duplicate rate to 0.01%; if all
-        eight still collide, the generator is degenerate and we fail closed.
+        not a nudged one. The limiter compares against recent, location-aware history;
+        if all configured draws still collide, the generator is degenerate and we fail closed.
         """
         draws = max(1, self.cfg.caps.non_repetition_resamples)
-        for _ in range(draws):
+        for i in range(draws):
             gesture = motor.synth_tap(self.rng, (tx, ty), radius, self.panel,
                                       self.cfg.motor, self.contact, self.state)
             if not self.limiter.is_near_duplicate(gesture):
                 return gesture
+            if self.debug:
+                self.debug.record("non_repetition_reject", attempt=i + 1, of=draws,
+                                  memory=self.limiter.trajectory_memory_size)
+        if self.debug:
+            self.debug.record("non_repetition_collapse", attempts=draws,
+                              memory=self.limiter.trajectory_memory_size)
         raise Halt(f"could not draw a non-repeating gesture in {draws} attempts; "
                    "the motor generator has collapsed", Halt.NEAR_DUPLICATE)
 
@@ -693,6 +699,16 @@ class Engine:
                     timing.between_actions(self.rng, self.cfg.timing, self.state),
                     "loop_between_actions", state=cls.state.value)
                 if self.stats.target_found:
+                    # The hunt's designed SUCCESS exit: a target matchup appeared, we alerted
+                    # (_alert_target) and stop touching the game so the user plays it. Record
+                    # WHY we stopped, exactly like every other exit does -- this is the ONLY
+                    # common exit that otherwise left stop_reason blank, which made a by-design
+                    # stop read as a crash in status/the bug report ("running: False" with no
+                    # reason at all). Stats-only: no RNG draw and no HumanState tick, so the
+                    # stream stays bit-identical. Guarded so a Stop/Halt that raced onto this
+                    # same iteration keeps its own, more specific reason.
+                    if not self.stats.stop_reason:
+                        self.stats.stop_reason = "target_found"
                     break
             if self._stop and not self.stats.stop_reason:
                 self.stats.stop_reason = "user_stop"

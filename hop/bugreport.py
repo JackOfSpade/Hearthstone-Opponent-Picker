@@ -189,10 +189,27 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
                 "raise that knob or build an 'Opponent Still Choosing...' anchor (hop capture "
                 "--from-file).")
     if cards_ok:   # class present but did not snap to a known class
-        return (f"the class text ({cls_raw}) did not resolve to a known class though the "
-                f"cards counted fine (cards={cards}) -- a GARBLED nameplate read, not a blank "
-                "one. Suspect the opponent-class region/threshold (vision.ocr_max_edit_distance) "
-                "rather than the still-choosing transient.")
+        base = (f"the class text ({cls_raw}) did not resolve to a known class though the "
+                f"cards counted fine (cards={cards}) -- a GARBLED nameplate read, not a blank one.")
+        # Name the LIKELY class (over full labels AND the distinctive two-word fragments), so a
+        # garbled read is self-identifying instead of leaving the reader to eyeball the raw text.
+        # This is exactly what would have made the live 'G DEATH' halt instant: it is a Death
+        # Knight whose long two-word label OCR'd as one word -- nearest_class reports Death Knight
+        # (distance 1 to the "DEATH" fragment), not the misleading nearest FULL label (Druid, 5).
+        hint = ""
+        try:
+            from .hero_classes import DISPLAY_NAMES, nearest_class
+            near, dist = nearest_class(cls_raw.strip().strip("'\""))
+            if near is not None:
+                hint = (f" It is closest to {DISPLAY_NAMES.get(near, near)} (edit distance "
+                        f"{dist}) -- if that looks right, the OCR caught only part of a long "
+                        "two-word class label (DEATH KNIGHT / DEMON HUNTER); this build now snaps "
+                        "such fragments, so a recurrence means the read missed even the fragment "
+                        "(check the opponent-class region alignment / the kept frame).")
+        except Exception:
+            pass
+        return (base + hint + " Suspect the opponent-class region or "
+                "vision.ocr_max_edit_distance rather than the still-choosing transient.")
     return (f"the CARD count was off (cards={cards}, expected 3 or 4) -- the green keep-glow "
             "strip detection miscounted, so this is a card-count/glow failure, not an "
             "opponent-class read. Check the glow thresholds against a kept frame.")
@@ -351,6 +368,13 @@ def summarize_journal(journal_text: str) -> str:
     # improved to explain. Surfaced so a healthy-looking run that quietly limped is visible.
     capture_retry_ms: list[float] = []
     capture_retry_last_err = ""
+    nonrep_rejects = 0
+    nonrep_reject_last_attempt = 0
+    nonrep_reject_last_of = 0
+    nonrep_reject_memory_max = 0
+    nonrep_collapses = 0
+    nonrep_collapse_attempts = 0
+    nonrep_collapse_memory = 0
     gaps: list[tuple[float, str, str]] = []
     last_halt = ""
     criteria = ""
@@ -528,6 +552,25 @@ def summarize_journal(journal_text: str) -> str:
                 seg_perception += float(ms) / 1000.0   # the hung time WAS wall-clock spent
             if d.get("error"):
                 capture_retry_last_err = str(d.get("error"))
+        if k == "non_repetition_reject":
+            nonrep_rejects += 1
+            attempt = d.get("attempt")
+            of = d.get("of")
+            memory = d.get("memory")
+            if isinstance(attempt, int):
+                nonrep_reject_last_attempt = attempt
+            if isinstance(of, int):
+                nonrep_reject_last_of = of
+            if isinstance(memory, int):
+                nonrep_reject_memory_max = max(nonrep_reject_memory_max, memory)
+        if k == "non_repetition_collapse":
+            nonrep_collapses += 1
+            attempts = d.get("attempts")
+            memory = d.get("memory")
+            if isinstance(attempts, int):
+                nonrep_collapse_attempts = attempts
+            if isinstance(memory, int):
+                nonrep_collapse_memory = memory
         if k == "classify":
             ms = d.get("ms")
             if isinstance(ms, (int, float)):
@@ -778,6 +821,25 @@ def summarize_journal(journal_text: str) -> str:
         out.append("- mulligan reads: " + "; ".join(parts))
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
+    if nonrep_rejects or nonrep_collapses:
+        parts = []
+        if nonrep_rejects:
+            parts.append(f"{nonrep_rejects} rejected draw(s)")
+            if nonrep_reject_last_of:
+                parts.append(f"last rejected attempt {nonrep_reject_last_attempt}/{nonrep_reject_last_of}")
+            if nonrep_reject_memory_max:
+                parts.append(f"memory peaked at {nonrep_reject_memory_max}")
+        if nonrep_collapses:
+            attempts = nonrep_collapse_attempts or nonrep_reject_last_of
+            mem = nonrep_collapse_memory or nonrep_reject_memory_max
+            detail = f"{nonrep_collapses} collapse(s)"
+            if attempts:
+                detail += f" after {attempts} attempts"
+            if mem:
+                detail += f" with memory={mem}"
+            parts.append(detail)
+        out.append("- non-repetition gate: " + "; ".join(parts) +
+                   " -- repeated recent tap fingerprints exhausted the resample budget")
     if sleeps:
         biggest = sorted(sleeps.items(), key=lambda kv: -kv[1])[:6]
         out.append("- intentional sleeps: " + ", ".join(
@@ -987,6 +1049,18 @@ def format_status(status: dict) -> str:
         return ""
     g = status.get
     lines = [f"- running: {g('running')}   uptime_s: {g('uptime_s')}"]
+    # The target-found stop is the ONE common successful exit that records no stop_reason on older
+    # builds -- run() breaks on stats.target_found without setting one -- so a reader sees "running:
+    # False" with no reason and mistakes the SUCCESS for a crash (this very report's confusion). Say
+    # plainly it is the designed win: hop found a class matching your criteria at the mulligan and
+    # STOPS touching the game so you can play it. Derived from running/target_found (NOT stop_reason)
+    # so it fires identically on an OLD build (stop_reason="") and a NEW one (stop_reason=
+    # "target_found"); gated on no last_error so a genuine crash is never blessed as a success.
+    if not g("running") and g("target_found") and not g("last_error"):
+        opp = g("last_opponent") or "a targeted class"
+        lines.append(f"- outcome: SUCCESS — hop found {opp}, which matched your criteria, and "
+                     "STOPPED ON PURPOSE so you can play the game (target -> alert + stop touching "
+                     "the game). 'running: False' with no error here is the WIN condition, NOT a crash.")
     crit = g("criteria") or {}
     if crit:
         # the criteria the run ACTUALLY used (dashboard/menu overrides included), so a

@@ -95,6 +95,14 @@ class EngineController:
                     self._last_error = f"{type(e).__name__}: {e}"
                     self._last_error_tb = traceback.format_exc()
                     self._phase = "error"
+                    # A crash here is a stop the engine never got to announce: it escaped
+                    # run()'s own halt handling, or construction (adb connect / UHID
+                    # enumerate) failed before the loop began. Either way the hunt is dead
+                    # and the user did not ask for it, so alert audibly -- same reasoning as
+                    # a halt (they are not watching the screen). The one exception is a Stop
+                    # pressed mid-construction: then the failure is moot and a sound is noise.
+                    if self.alerter is not None and not self._stop_requested:
+                        self.alerter.halt(self._last_error)
 
             self._thread = threading.Thread(target=_run, daemon=True)
             self._thread.start()

@@ -240,6 +240,17 @@ def test_mulligan_read_halt_diagnosis_distinguishes_the_three_failure_modes():
     assert d("some other halt entirely") == ""                                   # not our halt
 
 
+def test_mulligan_garbled_diagnosis_names_the_likely_class():
+    """A garbled-class halt should name the LIKELY class (over full labels + two-word
+    fragments), so the live 'G DEATH' halt reads 'closest to Death Knight' -- not the
+    misleading nearest full label (Druid). This is what makes such a halt self-identifying."""
+    out = br._diagnose_mulligan_read_halt(
+        "could not read mulligan (class='G DEATH', cards=4)")
+    assert "GARBLED" in out
+    assert "Death Knight" in out          # named the real class via the "DEATH" fragment
+    assert "Druid" not in out             # NOT the misleading nearest full label
+
+
 def test_summarize_journal_surfaces_the_runs_active_criteria():
     """A run journal's first line records what it hunted for; the summary must show it."""
     import json
@@ -346,6 +357,24 @@ def test_summarize_journal_surfaces_capture_retries():
     assert "capture retries: 1 screencap(s) stalled/failed" in s
     assert "20.0s hung total" in s
     assert "timed out after 20s" in s
+
+
+def test_summarize_journal_surfaces_non_repetition_rejects_and_collapse():
+    """The live non-repetition halt needed the rejected-draw count and memory size. A raw
+    terminal halt says only '8 attempts'; the journal now shows whether the gate saturated."""
+    import json
+    events = [
+        {"kind": "non_repetition_reject", "detail": {"attempt": i, "of": 8, "memory": 32}}
+        for i in range(1, 9)
+    ] + [
+        {"kind": "non_repetition_collapse", "detail": {"attempts": 8, "memory": 32}},
+        {"kind": "halt", "detail": {"message": "HALTED: could not draw a non-repeating "
+                                    "gesture in 8 attempts; the motor generator has collapsed"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "non-repetition gate: 8 rejected draw(s)" in s
+    assert "last rejected attempt 8/8" in s
+    assert "memory=32" in s
 
 
 def test_summarize_journal_flags_a_degrading_capture_trend():
@@ -935,6 +964,38 @@ def test_format_status_surfaces_running_actions_and_distribution():
     assert "running: True" in out
     assert "actions: 5" in out and "concedes: 1" in out
     assert "Mage×2" in out and "Rogue×1" in out
+
+
+def test_format_status_names_a_target_found_stop_as_success_not_a_crash():
+    """The most common successful exit -- hop found a targeted class at the mulligan and STOPPED
+    touching the game so you can play it -- records no stop_reason on older builds, so 'running:
+    False' with no reason reads as a crash. format_status must name it as the WIN condition, robust
+    to an OLD build (stop_reason='') AND a NEW one (stop_reason='target_found')."""
+    for stop_reason in ("", "target_found"):
+        out = br.format_status({
+            "running": False, "uptime_s": 903.2, "stop_reason": stop_reason, "last_error": "",
+            "games": 0, "concedes": 0, "target_found": True, "last_opponent": "Priest",
+        })
+        assert "outcome: SUCCESS" in out
+        assert "NOT a crash" in out
+        assert "Priest" in out
+
+
+def test_format_status_target_found_success_line_stays_silent_otherwise():
+    """The success line must fire ONLY for a stopped, target-found run with no error -- never on a
+    running hunt, a genuine crash, a deliberate halt, or a crash that happened to have found a
+    target earlier (last_error must win)."""
+    running = br.format_status({"running": True, "uptime_s": 5, "target_found": True})
+    assert "outcome: SUCCESS" not in running          # still hunting, not a stop
+    crash = br.format_status({"running": False, "uptime_s": 5, "target_found": False,
+                              "last_error": "TimeoutExpired: screencap timed out after 20s"})
+    assert "outcome: SUCCESS" not in crash
+    halt = br.format_status({"running": False, "uptime_s": 5, "target_found": False,
+                             "stop_reason": "halt:deck list; re-select your deck"})
+    assert "outcome: SUCCESS" not in halt
+    crash_after_found = br.format_status({"running": False, "uptime_s": 5, "target_found": True,
+                                          "last_error": "TimeoutExpired: screencap timed out"})
+    assert "outcome: SUCCESS" not in crash_after_found   # a real crash is never blessed
 
 
 def test_format_status_empty_is_empty():

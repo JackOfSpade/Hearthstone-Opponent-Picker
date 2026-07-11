@@ -65,18 +65,22 @@ class Limiter:
     def remember_trajectory(self, gesture: Gesture) -> None:
         self._traj.add(trajectory_fingerprint(gesture))
 
+    @property
+    def trajectory_memory_size(self) -> int:
+        return len(self._traj.fingerprints)
+
 
 def trajectory_fingerprint(g: Gesture) -> list[float]:
     """A small, comparable feature vector describing a gesture's shape+timing.
 
     Chosen so that two *materially different* human-ish gestures land far apart
-    while a verbatim replay lands at ~0 distance. Endpoints are in screen
-    fractions of the samples' own bounding box so absolute location doesn't
-    dominate; duration, sample count, path length and peak speed capture the
-    motor/timing signature.
+    while a verbatim replay lands at ~0 distance. Shape terms are normalized by
+    the samples' own bounding box so absolute location doesn't dominate; the
+    release point is still included so taps on different controls do not poison
+    each other's history during long hunts.
     """
     if not g.samples:
-        return [0.0] * 6
+        return [0.0] * 8
     xs = [s.x for s in g.samples]
     ys = [s.y for s in g.samples]
     ts = [s.t for s in g.samples]
@@ -100,6 +104,8 @@ def trajectory_fingerprint(g: Gesture) -> list[float]:
         peak_v / 1000.0,
         (xs[-1] - xs[0]) / span_x,
         (ys[-1] - ys[0]) / span_y,
+        xs[-1],
+        ys[-1],
     ]
 
 
@@ -108,7 +114,11 @@ class TrajectoryMemory:
     """Remembers gesture fingerprints and answers near-duplicate queries."""
 
     fingerprints: list[list[float]] = field(default_factory=list)
-    keep: int = 500
+    # Recent history, not whole-session history. The old 500-entry window made an hour-long
+    # hunt fail closed after normal repeated use of the same few Hearthstone controls: the
+    # memory became dense enough that eight fresh draws could all collide. Thirty-two still
+    # blocks immediate replay patterns while letting the motor model keep drawing for long runs.
+    keep: int = 32
 
     def add(self, fp: list[float]) -> None:
         self.fingerprints.append(fp)

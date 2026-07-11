@@ -163,17 +163,12 @@ non_repetition_threshold = 0.06    # reject trajectories that near-duplicate a p
 # that we did. (Same remedy `_endpoint_inside` already uses for the FFitts endpoint:
 # resample, don't clamp.) Only when this many independent draws all near-duplicate a
 # prior trajectory is the generator genuinely degenerate -- then Halt, fail closed.
-# LIVE-MEASURED 2026-07-08 over the real per-game tap sequence (play, 2 card taps,
-# confirm, gear, concede, 2x end_dismiss), 300 seeded runs x 30 taps each:
-#   resamples   emitted duplicates   runs that would Halt
-#       1            14.21%              293/300      <- the shipped behaviour
-#       2             2.40%              150/300
-#       4             0.12%               11/300
-#       6             0.01%                1/300
-#      10             0.00%                0/300
-# 86% of taps are accepted on the first draw, so this costs ~0.16 extra synth_tap
-# calls per tap (pure CPU, no I/O). Note the flag rate is NOT a fingerprint defect to
-# be tuned away: dropping the collinear `dur` feature RAISES it to 15.50%.
+# LIVE-FIXED 2026-07-10: the first version compared locationless tap fingerprints
+# against a 500-entry whole-session memory. A 52-minute/154-action hunt saturated that
+# memory and halted after 8 normal redraws. The limiter now compares against recent
+# history and includes release position in the fingerprint, so different controls do
+# not poison each other and old hour-ago taps age out. Re-measured over 1000 seeded
+# 154-tap sessions: 0/1000 collapsed with 8 resamples (max 35 rejected redraws total).
 non_repetition_resamples = 8
 
 [vision]

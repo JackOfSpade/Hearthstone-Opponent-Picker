@@ -61,7 +61,11 @@ def test_duration_is_an_exact_function_of_the_sample_count(cfg):
 
 
 def test_the_gate_really_does_saturate_without_resampling(cfg):
-    """Pin the measurement the resample budget was chosen from."""
+    """A single draw still collides often enough that the pre-emit gate must resample.
+
+    The old locationless whole-session memory was ~14%; release-position features and a
+    recent window bring it down, but not to zero.
+    """
     layout = GameLayout()
     seq = _game_sequence(layout)
     flags = taps = 0
@@ -77,7 +81,7 @@ def test_the_gate_really_does_saturate_without_resampling(cfg):
             taps += 1
             flags += mem.is_near_duplicate(fp, cfg.caps.non_repetition_threshold)
             mem.add(fp)
-    assert flags / taps > 0.05, "a single draw used to duplicate ~14% of the time"
+    assert flags / taps > 0.02, "a single draw still collides often enough to need resampling"
 
 
 # ── the pre-emit gate ────────────────────────────────────────────────────────
@@ -141,16 +145,17 @@ def test_only_the_emitted_gesture_is_remembered(cfg):
     assert len(eng.limiter._traj.fingerprints) == 1
 
 
-def test_a_full_game_of_taps_never_halts_on_non_repetition(cfg):
-    """The regression that the shipped code would have hit at ~tap #13."""
+def test_a_live_length_hunt_never_halts_on_non_repetition(cfg):
+    """Live regression: after 154 actions, a normal hunt halted because the old global,
+    locationless memory was dense enough that eight fresh tap draws all collided."""
     layout = GameLayout()
     seq = _game_sequence(layout)
     eng, backend = _engine(cfg, [ScreenState.PLAY_SCREEN])
     eng.panel = PANEL
-    for i in range(30):        # a full run's worth of taps
+    for i in range(160):        # the failing report stopped at 154 actions
         eng._tap(seq[i % len(seq)], committing=False, decision_type="commit",
                  expected_change="full_transition", allow_correction=False, what="x")
-    assert len(backend.gestures) == 30
+    assert len(backend.gestures) == 160
 
 
 # ── the correction is not a blind retry ──────────────────────────────────────

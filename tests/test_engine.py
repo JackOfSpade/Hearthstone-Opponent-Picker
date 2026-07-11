@@ -76,6 +76,11 @@ def test_target_found_alerts_and_stops(cfg):
     eng, backend = _engine(cfg, [ScreenState.MULLIGAN], target_read=read, alerter=alerter)
     stats = eng.run(max_iterations=3)
     assert stats.target_found is True
+    # the designed success exit records WHY it stopped, like every other exit -- so status /
+    # the bug report can say "found your target", not leave a bare "running: False" that reads
+    # as a crash. It must not look like a halt.
+    assert stats.stop_reason == "target_found"
+    assert not stats.stop_reason.startswith("halt")
     assert alerter.found == ("Mage", True)
     # the engine must NOT tap the game once a target is found
     assert backend.gestures == []
