@@ -266,6 +266,16 @@ reconnect_attempt_cap = 3
 # an unknown state (we are still on the mulligan), so halting the hunt over it would be
 # fail-closed applied where nothing is closed.
 mulligan_card_tap_attempts = 3
+# A Concede tap is a BUTTON tap, which this client normally honours every time -- but under a
+# DEGRADING wireless link even a button tap can be silently dropped (observed: a run whose
+# capture latency was climbing dropped the concede, and its own verify could not catch it
+# because the board animates behind the semi-transparent Game Menu, so the change-check passed
+# on ambient motion). The only positive proof the Concede took is the Game Menu LEAVING, so
+# retry the SAME Concede coordinate -- the TOP menu entry, never a point below it -- while the
+# menu is positively still up, exactly as mulligan cards are retried. Each attempt keeps the
+# full screen_wait budget first, so a slow-but-honoured concede never retaps. 1 = the old
+# single-tap-then-halt (which failed the whole hunt closed on one dropped committing tap).
+concede_tap_attempts = 3
 # After we tap Confirm, the wait for the mulligan to LEAVE has to cover the OPPONENT
 # finishing their own mulligan too -- not just our board drawing in. While they choose,
 # this client replaces the "Starting Hand" banner (our mulligan anchor) with an

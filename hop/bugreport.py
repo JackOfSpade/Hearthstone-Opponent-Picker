@@ -420,7 +420,27 @@ def summarize_journal(journal_text: str) -> str:
     # last verified tap, for the false-halt-by-verification check below
     last_tap_what = ""
     last_tap_verified = ""      # change_kind of the verify_ok that confirmed the last tap
+    last_tap_expected = ""      # the change_kind that tap DEMANDED (its `expected` field)
     unknown_after_verify = False
+    # A GENUINE stuck committing tap -- the COMPLEMENT of verified_then_halt. When a button
+    # transition's leave-wait times out with the SOURCE screen STILL POSITIVELY NAMED (never
+    # UNKNOWN), the tap was DROPPED (never registered), not mis-navigated onto an unnamed
+    # destination. Today both false-halt diagnostics stay silent on this shape (false_halt_note
+    # needs an unknown_screen near-miss; verified_then_halt needs a trailing UNKNOWN) and the
+    # halt isn't in _DELIBERATE_HALTS -- so a genuine dropped-commit fell through to a bare
+    # "ended: <message>". Read the terminal wait_timeout{what,state} and how many polls the
+    # source persisted; corroborate with the tap's expected-vs-verified change (a `partial`
+    # where `full_transition` was demanded is a commit masked by ambient animation behind a
+    # semi-transparent overlay). This is exactly the concede-drop this report was pasted for.
+    wait_timeout_what = ""
+    wait_timeout_state = ""
+    leave_poll_what = ""        # contiguous run of leave-wait polls (reset by each tap)
+    leave_poll_run = 0
+    genuine_stuck_note = ""
+    # Taps the client silently ignored and the engine re-sent until honoured. A CLUSTER of these
+    # is the wireless link dropping input -- the same failure a terminal stuck-tap halt is the
+    # tail of -- so surfacing the count corroborates a dropped-commit root cause.
+    dropped_taps = 0
     # Unknown-halt context: which NAMED screen the terminal UNKNOWN run followed, and how many
     # looks it persisted. A near-miss line already says which anchor an unknown came closest to,
     # but not WHERE IN THE FLOW it appeared -- and "an unknown that won't settle right after
@@ -605,7 +625,27 @@ def summarize_journal(journal_text: str) -> str:
             # reset the verified-then-halt trail for THIS tap's outcome
             last_tap_what = what
             last_tap_verified = ""
+            last_tap_expected = str(d.get("expected", "any"))
             unknown_after_verify = False
+            # a new action ends the previous leave-wait's poll run (see the genuine-stuck note)
+            leave_poll_what, leave_poll_run = "", 0
+        if k == "wait_until_poll":
+            # Count the contiguous run of leave-wait polls for one action, so a terminal
+            # stuck halt can report "the source screen persisted N looks" (the tell that the
+            # tap never took, as opposed to a one-frame transient).
+            w = str(d.get("what", ""))
+            if w == leave_poll_what:
+                leave_poll_run += 1
+            else:
+                leave_poll_what, leave_poll_run = w, 1
+        if k == "wait_timeout":
+            # The leave-wait gave up. `state` is the SOURCE screen still on-frame at timeout; a
+            # NAMED one (not "unknown") means the awaited transition never happened -- a genuine
+            # stuck, resolved into the dropped-commit note below.
+            wait_timeout_what = str(d.get("what", ""))
+            wait_timeout_state = str(d.get("state", ""))
+        if k in ("mulligan_card_tap_ignored", "concede_tap_ignored"):
+            dropped_taps += 1
         if k == "verify_ok":
             # the tap's OWN change-check passed: the screen provably moved after it.
             last_tap_verified = str(d.get("change_kind", "?"))
@@ -633,6 +673,38 @@ def summarize_journal(journal_text: str) -> str:
                     f"(UNKNOWN), not from a stuck '{last_tap_what}'. Treat as a classification "
                     f"miss on the DESTINATION: capture that screen's anchor (hop capture "
                     f"--from-file), don't chase a missed tap.")
+            # The COMPLEMENT: a stuck-halt whose leave-wait timed out with the SOURCE screen
+            # still POSITIVELY NAMED (never UNKNOWN) is a GENUINE stuck -- the awaited transition
+            # never happened, i.e. the committing tap was DROPPED (never registered), not
+            # mis-navigated to an unnamed screen. Mutually exclusive with verified_then_halt by
+            # construction (that needs a trailing UNKNOWN; this needs a named source). Reads only
+            # the terminal wait_timeout, so a mid-run wait that later succeeded can't trip it.
+            elif (_is_stuck_halt(last_halt) and wait_timeout_state
+                  and wait_timeout_state != "unknown"):
+                polls = (leave_poll_run + 1 if leave_poll_what == wait_timeout_what
+                         else leave_poll_run or 1)
+                # The masked-drop tell: the tap's OWN verify logged a WEAKER change than it
+                # demanded (partial < full_transition, admitted only by _compatible), which
+                # happens when ambient animation behind a semi-transparent overlay -- an enemy
+                # turn behind the open Game Menu -- moves pixels the tap did not.
+                weaker = ""
+                if (last_tap_verified and last_tap_expected
+                        and last_tap_expected not in ("", "any")
+                        and last_tap_verified != last_tap_expected):
+                    weaker = (f" That '{last_tap_what}' tap's own verify logged change_kind "
+                              f"'{last_tap_verified}', WEAKER than the '{last_tap_expected}' it "
+                              f"demanded (admitted by _compatible) -- the signature of a commit "
+                              f"masked by ambient animation behind a semi-transparent overlay, so "
+                              f"the tap read OK yet never registered.")
+                genuine_stuck_note = (
+                    f"the '{wait_timeout_what or last_tap_what}' leave-wait timed out with the "
+                    f"screen still positively '{wait_timeout_state}' for {polls} look(s) and "
+                    f"never UNKNOWN -- so the committing tap was DROPPED (never registered), not "
+                    f"mis-navigated to an unnamed screen.{weaker} The fix is a bounded RE-TAP of "
+                    f"the button's own coordinate while the frame still reads "
+                    f"'{wait_timeout_state}' (like the mulligan-card retry), NOT a new anchor or "
+                    f"a coordinate change. A congested/degrading wireless link (see the "
+                    f"capture-time TREND) is what drops even a button tap.")
         if k == "unknown_screen" and d.get("near_misses"):
             # the anchor an unknown screen came CLOSEST to: a near-miss below its
             # threshold usually means "known screen, new visual face" -- the single
@@ -821,6 +893,13 @@ def summarize_journal(journal_text: str) -> str:
         out.append("- mulligan reads: " + "; ".join(parts))
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
+    if dropped_taps:
+        # Taps the client silently ignored, re-sent until honoured. A cluster of these is the
+        # wireless link dropping INPUT (not just frames) -- the same failure a terminal
+        # stuck-tap halt is the tail of, so it corroborates a dropped-commit root cause.
+        out.append(f"- dropped taps re-sent: {dropped_taps} (the client silently ignored these "
+                   "and hop re-tapped until they took -- a cluster means the link is dropping "
+                   "input; the same failure mode as a terminal stuck committing tap)")
     if nonrep_rejects or nonrep_collapses:
         parts = []
         if nonrep_rejects:
@@ -926,6 +1005,8 @@ def summarize_journal(journal_text: str) -> str:
         out.append(f"- likely FALSE halt: {false_halt_note}")
     if verified_then_halt:
         out.append(f"- likely FALSE halt (verified-then-stuck): {verified_then_halt}")
+    if genuine_stuck_note:
+        out.append(f"- likely GENUINE stuck (DROPPED committing tap): {genuine_stuck_note}")
     mulligan_read_note = _diagnose_mulligan_read_halt(last_halt)
     if mulligan_read_note:
         # Name a "could not read mulligan" halt's cause (class blank vs garbled vs card

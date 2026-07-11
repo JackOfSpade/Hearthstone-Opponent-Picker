@@ -80,17 +80,58 @@ def test_engine_never_taps_a_concede_confirm():
     assert "layout.concede_confirm" not in inspect.getsource(engine.Engine)
 
 
-def test_concede_halts_rather_than_tapping_below_the_concede_button(cfg):
-    """If Concede is ignored, the menu is still up -- stop, never tap again.
+def test_concede_retries_the_concede_button_then_halts_never_tapping_below_it(cfg):
+    """A dropped Concede leaves the menu up; retry Concede's OWN coordinate, then fail closed.
 
-    The tap below Concede is Quit. Exactly two gestures may leave the engine here:
-    the gear, and Concede itself.
+    A Concede button tap can be silently dropped (a congested link), and unlike the old
+    single-tap-then-halt, the engine re-sends it a bounded number of times -- but ONLY the
+    Concede button, never a point below it (Options/Quit). If the menu never leaves it halts.
+    The safety invariant is not "never tap again"; it is "never tap below Concede": every
+    retap is on the Concede coordinate itself.
     """
-    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU])
+    debug = _RecordingDebug()
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU], debug=debug)
     with pytest.raises(Halt) as e:
         eng._concede()
-    assert "Quit" in str(e.value)
-    assert len(backend.gestures) == 2       # gear, concede -- and nothing else
+    assert "Quit" not in str(e.value)                        # the stale, wrong warning is gone
+    assert "not registering" in str(e.value) or "still up" in str(e.value)
+    # gear + one Concede tap per attempt, and NOTHING else
+    assert len(backend.gestures) == 1 + cfg.vision.concede_tap_attempts
+    # every Concede retap landed on the Concede button's own point -- never below it
+    concede = eng.layout.concede_button.to_px(eng.panel)
+    concede_pt = (round(concede[0]), round(concede[1]))
+    taps = [d["point"] for kind, d in debug.records if kind == "tap" and d["what"] == "concede"]
+    assert len(taps) == cfg.vision.concede_tap_attempts
+    assert all(pt == concede_pt for pt in taps)              # exactly Concede, never Options/Quit
+    # the TOP entry sits well above Options (y~0.42) and Quit (y~0.56): no retap can reach them
+    assert concede_pt[1] < 40 * 0.42
+    # each ignored tap is journalled so the dropped-button rate is observable
+    ignored = [d for kind, d in debug.records if kind == "concede_tap_ignored"]
+    assert len(ignored) == cfg.vision.concede_tap_attempts - 1
+
+
+def test_concede_retries_a_dropped_tap_then_succeeds(cfg):
+    """The recovery the halt used to deny: the first Concede is dropped (the menu persists the
+    whole first leave-wait), the retap lands, and the board dissolves -- a completed concede.
+
+    The first attempt keeps the FULL screen_wait budget before it decides to retap, so the
+    menu must stay up for that entire wait to force one retry; then the next look leaves.
+    """
+    debug = _RecordingDebug()
+    n = cfg.vision.screen_wait_attempts
+    states = ([ScreenState.IN_GAME]
+              + [ScreenState.CONCEDE_MENU] * (1 + n)   # gear-open look + the whole first wait
+              + [ScreenState.VICTORY])                 # the retap's wait sees the board dissolve
+    eng, backend = _engine(cfg, states, debug=debug)
+    assert eng._concede() is True
+    # gear + first (dropped) concede + the retap that took == 3
+    assert len(backend.gestures) == 3
+    ignored = [d for kind, d in debug.records if kind == "concede_tap_ignored"]
+    assert len(ignored) == 1                                 # exactly one retry, then success
+    concede = eng.layout.concede_button.to_px(eng.panel)
+    concede_pt = (round(concede[0]), round(concede[1]))
+    taps = [d["point"] for kind, d in debug.records if kind == "tap" and d["what"] == "concede"]
+    assert taps == [concede_pt, concede_pt]                  # both taps on Concede, never below
 
 
 def test_concede_requires_the_game_menu_before_the_committing_tap(cfg):

@@ -655,6 +655,60 @@ def test_summarize_journal_false_halt_ignores_a_named_destination_after_the_veri
     assert "verified-then-stuck" not in s
 
 
+def test_summarize_journal_flags_a_genuine_stuck_dropped_commit():
+    """The COMPLEMENT of verified-then-stuck: the leave-wait timed out with the SOURCE screen
+    still positively NAMED (never UNKNOWN) -- a DROPPED committing tap, not an unnamed
+    destination. This is the concede-drop this whole diagnosis was added for: the tap's own
+    verify passed on a WEAKER change (partial < the full_transition it demanded) because the
+    board animated behind the semi-transparent Game Menu, masking the drop."""
+    import json
+    events = (
+        [{"kind": "tap", "detail": {"what": "concede", "expected": "full_transition"}},
+         {"kind": "verify_ok", "detail": {"change_kind": "partial"}}]
+        + [e for _ in range(6) for e in (
+            {"kind": "classify", "detail": {"ms": 30, "state": "concede_menu"}},
+            {"kind": "wait_until_poll", "detail": {"what": "concede", "state": "concede_menu"}})]
+        + [{"kind": "classify", "detail": {"ms": 30, "state": "concede_menu"}},
+           {"kind": "wait_timeout", "detail": {"what": "concede", "state": "concede_menu"}},
+           {"kind": "halt", "detail": {"message": "Concede did not dismiss the Game Menu after 3 tap(s)"}}]
+    )
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "GENUINE stuck (DROPPED committing tap)" in s
+    assert "still positively 'concede_menu' for 7 look(s)" in s   # 6 polls + the timeout look
+    assert "'partial', WEAKER than the 'full_transition'" in s    # the masked-drop tell
+    assert "FALSE halt (verified-then-stuck)" not in s            # mutually exclusive
+
+
+def test_summarize_journal_genuine_stuck_yields_to_the_unknown_destination_false_halt():
+    """When the SAME stuck halt is preceded by a trailing UNKNOWN (the destination is unnamed),
+    it is the verified-then-stuck FALSE halt, NOT a genuine dropped commit. The two are mutually
+    exclusive: a genuine stuck needs a positively-NAMED source at timeout, never UNKNOWN."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "mulligan_confirm", "expected": "full_transition"}},
+        {"kind": "verify_ok", "detail": {"change_kind": "full_transition"}},
+        {"kind": "classify", "detail": {"ms": 6000, "state": "unknown"}},
+        {"kind": "wait_timeout", "detail": {"what": "mulligan_confirm", "state": "unknown"}},
+        {"kind": "halt", "detail": {"message": "mulligan Confirm did not dismiss the mulligan"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "FALSE halt (verified-then-stuck)" in s
+    assert "GENUINE stuck (DROPPED committing tap)" not in s
+
+
+def test_summarize_journal_tallies_dropped_taps():
+    """A cluster of silently-ignored-then-re-sent taps (mulligan cards, and now concede) is the
+    wireless link dropping INPUT -- surfaced as one count so it corroborates a dropped-commit."""
+    import json
+    events = [
+        {"kind": "mulligan_card_tap_ignored", "detail": {"slot": 1, "attempt": 1, "of": 3}},
+        {"kind": "mulligan_card_tap_ignored", "detail": {"slot": 2, "attempt": 1, "of": 3}},
+        {"kind": "concede_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "dropped taps re-sent: 3" in s
+
+
 def test_summarize_journal_surfaces_the_coin_and_concede_timing():
     """Answers 'does it only concede on MY turn / wait till turn 2 going second?': the coin
     split, where the reject grammar chose to bail (random, not coin-driven), and how many

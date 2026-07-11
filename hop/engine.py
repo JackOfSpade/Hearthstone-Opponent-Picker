@@ -1212,13 +1212,15 @@ class Engine:
     def _concede(self) -> bool:
         """gear -> Concede, then wait for the Game Menu to actually go away.
 
-        **There is no confirm button, and there must be no blind tap here.** The
-        Game Menu reads Concede / Options / Quit top to bottom. The old code, if the
-        menu was still classified afterwards, tapped a fixed "concede_confirm" point
-        at y=0.56 - which is *dead centre on Quit* (measured against the real
-        concede_menu capture: the 0.9x144 px truncation disc lies almost entirely on
-        the Quit plate). So the recovery path for "the Concede tap was ignored" was
-        "quit Hearthstone" - and this client is known to ignore taps.
+        **There is no confirm button, and no fixed point below Concede may ever be
+        tapped.** The Game Menu reads Concede / Options / Quit top to bottom. The old
+        code, if the menu was still classified afterwards, tapped a fixed
+        "concede_confirm" point at y=0.56 - which is *dead centre on Quit* (measured
+        against the real concede_menu capture: the 0.9x144 px truncation disc lies
+        almost entirely on the Quit plate). So the recovery path for "the Concede tap
+        was ignored" was "quit Hearthstone" - and this client is known to ignore taps.
+        The recovery is instead to re-tap **Concede's own coordinate** (the TOP entry,
+        y=0.196), bounded, and only while the menu is positively still up (see below).
 
         Conceding is also **asynchronous**: the board dissolves over a second or
         more, and the menu can still be drawn on the frame right after the tap. So
@@ -1270,16 +1272,63 @@ class Engine:
         # fresh slow rejection. `committing=True` already books this as a commit for
         # HumanState, so this only aligns the think to match. RNG-draw-identical (think_time
         # draws one normal either way); only the think DURATION shrinks (~2.7s -> ~1.7s med).
-        self._tap(self.layout.concede_button, committing=True, decision_type="commit",
-                  expected_change="full_transition", what="concede")
-        self._wait_until_screen_leaves(
-            ScreenState.CONCEDE_MENU, where="concede",
-            stuck="Concede did not dismiss the Game Menu; refusing to tap again "
-                  "(the entry below Concede is Quit)",
-            # while the menu is still up its anchor clears (fast still-polls); the concede
-            # drops us onto the dissolving board then the end banners.
-            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT})
-        return True
+        #
+        # A single Concede tap can be silently DROPPED. This client ignores taps under a
+        # congested wireless link (this run dropped two mulligan-card taps the same way,
+        # retried, and had them honoured), and the concede tap's OWN change-check cannot
+        # catch it: the board keeps animating BEHIND the semi-transparent Game Menu (an
+        # enemy turn, flames, an attack arrow), so `_tap` sees a `partial` change and its
+        # NO_CHANGE correction never fires -- verify passes on ambient motion unrelated to
+        # the tap. The only positive proof the Concede took is the Game Menu LEAVING. So
+        # retry exactly as the mulligan cards do (`_replace_card`) -- but a concede re-tap
+        # is safe ONLY while the menu is POSITIVELY still up:
+        #   * The Concede button is the TOP entry of a STATIC menu, so re-tapping its OWN
+        #     coordinate (0.5025, 0.196) lands on Concede -- never the Options/Quit entries
+        #     below it. There is still NO fixed point below Concede (the deleted, fatal
+        #     `concede_confirm`); we re-send the same button, nothing lower.
+        #   * The engine already trusts this exact tap: `_dispatch` re-taps concede every
+        #     loop iteration while `concede_menu` persists (an UNBOUNDED implicit retry).
+        #     This bounds it and keeps it inside `_concede`.
+        #   * The gate can't fire on a live/end board: the concede_menu anchor is the ornate
+        #     "Game Menu" title plate, which OFF-PHONE NCC-scores 0.18-0.36 on every other
+        #     screen (defeat/victory/in_game/mulligan/rewards/reconnect) vs its 0.72 floor,
+        #     and 0.84 only on its own frame -- so a positive concede_menu is the menu, not a
+        #     priority-10 false positive masking a dissolving board.
+        # An UNKNOWN or any other frame is NOT proof the menu is up, so we never blind-retap
+        # on it: we fail closed (keep the pixels + Halt) exactly as before. Each attempt
+        # keeps the FULL screen_wait budget before deciding to retap, so a slow-but-HONOURED
+        # concede (the menu lingers a poll or two while the board dissolves) leaves within the
+        # first wait and never retaps -- the happy path stays RNG/journal byte-identical.
+        arrivals = {ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT}
+        attempts = max(1, self.cfg.vision.concede_tap_attempts)
+        cls = frame = None
+        for attempt in range(attempts):
+            self._tap(self.layout.concede_button, committing=True, decision_type="commit",
+                      expected_change="full_transition", what="concede")
+            ok, cls, frame = self._wait_until(
+                lambda c, _f: c.state not in (ScreenState.CONCEDE_MENU, ScreenState.UNKNOWN),
+                what="concede",
+                # {CONCEDE_MENU} | arrivals, exactly as `_wait_until_screen_leaves` scopes it
+                # (+ the interrupt floor); a re-classify here always scans that floor, so a
+                # reconnect/error co-drawn over the menu wins and stops the retry.
+                expected=frozenset({ScreenState.CONCEDE_MENU}) | frozenset(arrivals))
+            if ok:
+                return True
+            # The menu did not leave. Retry ONLY while it is POSITIVELY still the Game Menu --
+            # a re-tap is safe there and nowhere else. UNKNOWN / anything else falls through
+            # to the fail-closed halt below.
+            if cls.state != ScreenState.CONCEDE_MENU or attempt + 1 == attempts:
+                break
+            if self.debug:
+                self.debug.record("concede_tap_ignored", attempt=attempt + 1, of=attempts)
+            self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                            "concede_retry", attempt=attempt + 1)
+        if cls is not None and cls.state == ScreenState.UNKNOWN:
+            self._record_unknown(frame, where="concede", confidence=round(cls.confidence, 3),
+                                 waiting_to_leave=ScreenState.CONCEDE_MENU.value)
+        raise Halt(f"Concede did not dismiss the Game Menu after {attempts} tap(s); the menu "
+                   "is still up, so the tap is not registering (a dropped committing tap, not "
+                   "a wrong coordinate). Only Concede's own coordinate was ever tapped.")
 
     #: Screens ``_clear_end_screens`` is allowed to tap ``end_dismiss`` on. The tap is
     #: a fixed point, so the set of screens it may land on has to be closed and named.

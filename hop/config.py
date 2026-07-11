@@ -214,6 +214,13 @@ class VisionConfig:
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
     mulligan_card_tap_attempts: int
+    #: How many times to (re-)tap Concede before failing closed. Like a mulligan card, a
+    #: Concede BUTTON tap can be silently dropped under a congested wireless link, and its
+    #: own change-check can't catch it (the board animates behind the semi-transparent Game
+    #: Menu, so verify passes on ambient motion). Only the menu LEAVING is proof it took, so
+    #: retry the SAME Concede coordinate while the menu is positively still up. 1 restores
+    #: the old single-tap-then-halt behaviour. See :meth:`hop.engine.Engine._concede`.
+    concede_tap_attempts: int
     #: The wait for the mulligan to leave after we tap Confirm is NOT a normal button
     #: transition: it must also absorb the OPPONENT finishing THEIR mulligan. While they
     #: deliberate, this client swaps the "Starting Hand" banner (our mulligan anchor) for
