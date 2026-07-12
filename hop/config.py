@@ -233,11 +233,22 @@ class VisionConfig:
     mulligan_resolve_timeout_s: float
     mulligan_resolve_attempts: int
     #: Total tries to READ the opponent's class off the mulligan before failing closed.
-    #: The classifier has already confirmed the mulligan is up; a blank class is the same
-    #: transient the resolve wait covers -- the nameplate still drawing in, or an "Opponent
-    #: Still Choosing..." banner over it -- so we re-read a few times, not just once, before
-    #: halting. (>=1; 1 restores the old single-read-no-retry behaviour.)
+    #: The classifier has already confirmed the mulligan is up; a blank class is a transient
+    #: (most likely the nameplate still drawing in), so we re-read a few times, not just once,
+    #: before giving up. (>=1; 1 restores the old single-read-no-retry behaviour.)
     mulligan_read_attempts: int
+    #: Consecutive GAMES whose CLASS never reads (blank/garbled after every re-read) before the
+    #: hunt fails closed. One unreadable game is a transient hop recovers from -- it concedes +
+    #: requeues, like a human who can't ID the matchup -- rather than halting the whole
+    #: unattended run. A *run* of them in a row means the reader is broken RIGHT NOW (a shifted
+    #: nameplate region, a UI change breaking every read), so at this many hop stops for a human.
+    #: The streak resets on any usable read, so this catches an ACUTE, class-independent break,
+    #: NOT a failure correlated to one class's word (that one is surfaced by the report's "class
+    #: NEVER read" line + the "?" games in the observed distribution -- visible, not auto-halted,
+    #: since auto-halting on a scattered rate would false-stop a healthy hunt). The trade this
+    #: makes is deliberate: an unreadable game that happens to be a target is conceded rather
+    #: than halting the hunt on it. (>=1; 1 restores the old halt-on-first-unreadable-class.)
+    mulligan_unreadable_halt_streak: int
     glow_green_bias: int
     glow_min_green: int
     glow_col_min_frac: float

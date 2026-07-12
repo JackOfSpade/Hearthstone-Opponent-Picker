@@ -217,8 +217,10 @@ def test_summarize_empty_journal_is_empty():
 
 def test_could_not_read_mulligan_halt_is_self_diagnosed():
     """The 'class=\'\' cards=3' halt (the one this feature was built for) must name its own
-    cause -- class blank but cards fine -> the opponent nameplate / still-choosing transient --
-    so the next such report is actionable without decoding the raw message."""
+    cause -- class blank but cards fine -> point at the `region_gray` datum that decides blank
+    vs mis-aligned OCR, and at the recover-not-halt streak knob -- so the next such report is
+    actionable without decoding the raw message. (The still-choosing banner is NOT the cause:
+    a real still-choosing frame OCRs the class fine, so the diagnosis must not claim it is.)"""
     import json
     events = [
         {"kind": "mulligan_read", "detail": {"opponent": "?", "cards": 3, "conf": 0.0}},
@@ -228,8 +230,8 @@ def test_could_not_read_mulligan_halt_is_self_diagnosed():
     ]
     summary = br.summarize_journal("\n".join(json.dumps(e) for e in events))
     assert "likely cause:" in summary
-    assert "BLANK" in summary and "Still Choosing" in summary
-    assert "mulligan_read_attempts" in summary        # points at the knob that governs it
+    assert "BLANK" in summary and "region_gray" in summary
+    assert "mulligan_unreadable_halt_streak" in summary   # points at the recover-not-halt knob
 
 
 def test_mulligan_read_halt_diagnosis_distinguishes_the_three_failure_modes():
@@ -502,6 +504,25 @@ def test_summarize_journal_flags_a_reread_that_stayed_unreadable():
     s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
     assert "still unreadable after the re-read" in s
     assert "opponents seen" not in s          # no class was ever resolved
+
+
+def test_summarize_journal_reads_out_unreadable_mulligan_region_stats():
+    """The `mulligan_unreadable` events carry the class-region pixel stats -- the datum a
+    'could not read mulligan' report never had. The summary must read them out (recovered vs
+    halted, and the last region_gray with a blank-vs-mis-aligned interpretation) so the cause
+    is IN the report, not left to saved-frame archaeology."""
+    import json
+    events = [
+        {"kind": "mulligan_unreadable", "detail": {"class_raw": "", "cards": 4, "streak": 1,
+            "cap": 4, "recovering": True, "region_gray": {"mean": 12.0, "min": 12, "max": 12, "std": 0.0}}},
+        {"kind": "mulligan_unreadable", "detail": {"class_raw": "", "cards": 4, "streak": 2,
+            "cap": 4, "recovering": True, "region_gray": {"mean": 44.0, "min": 0, "max": 255, "std": 61.8}}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "class NEVER read" in s
+    assert "2 recovered" in s                 # both conceded + requeued, hunt kept running
+    assert "std=61.8" in s                     # the last one's region stats are read out
+    assert "high std" in s                     # ...with the "text was present -> OCR/region" reading
 
 
 def test_summarize_journal_reports_think_absorbed_into_latency():

@@ -154,7 +154,7 @@ def _is_stuck_halt(message: str) -> bool:
 #: The "could not read mulligan (class=<raw>, cards=<n>)" halt carries BOTH signals the
 #: mulligan read needs, so which one failed is decidable from the message alone.
 _MULLIGAN_READ_HALT_RE = re.compile(
-    r"could not read mulligan \(class=(?P<cls>.*), cards=(?P<cards>-?\d+)\)")
+    r"could not read mulligan(?: \d+x in a row)? \(class=(?P<cls>.*), cards=(?P<cards>-?\d+)\)")
 
 
 def _diagnose_mulligan_read_halt(message: str) -> str:
@@ -162,13 +162,12 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
 
     The read needs two signals: the opponent's CLASS (OCR of the bottom-left nameplate)
     and our CARD count (the green keep-glow strips). The halt message carries both, so
-    which failed is decidable here instead of by opening the kept frame. The common --
-    and confusing -- case is class BLANK while the cards read fine: the mulligan genuinely
-    IS up, but the opponent's nameplate had not rendered, or an "Opponent Still
-    Choosing..." banner sat over the class region. That is the transient the read now
-    retries (``vision.mulligan_read_attempts``) before failing closed, so a recurrence
-    means the phone is slower than that budget, not a code regression. Returns "" for any
-    other halt.
+    which failed is decidable here instead of by opening the kept frame. A single
+    unreadable game no longer halts (hop concedes + requeues it); this halt fires only
+    after ``vision.mulligan_unreadable_halt_streak`` such games IN A ROW, i.e. a
+    *systematic* reader break. The decisive follow-up datum is the ``mulligan_unreadable``
+    journal event's ``region_gray`` (see the journal summary). Returns "" for any other
+    halt.
     """
     m = _MULLIGAN_READ_HALT_RE.search(message or "")
     if not m:
@@ -182,12 +181,17 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
     cards_ok = cards in (3, 4)
     if blank and cards_ok:
         return ("the opponent-CLASS OCR read BLANK (class='') while the cards counted fine "
-                f"(cards={cards}) -- the mulligan WAS up, but the opponent's nameplate had "
-                "not rendered yet / an 'Opponent Still Choosing...' banner was over the class "
-                "region. Transient, not a lost screen: the read retries "
-                "vision.mulligan_read_attempts times before halting. If it still recurs, "
-                "raise that knob or build an 'Opponent Still Choosing...' anchor (hop capture "
-                "--from-file).")
+                f"(cards={cards}). hop no longer halts a hunt on ONE unreadable game -- it "
+                "re-reads (vision.mulligan_read_attempts), then concedes + requeues the game; "
+                "reaching THIS halt means the class was unreadable "
+                "vision.mulligan_unreadable_halt_streak games IN A ROW, i.e. the reader is "
+                "systematically broken, not one slow nameplate. Decide which from the "
+                "`mulligan_unreadable` journal event's `region_gray`: a LOW std (near-uniform) "
+                "means the opponent nameplate had not drawn in (a render/timing transient -- "
+                "raise the streak or mulligan_read_attempts); a HIGH std means the text WAS "
+                "present and the OCR or the opponent_class_region alignment is at fault -- open "
+                "the saved anomaly frame. (An 'Opponent Still Choosing...' banner does NOT cause "
+                "this: a real still-choosing frame OCRs the class fine, verified on disk.)")
     if cards_ok:   # class present but did not snap to a known class
         base = (f"the class text ({cls_raw}) did not resolve to a known class though the "
                 f"cards counted fine (cards={cards}) -- a GARBLED nameplate read, not a blank one.")
@@ -349,6 +353,10 @@ def summarize_journal(journal_text: str) -> str:
     reread_recovered = 0   # first read unusable, re-read resolved a class
     reread_failed = 0      # re-read still unreadable (this is what precedes a halt)
     unreadable_first = 0   # first reads that came back "?" (OCR whiffed)
+    # Games the class NEVER read (given up on after every re-read). Each entry is the engine's
+    # `mulligan_unreadable` detail: whether it recovered (conceded + requeued) or halted, and
+    # the class-region pixel stats that say WHY it was blank -- the datum older reports lacked.
+    unreadable_games: list[dict] = []
     think_credited = 0.0   # think seconds absorbed into perception latency, not stacked
     # Per-tap wall-clock, split think vs perception, so "why is <action> so slow?" is
     # answered inline instead of by hand-tracing timestamps. Everything since the previous
@@ -516,6 +524,12 @@ def summarize_journal(journal_text: str) -> str:
                 else:
                     went_first += 1
                 coin_counted_game = True
+        if k == "mulligan_unreadable":
+            # A game hop gave up reading the class for. Keep the whole detail: the summary
+            # reports how many recovered vs the one that halted, and reads out the last one's
+            # region_gray (the blank-vs-garbled datum) so the cause is in the report, not just
+            # the message.
+            unreadable_games.append(d)
         if k == "reject_plan":
             # Where the reject grammar chose to bail. Chosen at RANDOM, independent of the
             # coin (journey.choose_concede_point) -- so a lopsided split here is just RNG,
@@ -891,6 +905,32 @@ def summarize_journal(journal_text: str) -> str:
         if reread_failed:
             parts.append(f"{reread_failed} still unreadable after the re-read (this is what precedes a halt)")
         out.append("- mulligan reads: " + "; ".join(parts))
+    if unreadable_games:
+        # Games the class never read. Each RECOVERED (conceded + requeued) except possibly
+        # the last, which halts iff its streak hit the cap. Read out the last one's region_gray
+        # -- the datum that says whether the region was blank (nameplate not drawn: low std) or
+        # full of text the OCR still missed (region/OCR fault: high std) -- so the cause is in
+        # the report itself, no saved-frame archaeology needed.
+        halted = [g for g in unreadable_games if not g.get("recovering", True)]
+        recovered = len(unreadable_games) - len(halted)
+        last = unreadable_games[-1]
+        rg = last.get("region_gray") or {}
+        rg_txt = (f"class-region gray mean={rg.get('mean')} std={rg.get('std')} "
+                  f"(min={rg.get('min')} max={rg.get('max')})") if rg else "class-region stats unavailable"
+        interp = ""
+        std = rg.get("std")
+        if isinstance(std, (int, float)):
+            interp = ("  low std => the opponent nameplate had not drawn in (a render transient)"
+                      if std < 12 else
+                      "  high std => the nameplate text WAS present; suspect the OCR or the "
+                      "opponent_class_region alignment, not a slow render")
+        parts = []
+        if recovered:
+            parts.append(f"{recovered} recovered (conceded + requeued -- hunt kept running)")
+        if halted:
+            parts.append(f"{len(halted)} hit the halt streak (cap={halted[-1].get('cap')})")
+        out.append(f"- class NEVER read: {'; '.join(parts)}. last: {rg_txt}.{interp} "
+                   "(saved as an anomaly frame; see mulligan_unreadable in the journal)")
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
     if dropped_taps:

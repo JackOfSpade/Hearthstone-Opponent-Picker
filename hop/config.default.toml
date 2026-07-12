@@ -289,14 +289,29 @@ concede_tap_attempts = 3
 mulligan_resolve_timeout_s = 75.0  # wall-clock; a roping opponent + slow UNKNOWN full-scans
 mulligan_resolve_attempts = 30     # poll bound (a frozen-clock test needs this; timeout binds on-device)
 # Reading the OPPONENT's class off the mulligan can whiff even once the mulligan is up:
-# the nameplate is still drawing in, or the same "Opponent Still Choosing..." banner is
-# sitting over it, so the class region reads blank (class='') though our cards count fine.
-# That is a transient, not a lost screen -- so re-read a few times before failing closed,
-# the same patience the resolve wait above gives a roping opponent. LIVE-OBSERVED
+# the nameplate is still drawing in, so the class region reads blank (class='') though our
+# cards count fine. (NOT the "Opponent Still Choosing..." banner above -- that is a POST-confirm
+# wait phenomenon, while this read happens BEFORE we confirm; a real still-choosing frame OCRs
+# the class fine, verified on disk.) That is a transient, not a lost screen -- so re-read a few
+# times before failing closed, the same patience the resolve wait above gives. LIVE-OBSERVED
 # 2026-07-10: a single re-read (the old behaviour, =2) halted a healthy hunt on one
 # slow-rendering nameplate. Each try costs ~0.8 s think + a wireless capture + OCR (~5 s),
 # so 4 keeps the added patience to ~15 s. (>=1; 1 = one read, no retry.)
 mulligan_read_attempts = 4
+# When a game's class NEVER reads (blank/garbled through all mulligan_read_attempts above),
+# halting the whole unattended hunt on that one nameplate is out of step with every other
+# transient hop recovers from (a dropped tap, a reconnect, a stray Collection screen). The
+# cards counted fine, so hop can concede + requeue that game -- exactly what a human hunting
+# specific classes does when they can't tell what they're facing -- and only fail closed when
+# it happens this many GAMES in a row. A single unreadable game (the LIVE-OBSERVED 2026-07-11
+# halt: class='', cards=4, going 2nd) now recovers; a *run* in a row means the reader is broken
+# RIGHT NOW (a shifted nameplate region, a UI change) and stops for a human. The streak resets
+# on any usable read, so this catches an ACUTE, class-independent break -- a failure correlated
+# to one class's word is surfaced by the report's "class NEVER read" line and the "?" games
+# instead (auto-halting on a scattered rate would false-stop a healthy hunt). Deliberate trade:
+# an unreadable game that happens to be a target is conceded, not halted on. (>=1; 1 = halt on
+# the first unreadable game.)
+mulligan_unreadable_halt_streak = 4
 # Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
 # The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
 # which this replaced - card artwork cannot fake it. A strip must span most of the

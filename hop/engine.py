@@ -38,7 +38,7 @@ from .adb import AdbError
 from .config import Config
 from .geometry import PanelGeometry
 from .hearthstone import GameLayout, MulliganRead, Point, read_mulligan
-from .hero_classes import DISPLAY_NAMES
+from .hero_classes import DISPLAY_NAMES, nearest_class
 from .humanize import journey, motor, timing
 from .humanize.contact import ContactModel
 from .humanize.limiter import Limiter
@@ -120,6 +120,39 @@ def evaluate_matchup(read: MulliganRead, cfg: Config) -> str:
     return "keep" if cfg.criteria.accepts(read.opponent_class, read.we_go_second) else "reject"
 
 
+def _region_gray_stats(frame: Frame, region) -> dict:
+    """Grayscale mean/min/max/std of a screen region, for diagnosing an unreadable read.
+
+    This is the datum a "could not read mulligan" report never had: a LOW std means the
+    class region was near-uniform (the opponent nameplate had not drawn in -- a transient
+    that waiting or the recover-and-requeue resolves), while a HIGH std means the text WAS
+    there and the OCR/region alignment is the fault (a code problem, not a slow phone).
+    Works with either Frame backing (ndarray or flat bytes); returns ``{}`` if unavailable.
+    """
+    try:
+        rx, ry, rw, rh = region.to_px(frame)
+        crop = frame.crop(rx, ry, rw, rh)
+    except Exception:
+        return {}
+    data = crop.data
+    try:
+        import numpy as np
+        if not isinstance(data, (bytes, bytearray)):
+            a = np.asarray(data, dtype=float)
+            return {"mean": round(float(a.mean()), 1), "min": int(a.min()),
+                    "max": int(a.max()), "std": round(float(a.std()), 1)}
+    except Exception:
+        pass
+    vals = bytes(data) if isinstance(data, (bytes, bytearray)) else b""
+    if not vals:
+        return {}
+    n = len(vals)
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    return {"mean": round(mean, 1), "min": min(vals), "max": max(vals),
+            "std": round(var ** 0.5, 1)}
+
+
 class Engine:
     def __init__(
         self,
@@ -185,6 +218,12 @@ class Engine:
         #: consecutive top-level dispatches that saw the deck LIST (waiting, never tapping,
         #: for the user to re-select their deck after an error dropped us there)
         self._deck_select_polls = 0
+        #: consecutive GAMES whose opponent class never read (blank/garbled through every
+        #: re-read). One such game is a transient we recover from (concede + requeue, like a
+        #: human who can't ID the matchup); a *run* of them means the reader is systematically
+        #: broken and must fail closed for a human. Reset by any usable read. Mirrors the
+        #: `_reconnect_attempts` bounded-recovery pattern. See `_handle_mulligan`.
+        self._unreadable_mulligans = 0
         #: did THIS hunt queue the game currently in progress? Only a game we started
         #: may be conceded from the board - a board we found ourselves in is the user's.
         self._own_game = False
@@ -998,12 +1037,14 @@ class Engine:
         decision = evaluate_matchup(read, self.cfg)
         if decision == "unusable":
             # The classifier has already confirmed the mulligan is up, so a blank/garbled
-            # read is a transient -- the opponent's nameplate still drawing in, or the
-            # "Opponent Still Choosing..." banner sitting over the class region (class='')
-            # while our cards count fine -- not a lost screen. Re-read a few times before
-            # failing closed; a single re-read alone halted a healthy hunt on one
-            # slow-rendering nameplate. The extra RNG draws and looks happen ONLY on this
-            # recover-or-halt path, never on a clean first read.
+            # read is a transient -- most likely the opponent's nameplate still drawing in --
+            # not a lost screen. (NOT the "Opponent Still Choosing..." banner: that is a
+            # POST-confirm phenomenon -- it replaces our "Starting Hand" anchor while we WAIT
+            # for the opponent after WE confirm, see `_confirm_mulligan` -- whereas this read
+            # happens BEFORE confirming; and a real still-choosing frame OCRs the class fine,
+            # verified on disk.) Re-read a few times before failing closed; a single re-read
+            # alone halted a healthy hunt on one slow-rendering nameplate. The extra RNG draws
+            # and looks happen ONLY on this recover-or-halt path, never on a clean first read.
             for attempt in range(1, max(1, self.cfg.vision.mulligan_read_attempts)):
                 self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
                                 "mulligan_reread")
@@ -1029,11 +1070,50 @@ class Engine:
                         class_raw=read.class_raw)
                 if decision != "unusable":
                     break
-            if decision == "unusable":
-                raise Halt(f"could not read mulligan (class={read.class_raw!r}, cards={read.num_cards})")
+            if decision == "unusable" and read.opponent_class is None:
+                # The CLASS never read, this game. Halting the whole unattended hunt on one
+                # unreadable nameplate is out of step with every other transient here (a
+                # dropped tap, a reconnect, a stray Collection screen all RECOVER), and the
+                # recovery is available: the cards counted fine, so the reject journey
+                # (concede + requeue) can run without the class -- exactly what a human hunting
+                # specific classes does when they can't tell what they're facing. So recover,
+                # and only fail closed when it happens `mulligan_unreadable_halt_streak` GAMES
+                # in a row -- an ACUTE reader break (a shifted region, a UI change breaking every
+                # read), not a one-off. (A break correlated to ONE class's word evades the streak
+                # -- good reads between its appearances reset it -- and is instead surfaced by the
+                # report's "class NEVER read" line; auto-halting on a scattered rate would
+                # false-stop a healthy hunt.) The frame + class-region pixel stats are
+                # preserved here because a named-screen halt otherwise saved nothing to diagnose
+                # the blank read from (the pixels are the one datum the report lacked).
+                #
+                # Gated on `opponent_class is None` on purpose: "unusable" ALSO covers a game
+                # whose class read FINE (perhaps a TARGET) but whose CARD count never resolved.
+                # That one must NOT be conceded -- we cannot tell the hand (coin, how many to
+                # replace) and might be throwing away the very matchup the hunt exists to catch,
+                # so it keeps the old fail-closed Halt below. Only a blank/garbled CLASS recovers.
+                self._unreadable_mulligans += 1
+                cap = max(1, self.cfg.vision.mulligan_unreadable_halt_streak)
+                self._record_unreadable_mulligan(frame, read, self._unreadable_mulligans, cap)
+                if self._unreadable_mulligans >= cap:
+                    raise Halt(f"could not read mulligan {self._unreadable_mulligans}x in a row "
+                               f"(class={read.class_raw!r}, cards={read.num_cards}); the "
+                               "opponent-class reader looks systematically broken")
+                # else fall through: `decision` stays 'unusable', the stats below record a "?"
+                # game, and `_execute_reject` concedes + requeues. The hunt lives on.
+            elif decision == "unusable":
+                # Class read but the CARD count never resolved: fail closed as before (do not
+                # concede a possible target on a hand we cannot count).
+                raise Halt(f"could not read mulligan (class={read.class_raw!r}, "
+                           f"cards={read.num_cards})")
 
         # session stats (once per game, on the resolved read): the observed class
         # distribution and the coin split the dashboard charts.
+        if decision != "unusable":
+            # A usable read clears the consecutive-unreadable streak (the reader recovered).
+            # Not reset on the recover-as-reject path above, so a *run* of blanks still trips
+            # the cap. Stats-only: no RNG draw, no HumanState tick -- the timing stream is
+            # unchanged on every path that already worked.
+            self._unreadable_mulligans = 0
         name = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
         self.stats.last_opponent = name
         self.stats.class_distribution[name] = self.stats.class_distribution.get(name, 0) + 1
@@ -1049,6 +1129,47 @@ class Engine:
             self._alert_target(read)
             return
         self._execute_reject(read)
+
+    def _record_unreadable_mulligan(self, frame: Frame, read: MulliganRead,
+                                    streak: int, cap: int) -> None:
+        """Preserve everything needed to diagnose a blank/garbled opponent-class read.
+
+        A "could not read mulligan" halt used to save NOTHING -- the mulligan is a *named*
+        screen, so :meth:`DebugLog.unknown_screen` (the only frame hop keeps on purpose)
+        never fired, and the report was left with just ``class=''`` and no way to tell a
+        region that was blank (nameplate not drawn -> wait) from one full of contrast the
+        OCR still whiffed (region/preprocess bug). So journal the class-region PIXEL STATS
+        (the decisive datum) and save the frame as an anomaly (bounded, in-run). Pure
+        observability: no RNG draw, no HumanState tick.
+        """
+        if self.debug is None:
+            return
+        stats = _region_gray_stats(frame, self.layout.opponent_class_region)
+        # `nearest_class` (no cutoff) names the PROBABLE class of a garbled -- not blank --
+        # read, so a report reads "closest to Death Knight (dist 1)" instead of raw text. Only
+        # meaningful when SOMETHING was read; a blank read has no nearest (leave it None).
+        near_name, near_dist = "", None
+        raw = (read.class_raw or "").strip()
+        if raw:
+            try:
+                near, near_dist = nearest_class(raw)
+                near_name = DISPLAY_NAMES.get(near, "") if near else ""
+            except Exception:
+                near_dist = None
+        recovering = streak < cap
+        self.debug.record("mulligan_unreadable", class_raw=read.class_raw,
+                          cards=read.num_cards, second=read.we_go_second,
+                          streak=streak, cap=cap, recovering=recovering,
+                          nearest=near_name, nearest_dist=near_dist,
+                          region_gray=stats)
+        # Save the frame so the exact pixels are recoverable. anomaly() prunes to the newest
+        # few, so a healthy-then-recovered hunt never accretes frames without bound.
+        try:
+            self.debug.anomaly("mulligan opponent-class unreadable", before=frame,
+                               class_raw=read.class_raw, cards=read.num_cards,
+                               streak=streak, cap=cap, region_gray=stats)
+        except Exception:
+            pass
 
     # ── the plausible-exit journey (anti-barcode core) ───────────────────────
 

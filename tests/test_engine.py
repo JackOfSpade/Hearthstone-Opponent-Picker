@@ -185,21 +185,121 @@ def test_mulligan_class_recovers_on_a_later_reread_not_just_the_first(cfg):
     assert eng.stats.last_opponent == "Mage"
 
 
-def test_a_persistently_unreadable_mulligan_still_halts(cfg):
-    """The patience is bounded: a class that never reads still fails closed."""
-    from hop.verify import Halt
+def test_a_single_unreadable_mulligan_recovers_not_halts(cfg):
+    """A single game whose class never reads is a transient, not a fatal halt: hop concedes +
+    requeues it (the reject journey, which needs only the card count -- present here) and keeps
+    hunting. This is the LIVE-OBSERVED 2026-07-11 halt (class='', cards=4, going 2nd), which
+    used to stop the whole unattended run on one nameplate."""
+    attempts = cfg.vision.mulligan_read_attempts
     eng = _mulligan_read_engine(
-        cfg, [MulliganRead(None, False, 3, 0.0, "", "tesseract")] * 8)
-    with pytest.raises(Halt, match="could not read mulligan"):
+        cfg, [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts)
+    rejected = []
+    eng._execute_reject = lambda read: rejected.append(read)
+    eng._handle_mulligan(gray_frame(80, 40))          # must NOT raise Halt
+    assert len(rejected) == 1                          # conceded + requeued, hunt lives on
+    assert eng._unreadable_mulligans == 1              # but the streak is counting
+    assert eng.stats.class_distribution == {"?": 1}    # recorded honestly as an unread game
+
+
+def test_unreadable_streak_resets_on_a_good_read(cfg):
+    """The consecutive-failure streak is CONSECUTIVE: any usable read clears it, so an
+    occasional unreadable game interleaved with good ones never trips the halt."""
+    from dataclasses import replace
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    attempts = cfg.vision.mulligan_read_attempts
+    eng = _mulligan_read_engine(
+        cfg,
+        [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts    # game 1: unreadable
+        + [MulliganRead(HeroClass.MAGE, True, 4, 0.8, "MAGE", "tesseract")])  # game 2: reads fine
+    eng._handle_mulligan(gray_frame(80, 40))
+    assert eng._unreadable_mulligans == 1
+    eng._handle_mulligan(gray_frame(80, 40))
+    assert eng._unreadable_mulligans == 0             # a good read cleared the streak
+
+
+def test_a_persistently_unreadable_mulligan_halts_after_a_streak(cfg):
+    """Patience is bounded across GAMES: a class that never reads game after game is a
+    systematically broken reader (it would otherwise silently concede a real target forever),
+    so hop still fails closed -- just after `mulligan_unreadable_halt_streak` games, not one."""
+    from hop.verify import Halt
+    attempts = cfg.vision.mulligan_read_attempts
+    cap = cfg.vision.mulligan_unreadable_halt_streak
+    eng = _mulligan_read_engine(
+        cfg, [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * (attempts * cap))
+    for _ in range(cap - 1):
+        eng._handle_mulligan(gray_frame(80, 40))       # each recovers, no raise
+    assert eng._unreadable_mulligans == cap - 1
+    with pytest.raises(Halt, match="in a row"):
+        eng._handle_mulligan(gray_frame(80, 40))       # the cap-th game fails closed
+
+
+def test_good_class_bad_card_count_still_halts_never_conceded(cfg):
+    """The recover-as-reject path is gated on the CLASS being unreadable. A game whose class
+    reads FINE (here a hunted target) but whose card count never resolves must NOT be conceded
+    -- we can't tell the hand and might throw away the target the hunt exists to catch -- so it
+    keeps the old fail-closed Halt, on the FIRST such game (no streak), and never rejects."""
+    from hop.verify import Halt
+    from dataclasses import replace
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    attempts = cfg.vision.mulligan_read_attempts
+    eng = _mulligan_read_engine(
+        cfg, [MulliganRead(HeroClass.PALADIN, False, 0, 0.9, "PALADIN", "tesseract")] * attempts)
+    rejected = []
+    eng._execute_reject = lambda read: rejected.append(read)
+    with pytest.raises(Halt, match=r"could not read mulligan \(class='PALADIN', cards=0\)"):
         eng._handle_mulligan(gray_frame(80, 40))
+    assert rejected == []                       # the target was NOT conceded
+    assert eng._unreadable_mulligans == 0       # a card-count miss is not a class-read streak
+
+
+def test_unreadable_mulligan_saves_the_frame_and_class_region_stats(cfg):
+    """Harness regression: a 'could not read mulligan' used to save NOTHING (the mulligan is a
+    NAMED screen, so the unknown-frame store never fired), leaving a report with only class=''
+    and no way to tell a blank region from a mis-aligned OCR. Now it journals the class-region
+    pixel stats -- the decisive datum -- and saves the frame."""
+    from dataclasses import replace
+    from hop.geometry import PanelGeometry
+
+    class RecordingDebug:
+        def __init__(self):
+            self.events = []
+            self.anomalies = []
+
+        def record(self, kind, /, **detail):
+            self.events.append((kind, detail))
+
+        def anomaly(self, reason, before=None, after=None, **context):
+            self.anomalies.append((reason, before, context))
+
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+    dbg = RecordingDebug()
+    attempts = cfg.vision.mulligan_read_attempts
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1), layout=GameLayout(),
+                 capturer=ScriptedCapturer([gray_frame(80, 40)] * (attempts + 1)), debug=dbg)
+    eng._execute_reject = lambda read: None
+    reads = iter([MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts)
+    eng._read_mulligan = lambda *a, **k: next(reads)
+
+    eng._handle_mulligan(gray_frame(80, 40))
+
+    unreadable = [d for k, d in dbg.events if k == "mulligan_unreadable"]
+    assert len(unreadable) == 1
+    d = unreadable[0]
+    assert d["recovering"] is True and d["streak"] == 1 and d["cap"] == cfg.vision.mulligan_unreadable_halt_streak
+    assert set(d["region_gray"]) == {"mean", "min", "max", "std"}   # the decisive datum is present
+    assert len(dbg.anomalies) == 1                                   # the frame was saved for diagnosis
 
 
 def test_mulligan_read_attempts_one_restores_single_read_no_retry(cfg):
-    """`mulligan_read_attempts = 1` is the escape hatch back to one read, no re-read."""
+    """`mulligan_read_attempts = 1` is the escape hatch back to one read, no re-read. Paired
+    with `mulligan_unreadable_halt_streak = 1` it restores the old halt-on-first behaviour."""
     from dataclasses import replace
     from hop.verify import Halt
 
-    cfg = replace(cfg, vision=replace(cfg.vision, mulligan_read_attempts=1))
+    cfg = replace(cfg, vision=replace(cfg.vision, mulligan_read_attempts=1,
+                                      mulligan_unreadable_halt_streak=1))
     reads = []
 
     def read(*a, **k):
