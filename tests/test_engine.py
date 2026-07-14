@@ -156,6 +156,89 @@ def test_mulligan_reread_is_journalled_with_its_recovered_class(cfg):
     assert eng.stats.last_opponent == "Druid"
 
 
+def test_opponent_class_region_captures_the_longest_label_from_the_screen_edge(cfg):
+    """The class-label crop is one conservative box: anchored at the screen edge (casual has no
+    rank medallion, so the class word butts the left) and wide enough for the LONGEST label,
+    "DEMON HUNTER"/"DEATH KNIGHT" (12 glyph-units ~0.094 W at the casual pitch). Clipping the left
+    is the catastrophic failure the reported bug came from ("DEMON HUNTER" -> "HUNTER"); a too-wide
+    crop into the dark gutter is harmless. So: start at 0, and reach well past 0.094 W."""
+    from hop.hearthstone import read_mulligan
+    from hop.perception.ocr import ClassRead
+
+    layout = GameLayout()
+    reg = layout.opponent_class_region
+    assert reg.xf == 0.0                       # screen edge -- never clips the word's left
+    assert reg.xf + reg.wf >= 0.15             # reaches past the longest label's ~0.094 W end
+
+    # read_mulligan crops exactly that region (width in px), whatever the frame size.
+    seen = {}
+
+    class RecReader:
+        def read(self, crop):
+            seen["w"] = crop.width
+            return ClassRead(HeroClass.MAGE, 1.0, "MAGE", 0, "tesseract")
+
+    fr = gray_frame(2400, 400)
+    read_mulligan(fr, layout, RecReader(), cfg.vision)
+    assert seen["w"] == int(reg.wf * 2400)
+
+
+def test_low_confidence_resolved_read_is_preserved_for_diagnosis(cfg):
+    """A read that RESOLVED to a valid class but at low confidence is the silent-misread case
+    (a garbled two-word label snapping to its own tail word: Demon Hunter -> Hunter, conf 0.25).
+    It never reaches the re-read path -- the engine acts on it as if certain -- so its pixels +
+    raw are preserved HERE (a `mulligan_low_confidence` journal line + an anomaly frame), the one
+    datum a bare 'opponents seen: Hunter' report loses when the frame is deleted. A CLEAN read
+    (conf 1.0, distance 0) preserves nothing. Observability only: no control-flow change."""
+    from dataclasses import replace
+    from hop.geometry import PanelGeometry
+
+    class RecordingDebug:
+        def __init__(self):
+            self.events = []
+            self.anomalies = []
+
+        def record(self, kind, /, **detail):
+            self.events.append((kind, detail))
+
+        def anomaly(self, reason, before=None, after=None, **context):
+            self.anomalies.append((reason, context))
+
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
+
+    def _eng():
+        dbg = RecordingDebug()
+        eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                     FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                     sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1),
+                     layout=GameLayout(),
+                     capturer=ScriptedCapturer([gray_frame(80, 40)]), debug=dbg)
+        eng._execute_reject = lambda read: None    # skip the concede journey; we test the read
+        return eng, dbg
+
+    # conf 0.25 == 3 glyph edits off the label: snapped Hunter, raw was "<stray glyph> HUNTER".
+    eng, dbg = _eng()
+    eng._read_mulligan = lambda *a, **k: MulliganRead(
+        HeroClass.HUNTER, True, 4, 0.25, "G HUNTER", "tesseract")
+    eng._handle_mulligan(gray_frame(80, 40))
+    low = [d for k, d in dbg.events if k == "mulligan_low_confidence"]
+    assert len(low) == 1
+    assert low[0]["snapped"] == "Hunter" and low[0]["class_raw"] == "G HUNTER"
+    assert low[0]["conf"] == 0.25
+    assert dbg.anomalies and "low confidence" in dbg.anomalies[0][0]
+    # the raw OCR is also on the FIRST mulligan_read line now (was re-reads only)
+    first = next(d for k, d in dbg.events if k == "mulligan_read")
+    assert first["class_raw"] == "G HUNTER"
+
+    # a CLEAN read (conf 1.0) preserves nothing -- a healthy hunt saves no frames.
+    eng, dbg = _eng()
+    eng._read_mulligan = lambda *a, **k: MulliganRead(
+        HeroClass.MAGE, False, 3, 1.0, "MAGE", "tesseract")
+    eng._handle_mulligan(gray_frame(80, 40))
+    assert not [d for k, d in dbg.events if k == "mulligan_low_confidence"]
+    assert not dbg.anomalies
+
+
 def _mulligan_read_engine(cfg, reads, n_frames=6):
     """An engine on the mulligan whose `_read_mulligan` yields a scripted sequence."""
     from hop.geometry import PanelGeometry

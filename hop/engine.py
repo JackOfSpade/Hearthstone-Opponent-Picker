@@ -120,6 +120,19 @@ def evaluate_matchup(read: MulliganRead, cfg: Config) -> str:
     return "keep" if cfg.criteria.accepts(read.opponent_class, read.we_go_second) else "reject"
 
 
+#: A RESOLVED class read below this confidence is kept for diagnosis even though the engine acts
+#: on it. ClassReader maps OCR edit-distance to confidence as 1 - distance/(max_edit+1); at the
+#: default ocr_max_edit_distance=3 that is 1.0 = exact, 0.75 = 1 edit, 0.5 = 2 edits, 0.25 = 3
+#: edits (the snap's max), so this floor keeps reads >=2 glyphs off their label. (If that knob is
+#: raised the scale widens, but the floor still keeps only shakily-resolved reads.) Such a read
+#: never reaches the "unusable" re-read path -- it looks certain -- yet 2+ errors is exactly where
+#: a garbled two-word label mis-snaps to a valid-but-wrong class (the Demon-Hunter-read-as-Hunter
+#: bug: conf 0.25). The frame is otherwise deleted, leaving the report only a bare class name;
+#: keeping the pixels makes the next such misread diagnosable. A clean read (distance 0, conf 1.0)
+#: saves nothing.
+_LOW_CONFIDENCE_KEEP = 0.75
+
+
 def _region_gray_stats(frame: Frame, region) -> dict:
     """Grayscale mean/min/max/std of a screen region, for diagnosing an unreadable read.
 
@@ -1029,10 +1042,17 @@ class Engine:
         self.state.observe_confidence(read.class_confidence)
         self.stats.last_opponent = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
         if self.debug:
+            # class_raw on the FIRST read too (previously only re-reads carried it): a read that
+            # resolves to a WRONG class at low confidence -- a garbled two-word label snapping to
+            # its tail word, the reported "Demon Hunter read as Hunter" -- never triggers the
+            # re-read path (that fires only on an UNUSABLE read), so without the raw here the
+            # report could only show the snapped class and a bare confidence, with no way to see
+            # that the OCR string was "<stray glyph> HUNTER". The raw is the datum that names the
+            # failure. Pure observability.
             self.debug.record("mulligan_read", opponent=self.stats.last_opponent,
                               second=read.we_go_second, cards=read.num_cards,
                               conf=round(read.class_confidence, 3), method=read.method,
-                              ms=ocr_ms)
+                              class_raw=read.class_raw, ms=ocr_ms)
 
         decision = evaluate_matchup(read, self.cfg)
         if decision == "unusable":
@@ -1122,6 +1142,12 @@ class Engine:
         else:
             self.stats.going_first += 1
 
+        # A read the engine ACTS ON but only barely resolved (see _LOW_CONFIDENCE_KEEP): keep its
+        # pixels + raw text so a silent misread -- a garbled two-word label snapping to a
+        # valid-but-wrong class -- stays diagnosable instead of vanishing with the deleted frame.
+        if decision != "unusable" and read.class_confidence < _LOW_CONFIDENCE_KEEP:
+            self._record_low_confidence_mulligan(frame, read)
+
         if decision == "keep":
             self.stats.target_found = True
             # the hunt stops on a target, so `concedes` right now IS "concedes until target".
@@ -1168,6 +1194,40 @@ class Engine:
             self.debug.anomaly("mulligan opponent-class unreadable", before=frame,
                                class_raw=read.class_raw, cards=read.num_cards,
                                streak=streak, cap=cap, region_gray=stats)
+        except Exception:
+            pass
+
+    def _record_low_confidence_mulligan(self, frame: Frame, read: MulliganRead) -> None:
+        """Preserve a RESOLVED-but-shaky opponent-class read (acted on, yet >=2 glyph errors).
+
+        The twin of :meth:`_record_unreadable_mulligan`: that one fires when the class NEVER read
+        (opponent None); this fires when it DID read -- to a real class -- but only barely, the
+        silent-misread case the re-read path never sees (it triggers only on an *unusable* read).
+        Same discipline: journal the class-region PIXEL STATS (blank region vs. contrast-the-OCR-
+        still-mangled) and `nearest_class` (the probable class of a garble), and save the frame
+        (bounded via anomaly()). Pure observability: no RNG draw, no HumanState tick, no
+        control-flow change -- the engine has already acted on `read`.
+        """
+        if self.debug is None:
+            return
+        stats = _region_gray_stats(frame, self.layout.opponent_class_region)
+        near_name, near_dist = "", None
+        raw = (read.class_raw or "").strip()
+        if raw:
+            try:
+                near, near_dist = nearest_class(raw)
+                near_name = DISPLAY_NAMES.get(near, "") if near else ""
+            except Exception:
+                near_dist = None
+        snapped = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
+        self.debug.record("mulligan_low_confidence", class_raw=read.class_raw, snapped=snapped,
+                          conf=round(read.class_confidence, 3), cards=read.num_cards,
+                          second=read.we_go_second, nearest=near_name, nearest_dist=near_dist,
+                          region_gray=stats)
+        try:
+            self.debug.anomaly("mulligan class read at low confidence", before=frame,
+                               class_raw=read.class_raw, snapped=snapped,
+                               conf=round(read.class_confidence, 3), region_gray=stats)
         except Exception:
             pass
 

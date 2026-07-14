@@ -357,6 +357,13 @@ def summarize_journal(journal_text: str) -> str:
     # `mulligan_unreadable` detail: whether it recovered (conceded + requeued) or halted, and
     # the class-region pixel stats that say WHY it was blank -- the datum older reports lacked.
     unreadable_games: list[dict] = []
+    # Reads that RESOLVED to a class but at a confidence low enough to be a silent misread. The
+    # engine acts on these as if certain (they never reach the re-read path), so the report must
+    # flag them or "opponents seen" reads as ground truth when it may be a garbled two-word label
+    # snapped to a valid-but-wrong class -- the Demon-Hunter-read-as-Hunter bug.
+    low_conf_reads: list[dict] = []
+    LOW_CONF_FLAG = 0.75   # mirror engine._LOW_CONFIDENCE_KEEP: conf < this == a shakily-resolved
+    #                        read (>=2 glyph edits at the default ocr_max_edit_distance=3)
     think_credited = 0.0   # think seconds absorbed into perception latency, not stacked
     # Per-tap wall-clock, split think vs perception, so "why is <action> so slow?" is
     # answered inline instead of by hand-tracing timestamps. Everything since the previous
@@ -498,6 +505,13 @@ def summarize_journal(journal_text: str) -> str:
             # journal line lacking `cards` is treated as usable, so older reports are unchanged.
             if opp and opp != "?" and d.get("cards", 3) in (3, 4):
                 classes[opp] = classes.get(opp, 0) + 1
+                conf = d.get("conf")
+                if isinstance(conf, (int, float)) and conf < LOW_CONF_FLAG:
+                    # The engine acted on this class despite the shaky OCR; carry the raw text so
+                    # the report can show WHY it may be wrong (a stray glyph, a mangled word).
+                    low_conf_reads.append({"opp": opp, "conf": float(conf),
+                                           "raw": (d.get("class_raw") or "").strip(),
+                                           "reread": is_reread})
                 if is_reread:
                     reread_recovered += 1
                 # the resolved read a following reject_plan pairs its class + coin to (updated on
@@ -855,6 +869,19 @@ def summarize_journal(journal_text: str) -> str:
     out.append("- kinds: " + ", ".join(f"{k}={n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])))
     if classes:
         out.append("- opponents seen: " + ", ".join(f"{c}×{n}" for c, n in sorted(classes.items(), key=lambda kv: -kv[1])))
+    if low_conf_reads:
+        # A read that RESOLVED but at low confidence is the silent-misread risk: it is where a
+        # garbled TWO-word class lands on a valid-but-WRONG one -- "DEMON HUNTER" snapping to its
+        # own tail word HUNTER. Show the confidence + RAW OCR so "opponents seen" above is not
+        # taken as ground truth (the raw text shows the actual corruption); the class-region
+        # pixels are also kept (an `anomaly` frame + a `mulligan_low_confidence` journal line) for
+        # the deciding look. Report the confidence itself, NOT a decoded edit count: the OCR
+        # distance->confidence scale depends on vision.ocr_max_edit_distance, so a reverse-
+        # engineered "N glyph edits" would be wrong whenever that knob is off its default.
+        bits = [f"{r['opp']} conf {r['conf']:.2f}"
+                + (f" (raw {r['raw']!r})" if r['raw'] else "") for r in low_conf_reads]
+        out.append("- low-confidence class reads -- VERIFY (a garbled two-word label can snap to "
+                   "a valid-but-wrong class): " + "; ".join(bits))
     if went_first or went_second or concede_points:
         # The coin/turn story, so "does it only concede on my turn / wait till turn 2 going
         # second?" is answered from the report instead of by hand-tracing. Concede is via the

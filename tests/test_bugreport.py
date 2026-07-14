@@ -210,6 +210,37 @@ def test_summarize_journal_surfaces_class_distribution_and_ending():
     assert "unknown screen" in summary
 
 
+def test_summarize_journal_flags_a_low_confidence_class_read():
+    """A read that RESOLVED to a class but at low confidence must be surfaced with its confidence
+    and RAW OCR: the engine acted on it as ground truth, but a garbled two-word label can snap to
+    a valid-but-wrong class (Demon Hunter -> its tail word Hunter). The confidence is shown as-is
+    (NOT a decoded edit count -- the distance->confidence scale is config-dependent), and the raw
+    text shows the actual corruption."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "Hunter", "cards": 4, "second": True,
+                                             "conf": 0.25, "class_raw": "G HUNTER"}},
+    ]
+    summary = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "low-confidence class reads" in summary
+    assert "Hunter conf 0.25" in summary
+    assert "G HUNTER" in summary
+    assert "glyph edits" not in summary   # no reverse-engineered edit count (config-dependent)
+
+
+def test_summarize_journal_does_not_flag_a_confident_read():
+    """A clean read (high confidence) must NOT trip the low-confidence warning -- else every
+    report cries wolf and the flag stops meaning 'look here'."""
+    import json
+    events = [
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "cards": 3, "conf": 1.0,
+                                             "class_raw": "MAGE"}},
+    ]
+    summary = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "low-confidence class reads" not in summary
+    assert "Mage×1" in summary
+
+
 def test_summarize_empty_journal_is_empty():
     assert br.summarize_journal("") == ""
     assert br.summarize_journal("not json\n{bad") == ""

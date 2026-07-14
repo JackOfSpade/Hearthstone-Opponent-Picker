@@ -49,7 +49,25 @@ class GameLayout:
 
     # opponent is bottom-left; class label is the line under the portrait.
     # LIVE-VERIFIED: reads the OPPONENT's class (you are bottom-right).
-    opponent_class_region: Region = Region(0.03, 0.90, 0.20, 0.07)
+    #
+    # One conservative crop, anchored at the screen edge and sized for the LONGEST class label.
+    # In the CASUAL mulligan (the mode the hunt runs in) there is no rank medallion, so the class
+    # word butts the left edge -- LIVE-MEASURED at x 0.008..0.050 W for "PRIEST". The longest
+    # labels, "DEMON HUNTER"/"DEATH KNIGHT" (12 glyph-units), reach ~0.094 W at the measured
+    # ~0.0072 W casual pitch, so x 0.0 width 0.18 (to 0.18 W) clears the longest label with margin.
+    # Deliberately generous: over-reaching into the dark nameplate gutter is harmless (the crop
+    # still OCRs "PRIEST" cleanly out to width 0.25), whereas the OLD Region(0.03, .., 0.20, ..)
+    # started 0.022 W INSIDE the word and CLIPPED its left glyphs -- "PRIEST" -> "EST" (snapped,
+    # dist 3), and the reported bug, a "DEMON HUNTER" whose whole first word was cut off, leaving
+    # just "HUNTER" (a valid class the fail-closed snap then accepted, conf 0.25). CLIPPING is the
+    # catastrophic failure (a lost word is unrecoverable -- "HUNTER" is deliberately Hunter's own
+    # word, never a Demon Hunter fragment, see hero_classes._PARTIAL_LABELS); a too-wide crop is not.
+    #
+    # RANKED draws a league medallion in exactly this left band (x 0.009..0.060 W, measured), which
+    # OCRs as junk leading glyphs ("BSY PRIEST", dist 3) -- so this single crop is tuned for CASUAL,
+    # and a ranked two-word class could still mis-snap. If the hunt is ever run RANKED, add a
+    # mode-specific crop starting ~0.065 W (past the medallion). Card geometry is mode-shared.
+    opponent_class_region: Region = Region(0.0, 0.90, 0.18, 0.07)
     # the whole mulligan card row: the band the keep-glow strips are counted in
     card_row: Region = Region(0.12, 0.24, 0.76, 0.45)
     # Width of a card's interior - the span between its left and right keep-glow -
