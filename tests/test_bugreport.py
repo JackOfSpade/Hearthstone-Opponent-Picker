@@ -115,6 +115,55 @@ def test_diagnose_last_error_names_a_non_screencap_adb_timeout():
     assert "screencap over wireless" not in why.lower()             # not the first branch
 
 
+def test_diagnose_last_error_names_a_refused_connect():
+    """A REFUSED `adb connect` (adbd not listening on the wireless port) is a distinct failure
+    from the timeout branches above: it strikes BEFORE the hunt starts and no retry fixes it."""
+    why = br._diagnose_last_error(
+        "AdbError: could not connect to 192.168.99.139:5555: failed to connect to "
+        "'192.168.99.139:5555': Connection refused")
+    assert why
+    assert "refused" in why.lower() and "adb tcpip 5555" in why
+    assert "listener" in why.lower()
+    assert "get-state" in why.lower()          # points at the corroborating Host-section fact
+    # Regression: a live user re-enabled Android's "Wireless debugging" toggle and was still
+    # refused, because that toggle is a separate feature that doesn't touch this port. The
+    # diagnosis must steer AWAY from it, not offer it as an equivalent fix.
+    assert "wireless debugging" in why.lower()
+    assert "not do this" in why.lower() or "does not match" in why.lower()
+
+
+def test_host_diagnostics_names_a_usb_fix_command_when_wireless_is_refused():
+    """The generic 'run adb tcpip 5555' instruction wasn't enough for a live user, who tried
+    the wrong (Wireless debugging) fix instead. If the phone happens to be plugged in over USB
+    right now, name the EXACT command -- `adb devices -l` lists it with a bare serial (no
+    ip:port colon) and state "device", distinguishing it from the (broken) Wi-Fi entry."""
+    rules = [
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"1 packets transmitted, 1 packets received, 0.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device offline\n")),
+        (lambda a: "devices" in a,
+         _Proc(b"List of devices attached\n"
+               b"R58N70ABCDE            device usb:1-1 product:panther\n"
+               b"192.168.99.139:5555    offline transport_id:2\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555", run=_router(rules), system=lambda: "Darwin")
+    assert "USB-attached device detected right now: R58N70ABCDE" in out
+    assert "tcpip 5555" in out
+
+
+def test_host_diagnostics_skips_usb_probe_when_wireless_already_connected():
+    """No fix needed (and no noise) when the wireless link is fine."""
+    rules = [
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"1 packets transmitted, 1 packets received, 0.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(b"device\n")),
+        (lambda a: "devices" in a,
+         _Proc(b"List of devices attached\n192.168.99.139:5555    device transport_id:2\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555", run=_router(rules), system=lambda: "Darwin")
+    assert "USB-attached device detected" not in out
+
+
 def test_host_diagnostics_is_empty_off_macos():
     assert _REAL_HOST_DIAGNOSTICS("1.2.3.4:5555", run=_router([]), system=lambda: "Linux") == ""
 

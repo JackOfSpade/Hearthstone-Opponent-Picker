@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from hop.adb import Adb, AdbError, resolve_adb
+from hop.adb import Adb, AdbError, parse_usb_serials, resolve_adb
 
 
 def test_resolve_adb_prefers_path(monkeypatch):
@@ -81,6 +81,145 @@ def test_spawn_time_oserror_becomes_a_typed_adberror(monkeypatch):
     with pytest.raises(AdbError) as ei:
         a.screencap_png()
     assert "failed to run" in str(ei.value).lower()
+
+
+def test_connect_names_a_refused_connection_as_a_dead_listener(monkeypatch):
+    """A REFUSED connect (the phone is on the network but adbd isn't listening on this port)
+    is a different failure from a timeout, and no retry backoff fixes it -- retrying a closed
+    port can't make it listen. The raised error must say so instead of just echoing adb's raw
+    stdout, so the live status / bug report point straight at `adb tcpip 5555`, not a network
+    guess (see hop/bugreport.py's _diagnose_last_error for the fuller report-side diagnosis).
+
+    Regression: a user hit this live, re-enabled Android's "Wireless debugging" toggle (a
+    SEPARATE feature that opens its own random port), and was still refused -- because the
+    first version of this message named that toggle as an alternative fix, which is wrong.
+    The message must point ONLY at `adb tcpip 5555` and must not repeat that equivalence."""
+    import subprocess
+
+    a = Adb("192.168.99.139:5555", timeout=1.0)
+
+    class _Proc:
+        stdout = b"failed to connect to '192.168.99.139:5555': Connection refused\n"
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a_, **k: _Proc())
+    with pytest.raises(AdbError) as ei:
+        a.connect(retries=0)          # no retries needed: assert the message, not the backoff
+    msg = str(ei.value)
+    assert "Connection refused" in msg
+    assert "adb tcpip 5555" in msg
+    assert "does not restore 5555" in msg.replace("NOT", "not")
+    assert "(or re-enable Wireless" not in msg   # the old, misleading equivalence
+
+
+def test_parse_usb_serials_filters_wireless_and_unauthorized_entries():
+    """Shared by the USB rescue below and hop.bugreport's device probe -- a plain text parse
+    with no adb binary involved, so it's worth pinning on its own."""
+    out = (
+        "List of devices attached\n"
+        "R58N70ABCDE            device usb:1-1 product:panther\n"
+        "192.168.99.139:5555    offline transport_id:2\n"
+        "ZY223JQZ8G              unauthorized usb:1-2\n"
+    )
+    assert parse_usb_serials(out) == ["R58N70ABCDE"]
+
+
+def test_connect_auto_rescues_via_usb_when_refused(monkeypatch):
+    """The behaviour a user asked for directly after hitting this live: if the SAME phone is
+    already plugged in over USB when the wireless connect is refused, hop should just fix it
+    -- `adb tcpip <port>` on the USB serial, then retry -- instead of only printing
+    instructions for a fix the phone was sitting right there to receive."""
+    import subprocess
+
+    monkeypatch.setattr(time, "sleep", lambda *_a: None)   # skip the real settle/backoff waits
+    a = Adb("192.168.99.139:5555", timeout=1.0)
+    calls = []
+
+    class _Proc:
+        def __init__(self, stdout=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = b""
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "connect":
+            rescued = any("tcpip" in c for c in calls[:-1])
+            return _Proc(stdout=(b"connected to 192.168.99.139:5555\n" if rescued else
+                                 b"failed to connect to '192.168.99.139:5555': Connection refused\n"))
+        if args[1] == "devices":
+            return _Proc(stdout=b"List of devices attached\nR58N70ABCDE   device usb:1-1\n")
+        if "tcpip" in args:
+            return _Proc(returncode=0)
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.connect()   # must NOT raise
+    tcpip_calls = [c for c in calls if "tcpip" in c]
+    assert len(tcpip_calls) == 1                                  # rescue ran exactly once
+    assert "R58N70ABCDE" in tcpip_calls[0] and "5555" in tcpip_calls[0]
+
+
+def test_connect_falls_back_to_manual_fix_with_no_usb_device_present(monkeypatch):
+    """No USB device present means there's nothing to safely rescue from -- fall through to
+    the existing manual-fix error instead of guessing."""
+    import subprocess
+
+    monkeypatch.setattr(time, "sleep", lambda *_a: None)
+    a = Adb("192.168.99.139:5555", timeout=1.0)
+
+    class _Proc:
+        def __init__(self, stdout=b""):
+            self.stdout = stdout
+            self.stderr = b""
+
+    def fake_run(args, **kwargs):
+        if args[1] == "connect":
+            return _Proc(stdout=b"failed to connect to '192.168.99.139:5555': Connection refused\n")
+        if args[1] == "devices":
+            return _Proc(stdout=b"List of devices attached\n")   # nothing plugged in
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdbError) as ei:
+        a.connect(retries=0)
+    msg = str(ei.value)
+    assert "Connection refused" in msg
+    assert "adb tcpip 5555" in msg
+    assert "hop will re-pin it automatically" in msg
+
+
+def test_connect_names_a_rescue_that_ran_but_still_failed(monkeypatch):
+    """A rarer case: the USB rescue itself succeeded (`adb tcpip` returned 0) but the phone
+    still refuses the wireless connect afterward -- a different problem (bad address, Wi-Fi
+    actually down on the phone), so the message must say the rescue WAS applied, not repeat
+    the generic dead-listener advice as if nothing had been tried."""
+    import subprocess
+
+    monkeypatch.setattr(time, "sleep", lambda *_a: None)
+    a = Adb("192.168.99.139:5555", timeout=1.0)
+
+    class _Proc:
+        def __init__(self, stdout=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = b""
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        if args[1] == "connect":
+            return _Proc(stdout=b"failed to connect to '192.168.99.139:5555': Connection refused\n")
+        if args[1] == "devices":
+            return _Proc(stdout=b"List of devices attached\nR58N70ABCDE   device usb:1-1\n")
+        if "tcpip" in args:
+            return _Proc(returncode=0)
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(AdbError) as ei:
+        a.connect()   # default retries=4 -- gives the post-rescue retry a chance to fail too
+    msg = str(ei.value)
+    assert "USB rescue re-pinned the wireless listener" in msg
+    assert "still failed afterward" in msg
 
 
 def test_reconnect_disconnects_before_connecting(monkeypatch):

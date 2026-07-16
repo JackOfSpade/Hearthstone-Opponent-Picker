@@ -53,6 +53,24 @@ def resolve_adb() -> str:
     return "adb"
 
 
+def parse_usb_serials(devices_output: str) -> list[str]:
+    """Serials of USB-attached, authorized ("device"-state) phones from `adb devices` output.
+
+    `adb devices` lists BOTH USB and wireless endpoints; a wireless one's id is the ip:port
+    we're already dialing (and, when this matters, failing to reach), so filtering out any
+    id containing ':' leaves only real USB serials. "device" (not "offline"/"unauthorized")
+    is the only state that means actually usable right now. Shared by :meth:`Adb.connect`'s
+    USB rescue and hop.bugreport's device probe, so the parsing rule can't drift between the
+    two -- a plain pure-text parse, so it needs no adb binary and can't fail.
+    """
+    serials = []
+    for line in devices_output.splitlines():
+        tok = line.split()
+        if len(tok) >= 2 and tok[1] == "device" and ":" not in tok[0]:
+            serials.append(tok[0])
+    return serials
+
+
 class Adb:
     def __init__(self, address: str, adb_bin: str | None = None, timeout: float = 20.0):
         self.address = address
@@ -122,9 +140,21 @@ class Adb:
     # ── connection lifecycle ────────────────────────────────────────────────
 
     def connect(self, retries: int = 4) -> None:
-        """`adb connect <address>` with exponential backoff on failure."""
+        """`adb connect <address>` with exponential backoff on failure.
+
+        A REFUSED connection (the phone answered and closed the socket) means adbd simply
+        isn't listening on this port -- retrying with backoff can't fix that, only running
+        `adb tcpip <port>` on the phone can (see :func:`parse_usb_serials`). So on the FIRST
+        refusal this looks for that same phone attached over USB right now and, if found
+        alone, runs the fix itself and retries immediately -- turning "plug it in and run
+        this command" into something that just works when the phone happens to already be
+        plugged in. Falls through to the backoff loop (unchanged) for any other failure, and
+        to a manual-fix error message if no single USB device was there to rescue from.
+        """
         delay = 2.0
         last = ""
+        rescue_tried = False
+        rescue_ok = False
         for attempt in range(retries + 1):
             try:
                 out = subprocess.run(
@@ -140,10 +170,76 @@ class Adb:
                 raise AdbError(self._missing_adb_msg())
             except Exception as e:  # pragma: no cover - network
                 last = str(e)
+            if "refused" in last.lower() and not rescue_tried:
+                # Only ONE attempt at this, win or lose: repeating it on every subsequent
+                # retry would just re-run `adb devices`/`adb tcpip` for no new information.
+                rescue_tried = True
+                rescue_ok = self._rescue_via_usb()
+                if rescue_ok:
+                    continue   # retry now -- no backoff burned on a fix we just made
             if attempt < retries:
                 time.sleep(delay)
                 delay *= 2
-        raise AdbError(f"could not connect to {self.address}: {last.strip()}")
+        reason = last.strip()
+        if rescue_ok:
+            # We DID find the fix and applied it (adb tcpip succeeded on the USB-attached
+            # phone), but the wireless connect still failed afterward -- a different,
+            # rarer problem (wrong IP in device.adb_address, phone's Wi-Fi actually down),
+            # not the common dead-listener case, so don't repeat that advice here.
+            hint = (" -- a USB rescue re-pinned the wireless listener (`adb tcpip` succeeded "
+                    "on the USB-attached phone) but the wireless connect still failed "
+                    "afterward; check the phone's Wi-Fi and device.adb_address")
+        elif "refused" in reason.lower():
+            # A REFUSED connection (not a timeout) means the phone answered and closed the
+            # socket -- adbd simply isn't listening on THIS port right now, which is NOT a
+            # network/routing problem (a dead link times out; it does not refuse). A fixed
+            # port (like 5555 here) is pinned by running `adb tcpip 5555` over USB, and a
+            # reboot or a USB replug drops it until that's re-run. Android's own "Wireless
+            # debugging" toggle (Settings > Developer options) is a SEPARATE, unrelated
+            # feature: it opens its own listener on a random port shown on that screen, NOT
+            # 5555 -- so re-enabling it does NOT fix a refusal on a fixed port and is a dead
+            # end some users otherwise try first (confirmed live: a user re-enabled it and
+            # still got refused on 5555). The USB rescue above already covers the case where
+            # the phone is plugged in; reaching this message means it either wasn't plugged
+            # in, or more than one USB device was attached (too ambiguous to guess which).
+            hint = (" -- the phone's wireless-ADB listener is down, not a network drop: this "
+                    "address is pinned to port 5555 by `adb tcpip 5555` (run once over USB) "
+                    "-- a DIFFERENT mechanism from Android's 'Wireless debugging' toggle, "
+                    "which opens its own listener on a random port shown on that screen and "
+                    "does NOT restore 5555. Plug in ONLY the target phone over USB and retry "
+                    "(hop will re-pin it automatically), or run `adb tcpip 5555` yourself.")
+        else:
+            hint = ""
+        raise AdbError(f"could not connect to {self.address}: {reason}{hint}")
+
+    def _rescue_via_usb(self) -> bool:
+        """If this phone is reachable over USB right now, run `adb tcpip <port>` on it to
+        re-pin the wireless listener that a REFUSED :meth:`connect` needs restarted.
+
+        Only acts when exactly one authorized ("device"-state) USB serial is attached: zero
+        means nothing to rescue from, and more than one makes guessing which is this phone a
+        real risk (tcpip-ing the wrong device). Best-effort and never raises -- any failure
+        (adb missing, no USB device, `tcpip` itself failing) returns False so :meth:`connect`
+        falls through to its normal error, not a broken rescue standing in for it.
+        """
+        try:
+            out = subprocess.run([self.adb_bin, "devices"], capture_output=True,
+                                 timeout=self.timeout).stdout.decode(errors="replace")
+        except Exception:
+            return False
+        usb = parse_usb_serials(out)
+        if len(usb) != 1:
+            return False
+        port = self.address.rsplit(":", 1)[-1] if ":" in self.address else "5555"
+        try:
+            proc = subprocess.run([self.adb_bin, "-s", usb[0], "tcpip", port],
+                                  capture_output=True, timeout=self.timeout)
+        except Exception:
+            return False
+        if proc.returncode != 0:
+            return False
+        time.sleep(1.5)   # adbd restarts in TCP mode; give it a beat before the retry connects
+        return True
 
     def is_connected(self) -> bool:
         try:

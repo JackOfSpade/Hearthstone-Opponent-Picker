@@ -326,6 +326,26 @@ def _diagnose_last_error(last_error: str) -> str:
         return ("an ADB command timed out -- the wireless link to the phone stalled (device "
                 "asleep/Doze, Wi-Fi power-save, or the Mac slept). See the Host power/network "
                 "section for which. Transient stalls now self-heal (capture_retry_attempts).")
+    if "could not connect" in m and "refused" in m:
+        return ("the INITIAL `adb connect` was REFUSED, not timed out -- the phone answered and "
+                "closed the socket, meaning adbd's wireless TCP listener isn't running on this "
+                "port right now. This is a different failure from a mid-run screencap/ADB stall "
+                "above: it happens before the hunt even starts, and no amount of retrying `adb "
+                "connect` fixes it, because retrying can't make a closed port listen. THE FIX IS "
+                "NOT re-enabling Android's 'Wireless debugging' toggle (Settings > Developer "
+                "options) -- that is a SEPARATE feature from this config's fixed-port setup and "
+                "opens its own listener on a random port shown on that screen, which does not "
+                "match device.adb_address; toggling it again just repeats the same refusal (this "
+                "is exactly what a prior report on this same failure tried, and it did not help). "
+                "The actual fix: plug the phone into the Mac over USB and run `adb tcpip 5555` "
+                "again -- that is the mechanism that pins adbd to the fixed port, and it needs "
+                "re-running every time the phone reboots or the listener drops. If the Host "
+                "power/network section below has a 'USB-attached device detected' line, it names "
+                "the exact command to run. Corroborate with that section generally: an ICMP ping "
+                "that IS reachable while `adb get-state` reports the device not found is exactly "
+                "this signature (phone is on the network, adbd is not listening on this port) -- "
+                "as opposed to the phone being off the network entirely, which would also fail "
+                "the ping.")
     return ""
 
 
@@ -1408,12 +1428,36 @@ def _host_diagnostics(adb_address: str = "", *, run=None, system=None) -> str:
                          + ("reachable" if reachable else "NO reply (unreachable right now)"))
         try:
             from .adb import resolve_adb
-            state = _bounded_run([resolve_adb(), "-s", adb_address, "get-state"], 4, run)
+            adb_bin = resolve_adb()
+            state = _bounded_run([adb_bin, "-s", adb_address, "get-state"], 4, run)
         except Exception:
-            state = None
+            adb_bin, state = "", None
         if state is not None:
             lines.append(f"- adb get-state ({adb_address}): "
                          + (state.strip().replace("\n", " ") or "(no output / not connected)"))
+
+        # A wireless refusal is only fixable by re-running `adb tcpip 5555` over USB (see
+        # _diagnose_last_error). hop's own Adb.connect() now tries this automatically the
+        # moment a connect is REFUSED (see hop.adb.Adb._rescue_via_usb), so this line mostly
+        # fires for an OLDER run/report, or when the auto-rescue didn't apply (not plugged in
+        # at connect time, or more than one USB device made it too ambiguous to guess). Named
+        # here too so it's never just "go check" -- `adb devices -l` lists any USB-attached
+        # device, whose id has no ip:port colon and whose state is "device" (not
+        # "offline"/"unauthorized"); if one is present right now, this is a single
+        # copy-pasteable line, no guesswork. Skipped once the wireless link is already fine
+        # (state == "device"): nothing to fix.
+        if adb_bin and (state or "").strip() != "device":
+            devices = _bounded_run([adb_bin, "devices", "-l"], 4, run)
+            if devices is not None:
+                from .adb import parse_usb_serials
+                usb = parse_usb_serials(devices)
+                if usb:
+                    lines.append(f"- USB-attached device detected right now: {usb[0]} -- hop "
+                                 "will re-pin the wireless listener automatically on its next "
+                                 f"connect attempt, or run `{adb_bin} -s {usb[0]} tcpip 5555` "
+                                 "yourself right now (this is the actual fix for a refused "
+                                 "wireless connect; Android's 'Wireless debugging' toggle does "
+                                 "not do this)")
 
     return "\n".join(lines)
 
