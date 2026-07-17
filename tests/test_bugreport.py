@@ -780,6 +780,33 @@ def test_summarize_journal_flags_a_genuine_stuck_dropped_commit():
     assert "FALSE halt (verified-then-stuck)" not in s            # mutually exclusive
 
 
+def test_a_real_concede_exhaustion_does_not_duplicate_the_dropped_tap_diagnosis():
+    """Unlike Play, a REAL Concede exhaustion routes through `_wait_until` -- so
+    `genuine_stuck_note` already tells this exact story via `wait_timeout_state`. The newer,
+    more generic `_diagnose_dropped_committing_tap_halt` (which also matches Concede's real
+    message, since it shares the same 'not registering (a dropped committing tap' phrase)
+    must not ALSO fire and duplicate the same paragraph."""
+    import json
+    real_message = (
+        "Concede did not dismiss the Game Menu after 3 tap(s); the menu is still up, so the "
+        "tap is not registering (a dropped committing tap, not a wrong coordinate). Only "
+        "Concede's own coordinate was ever tapped.")
+    events = (
+        [{"kind": "tap", "detail": {"what": "concede", "expected": "full_transition"}},
+         {"kind": "verify_ok", "detail": {"change_kind": "partial"}}]
+        + [e for _ in range(6) for e in (
+            {"kind": "classify", "detail": {"ms": 30, "state": "concede_menu"}},
+            {"kind": "wait_until_poll", "detail": {"what": "concede", "state": "concede_menu"}})]
+        + [{"kind": "classify", "detail": {"ms": 30, "state": "concede_menu"}},
+           {"kind": "wait_timeout", "detail": {"what": "concede", "state": "concede_menu"}},
+           {"kind": "halt", "detail": {"message": real_message}}]
+    )
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "GENUINE stuck (DROPPED committing tap)" in s
+    assert s.count("not registering (a dropped committing tap") == 1   # not repeated verbatim
+    assert "- likely cause:" not in s   # the redundant second paragraph must not be added
+
+
 def test_summarize_journal_genuine_stuck_yields_to_the_unknown_destination_false_halt():
     """When the SAME stuck halt is preceded by a trailing UNKNOWN (the destination is unnamed),
     it is the verified-then-stuck FALSE halt, NOT a genuine dropped commit. The two are mutually
@@ -798,16 +825,127 @@ def test_summarize_journal_genuine_stuck_yields_to_the_unknown_destination_false
 
 
 def test_summarize_journal_tallies_dropped_taps():
-    """A cluster of silently-ignored-then-re-sent taps (mulligan cards, and now concede) is the
-    wireless link dropping INPUT -- surfaced as one count so it corroborates a dropped-commit."""
+    """A cluster of silently-ignored-then-re-sent taps (mulligan cards, concede, Play, and
+    now every other retrying tap site) is the wireless link dropping INPUT -- surfaced as
+    one count so it corroborates a dropped-commit."""
     import json
     events = [
         {"kind": "mulligan_card_tap_ignored", "detail": {"slot": 1, "attempt": 1, "of": 3}},
         {"kind": "mulligan_card_tap_ignored", "detail": {"slot": 2, "attempt": 1, "of": 3}},
         {"kind": "concede_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "play_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "error_ok_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "collection_back_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "deck_decline_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "mulligan_confirm_tap_ignored", "detail": {"attempt": 1, "of": 2}},
+        {"kind": "reconnect_tap_ignored", "detail": {"attempt": 1}},
     ]
     s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
-    assert "dropped taps re-sent: 3" in s
+    assert "dropped taps re-sent: 9" in s
+
+
+def test_diagnose_dropped_committing_tap_halt_covers_the_newest_retry_sites():
+    """The one shared phrase (see `_tap_dispatch_button`/`_decline_incomplete_deck`/
+    `_confirm_mulligan`) means these need no dedicated table entry, unlike the earlier
+    per-halt tables (`_DELIBERATE_HALTS`, `_diagnose_mulligan_read_halt`)."""
+    d = br._diagnose_dropped_committing_tap_halt
+    messages = [
+        "HALTED: the error dialog's OK button did not register after 3 tap(s); the screen "
+        "never moved, so the tap is not registering (a dropped committing tap, not a wrong "
+        "coordinate) -- the error dialog's OK button's own coordinate was the only one ever "
+        "tapped.",
+        "HALTED: the Collection back arrow did not register after 3 tap(s); the screen "
+        "never moved, so the tap is not registering (a dropped committing tap, not a wrong "
+        "coordinate) -- the Collection back arrow's own coordinate was the only one ever "
+        "tapped.",
+        "HALTED: the 'Complete deck automatically?' dialog did not close after 3 tap(s) of "
+        "No; the dialog is still up, so the tap is not registering (a dropped committing "
+        "tap, not a wrong coordinate). Only No's own coordinate was ever tapped.",
+        "HALTED: mulligan Confirm did not dismiss the mulligan after 2 tap(s); the mulligan "
+        "is still up, so the tap is not registering (a dropped committing tap, not a wrong "
+        "coordinate). Only Confirm's own coordinate was ever tapped.",
+    ]
+    for msg in messages:
+        assert d(msg), msg
+
+
+# ── bounded-retry exhaustion and bare NO_CHANGE halts ────────────────────────
+
+def test_diagnose_dropped_committing_tap_halt_covers_every_retry_site():
+    """The ONE shared phrase every bounded-retry tap site's exhaustion message ends in (see
+    `_concede`/`_tap_play`) is enough to diagnose all of them, present and future, without a
+    table entry per screen -- unlike the mulligan-read/deliberate-halt tables."""
+    d = br._diagnose_dropped_committing_tap_halt
+    play_msg = ("Play did not queue a game after 3 tap(s); the screen never moved, so the "
+                "tap is not registering (a dropped committing tap, not a wrong coordinate) "
+                "-- Play's own coordinate was the only one ever tapped.")
+    concede_msg = ("Concede did not dismiss the Game Menu after 3 tap(s); the menu is still "
+                   "up, so the tap is not registering (a dropped committing tap, not a wrong "
+                   "coordinate). Only Concede's own coordinate was ever tapped.")
+    for msg in (play_msg, concede_msg):
+        out = d(msg)
+        assert out
+        assert "DROPPED committing tap" in out
+        assert "vision.*_tap_attempts" in out
+    assert d("some other halt entirely") == ""
+
+
+def test_summarize_journal_names_an_exhausted_play_retry():
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "play", "expected": "full_transition"}},
+        {"kind": "play_tap_ignored", "detail": {"attempt": 1, "of": 3}},
+        {"kind": "tap", "detail": {"what": "play", "expected": "full_transition"}},
+        {"kind": "play_tap_ignored", "detail": {"attempt": 2, "of": 3}},
+        {"kind": "tap", "detail": {"what": "play", "expected": "full_transition"}},
+        {"kind": "halt", "detail": {"message":
+            "HALTED: Play did not queue a game after 3 tap(s); the screen never moved, so "
+            "the tap is not registering (a dropped committing tap, not a wrong coordinate) "
+            "-- Play's own coordinate was the only one ever tapped."}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "dropped taps re-sent: 2" in s
+    assert "DROPPED committing tap" in s
+    # the bare-NO_CHANGE diagnosis must NOT also fire -- different, more specific message
+    assert "one evidence-based correction" not in s
+
+
+def test_diagnose_no_change_halt_names_the_tap_and_is_not_a_wrong_coordinate():
+    """The one halt shape the `_is_stuck_halt` family (verified-then-stuck / genuine-stuck)
+    does not cover: a bare `Halt.NO_CHANGE` straight out of `_tap`, on a tap site with no
+    bounded retry of its own -- exactly what a raw 'ended: <message>' used to leave
+    undiagnosed."""
+    d = br._diagnose_no_change_halt
+    # every real halt is wrapped as "HALTED: {reason}" by Engine._notify_halt -- match on
+    # THAT shape, not the bare Verifier string alone, or this never fires on a real journal.
+    out = d("HALTED: no screen change after action (missed tap / stuck)", "play")
+    assert out
+    assert "'play'" in out
+    assert "not a wrong coordinate" in out.lower()
+    # still returns non-empty guidance (no crash) when no preceding tap's `what` was captured
+    assert d("HALTED: no screen change after action (missed tap / stuck)", "")
+    assert d("some other halt entirely", "play") == ""
+    # must not fire on a bounded-retry site's own (longer, more specific) exhaustion message
+    assert d("HALTED: Play did not queue a game after 3 tap(s); ... not registering "
+             "(a dropped committing tap, not a wrong coordinate)", "play") == ""
+
+
+def test_summarize_journal_names_a_bare_no_change_halt_on_an_unretried_tap_site():
+    """Regression: this exact shape (a plain `_tap()` NO_CHANGE halt on a dispatch tap with
+    no bounded retry of its own) used to fall through to a bare 'ended: <message>' with no
+    causal narrative at all. The halt message carries the real 'HALTED: ' prefix
+    `Engine._notify_halt` always adds -- an earlier version of this diagnosis matched the
+    bare Verifier string by exact equality and silently never fired on a real journal."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "error_ok", "expected": "full_transition"}},
+        {"kind": "halt", "detail": {"message":
+            "HALTED: no screen change after action (missed tap / stuck)"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "likely cause:" in s
+    assert "'error_ok'" in s
+    assert "DROPPED committing tap" not in s   # the other diagnosis must not also fire
 
 
 def test_summarize_journal_surfaces_the_coin_and_concede_timing():

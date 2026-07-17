@@ -790,6 +790,76 @@ class Engine:
             self.backend.close()
         return self.stats
 
+    def _tap_play(self) -> None:
+        """Tap the deck's Play button, retrying a tap this client silently dropped.
+
+        Play is a BUTTON tap on an otherwise static screen, unlike Concede: there is no
+        ambient board animation to mask a miss, so a dropped Play tap shows LITERALLY
+        ZERO pixel change on every post-tap look -- `_tap`'s own multi-poll
+        `_await_screen_motion` and its one evidence-based correction both agree nothing
+        moved (``Halt.NO_CHANGE``). That is exactly the failure `_replace_card` already
+        retries against (this client drops button taps too, not just card taps, for
+        reasons CALIBRATION.md never pinned down) -- and until now Play was the one
+        committing tap in the whole loop with NO retry budget, so one dropped Play tap
+        failed the entire hunt closed before a single game was even queued.
+
+        ``allow_correction=False`` disables `_tap`'s OWN inner correction: this loop
+        already supplies the evidence-based retry, so a second one inside `_tap` would
+        only double the settle+capture latency per attempt without changing the
+        outcome. Unlike a mulligan card, there is no "keep it and carry on" here -- Play
+        is how every game in the hunt starts, so exhausting the budget still fails
+        closed, with a message naming this as a dropped tap, not a bad coordinate.
+        """
+        attempts = max(1, self.cfg.vision.play_tap_attempts)
+        for attempt in range(attempts):
+            try:
+                self._tap(self.layout.play_button, committing=False, decision_type="commit",
+                          expected_change="full_transition", novelty=0.1,
+                          allow_correction=False, what="play")
+                return
+            except Halt as e:
+                if e.kind != Halt.NO_CHANGE:
+                    raise
+                if attempt + 1 == attempts:
+                    raise Halt(
+                        f"Play did not queue a game after {attempts} tap(s); the screen "
+                        "never moved, so the tap is not registering (a dropped "
+                        "committing tap, not a wrong coordinate) -- Play's own "
+                        "coordinate was the only one ever tapped.")
+                if self.debug:
+                    self.debug.record("play_tap_ignored", attempt=attempt + 1, of=attempts)
+                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                                "play_retry", attempt=attempt + 1)
+
+    def _tap_dispatch_button(self, point: Point, *, expected_change: str, what: str,
+                             label: str) -> None:
+        """Tap a generic, low-stakes dispatch dialog button, retrying a tap this client
+        silently dropped -- the same shape as `_tap_play`, generalized for screens plain
+        enough (single button, no committing consequence, no special wait-budget needs)
+        to share ONE knob (``vision.dispatch_tap_attempts``) instead of a dedicated one
+        each. See `_tap_play` for why the failure looks the way it does and why
+        ``allow_correction=False`` is right here too.
+        """
+        attempts = max(1, self.cfg.vision.dispatch_tap_attempts)
+        for attempt in range(attempts):
+            try:
+                self._tap(point, committing=False, decision_type="commit",
+                          expected_change=expected_change, allow_correction=False, what=what)
+                return
+            except Halt as e:
+                if e.kind != Halt.NO_CHANGE:
+                    raise
+                if attempt + 1 == attempts:
+                    raise Halt(
+                        f"{label} did not register after {attempts} tap(s); the screen "
+                        "never moved, so the tap is not registering (a dropped "
+                        f"committing tap, not a wrong coordinate) -- {label}'s own "
+                        "coordinate was the only one ever tapped.")
+                if self.debug:
+                    self.debug.record(f"{what}_tap_ignored", attempt=attempt + 1, of=attempts)
+                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                                f"{what}_retry", attempt=attempt + 1)
+
     def _dispatch(self, cls: Classification, frame: Frame) -> None:
         st = cls.state
         if st != ScreenState.IN_GAME:
@@ -807,8 +877,8 @@ class Engine:
             # journey's own requeue delay supplies the human pacing.
             if self.debug:
                 self.debug.record("error_dialog_dismissed")
-            self._tap(self.layout.error_ok, committing=False, decision_type="commit",
-                      expected_change="full_transition", what="error_ok")
+            self._tap_dispatch_button(self.layout.error_ok, expected_change="full_transition",
+                                      what="error_ok", label="the error dialog's OK button")
         elif st == ScreenState.RECONNECT_DIALOG:
             self._reconnect()
         elif st == ScreenState.RECONNECTING:
@@ -851,8 +921,7 @@ class Engine:
             self._decline_incomplete_deck()
         elif st == ScreenState.PLAY_SCREEN:
             # the loop's home state: the deck's Play button queues a game
-            self._tap(self.layout.play_button, committing=False, decision_type="commit",
-                      expected_change="full_transition", novelty=0.1, what="play")
+            self._tap_play()
             # ...and from here the game in progress is OURS to abandon. See
             # :meth:`_handle_in_game`.
             self._own_game = True
@@ -880,8 +949,8 @@ class Engine:
             # the deck list (a home screen) rather than halt. See ScreenState.COLLECTION.
             if self.debug:
                 self.debug.record("collection_backout")
-            self._tap(self.layout.collection_back, committing=False, decision_type="commit",
-                      expected_change="full_transition", what="collection_back")
+            self._tap_dispatch_button(self.layout.collection_back, expected_change="full_transition",
+                                      what="collection_back", label="the Collection back arrow")
         elif st == ScreenState.MENU:
             raise Halt("at the Hearthstone main menu; open Play and select a deck first "
                        "(the hunt loop queues from that deck's Play screen)")
@@ -953,12 +1022,68 @@ class Engine:
         Auto-completing a deck spends the user's dust/cards on cards Hearthstone picks;
         hop must never do that. Tap No and wait for the dialog to leave (an UNKNOWN frame
         is never proof it left - see :meth:`_wait_until_screen_leaves`).
+
+        'No' can be silently dropped like any other button tap. Retried, and ONLY while
+        positively still on ``INCOMPLETE_DECK`` -- never a blind tap once the dialog
+        might already be gone (that could land on whatever screen follows, including a
+        live deck grid). Unlike Concede's board, this dialog sits over a STATIC deck-
+        list background with no ambient animation to mask a drop, so a genuinely
+        dropped tap here shows literally zero pixel change and `_tap` itself raises
+        ``Halt.NO_CHANGE`` immediately -- that is caught below and treated as
+        equally-positive proof of "still stuck" as a fresh classify would give (indeed
+        stronger: it is a pixel-level fact, not a template match), so a masked drop
+        (`_wait_until` classifies afresh) and an unmasked one (`_tap` itself objects)
+        both feed the SAME retry decision. This dialog has no roping-opponent-style
+        reason to wait longer than the generic ``screen_wait_*`` budget, so it costs
+        about the same worst case as Concede's retry.
         """
-        self._tap(self.layout.deck_decline, committing=False, decision_type="commit",
-                  expected_change=None, allow_correction=False, what="deck_decline")
-        self._wait_until_screen_leaves(
-            ScreenState.INCOMPLETE_DECK, where="deck_decline",
-            stuck="the 'Complete deck automatically?' dialog did not close after No")
+        arrivals = {ScreenState.DECK_SELECT}
+        attempts = max(1, self.cfg.vision.deck_decline_tap_attempts)
+        cls = frame = None
+        taps_sent = 0
+        for attempt in range(attempts):
+            taps_sent = attempt + 1
+            dropped = False
+            try:
+                self._tap(self.layout.deck_decline, committing=False, decision_type="commit",
+                          expected_change=None, allow_correction=False, what="deck_decline")
+            except Halt as e:
+                if e.kind != Halt.NO_CHANGE:
+                    raise
+                dropped = True
+            if not dropped:
+                ok, cls, frame = self._wait_until(
+                    lambda c, _f: c.state not in (ScreenState.INCOMPLETE_DECK, ScreenState.UNKNOWN),
+                    what="deck_decline",
+                    expected=frozenset({ScreenState.INCOMPLETE_DECK}) | frozenset(arrivals))
+                if ok:
+                    return
+                dropped = cls.state == ScreenState.INCOMPLETE_DECK
+            if not dropped or attempt + 1 == attempts:
+                break
+            if self.debug:
+                self.debug.record("deck_decline_tap_ignored", attempt=attempt + 1, of=attempts)
+            self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                            "deck_decline_retry", attempt=attempt + 1)
+        # `dropped` here means "the loop stopped because it ran positively-still-stuck taps
+        # up to `attempts`" -- a real dropped-committing-tap story, distinct from breaking
+        # EARLY (after fewer than `attempts` taps) because the look came back UNKNOWN, which
+        # is NOT proof of a drop (it may be a transition we can't yet name, or something
+        # else entirely) and must not be reported as one -- see the mis-blamed exhaustion
+        # message this replaced, which always claimed "not registering" regardless of why
+        # the loop actually stopped.
+        if cls is not None and cls.state == ScreenState.UNKNOWN:
+            self._record_unknown(frame, where="deck_decline", confidence=round(cls.confidence, 3),
+                                 waiting_to_leave=ScreenState.INCOMPLETE_DECK.value)
+            raise Halt(
+                f"the 'Complete deck automatically?' dialog did not close after {taps_sent} "
+                "tap(s) of No, and the screen since could not be identified -- this may "
+                "not be a dropped tap; see the kept frame for what followed.")
+        raise Halt(
+            f"the 'Complete deck automatically?' dialog did not close after {taps_sent} "
+            "tap(s) of No; the dialog is still up, so the tap is not registering (a "
+            "dropped committing tap, not a wrong coordinate). Only No's own coordinate "
+            "was ever tapped.")
 
     def _book_game(self, conceded: bool) -> None:
         """Count a finished game, then pace the requeue."""
@@ -1001,8 +1126,24 @@ class Engine:
         if self.debug:
             self.debug.record("reconnect_tapped", attempt=self._reconnect_attempts)
 
-        self._tap(self.layout.reconnect_button, committing=False,
-                  decision_type="commit", expected_change=None, allow_correction=False, what="reconnect")
+        try:
+            self._tap(self.layout.reconnect_button, committing=False,
+                      decision_type="commit", expected_change=None, allow_correction=False,
+                      what="reconnect")
+        except Halt as e:
+            # The Reconnect BUTTON tap itself can be silently dropped, same as any other
+            # button (see `_tap_play`) -- a different failure from the async reconnect
+            # simply timing out AFTER a tap that took (the poll loop below). `cap`/
+            # `_reconnect_attempts` above ALREADY bound how many times this function may
+            # be re-entered -- the docstring's "let the outer loop re-enter _reconnect()"
+            # is the SAME mechanism the RECONNECT_DIALOG-persists case already relies on
+            # -- so a dropped tap just falls into that existing bounded retry instead of
+            # needing a second, nested budget of its own.
+            if e.kind != Halt.NO_CHANGE:
+                raise
+            if self.debug:
+                self.debug.record("reconnect_tap_ignored", attempt=self._reconnect_attempts)
+            return
 
         for _ in range(max(1, self.cfg.vision.reconnecting_wait_attempts)):
             # still-reconnecting polls resolve on the floor's own dialog anchors; a return
@@ -1266,37 +1407,102 @@ class Engine:
         Confirming is **asynchronous**: the cards fly off and the board draws in over
         a second or more. Within the tap's settle window only the bottom of the
         screen has moved, so demanding ``full_transition`` fails on a confirm that
-        worked (measured: ``bottom_sheet``). And the single-correction retap then
-        fires *after* the mulligan is already confirmed - a blind tap into a live
-        game, which is precisely what closed-loop navigation exists to prevent.
+        worked (measured: ``bottom_sheet``). And `_tap`'s own single-correction retap
+        would fire *after* the mulligan is already confirmed - a blind tap into a live
+        game, which is precisely what closed-loop navigation exists to prevent -- so
+        ``allow_correction=False``, same as `_concede`.
 
-        So: require only that something changed, never correct, and then verify the
-        real semantic end-state - that we are no longer on the mulligan - by looking.
+        So: require only that something changed, never correct inside `_tap`, and then
+        verify the real semantic end-state - that we are no longer on the mulligan - by
+        looking.
 
         And *looking* means seeing a screen we can name. The old loop accepted
         ``cls.state != MULLIGAN``, which an UNKNOWN frame satisfies - so a single
         unreadable frame (of which a confirm animation produces several) was taken as
         proof the mulligan was gone, and ``_play_beats``/``_concede`` then tapped on
         that premise. UNKNOWN is not an observation; it is the absence of one.
+
+        Confirm can ALSO be silently dropped outright, same as any other button (see
+        `_tap_play`). The mulligan's cards are static (no ambient board animation like
+        Concede's), so a genuinely dropped Confirm shows literally zero pixel change and
+        `_tap` itself raises ``Halt.NO_CHANGE`` immediately -- caught below and treated
+        as equally-positive proof of "still stuck" as a fresh classify would give.
+        Retried only while positively still on ``MULLIGAN`` -- never blind, and never
+        while the look came back UNKNOWN (that could be the opponent's rope, not a
+        drop; see below). Unlike Concede, EVERY attempt here must still use the FULL
+        ``mulligan_resolve_attempts``/``mulligan_resolve_timeout_s`` budget: a
+        genuinely slow (not dropped) opponent shows the exact same "still on
+        `MULLIGAN`... no wait, still `UNKNOWN`" trail for a SHORT wait as a dropped tap
+        does over a LONG one, and a smaller per-attempt budget would reintroduce the
+        false "did not dismiss" halt that budget exists to prevent (see
+        ``vision.mulligan_confirm_tap_attempts`` for why the attempt count is smaller
+        here than its siblings, to bound the resulting worst case).
         """
-        self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
-                  expected_change=None, allow_correction=False, what="mulligan_confirm")
-        self._wait_until_screen_leaves(
-            ScreenState.MULLIGAN, where="mulligan_confirm",
-            stuck="mulligan Confirm did not dismiss the mulligan",
-            # the board draws in (in_game); an opponent who concedes in the window lands us
-            # on an end banner. mulligan (the from-state) is kept in scope by the helper so
-            # a cross-fade where both clear resolves exactly as a full classify would.
-            arrivals={ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT},
-            # ...but the wait must ALSO outlast the opponent's own mulligan. Until they
-            # confirm, this client shows an "Opponent Still Choosing..." banner in place of
-            # our "Starting Hand" anchor -- an anchorless frame that reads UNKNOWN. The
-            # generic transition budget (~20 s) is far shorter than a roping opponent, so it
-            # false-halted here ("Confirm did not dismiss the mulligan") even though Confirm
-            # worked (the tap's own verify_ok fired the frame before). Wait to the mulligan
-            # rope instead; the wait never taps, so the larger budget only defers a Halt.
-            attempts=self.cfg.vision.mulligan_resolve_attempts,
-            timeout_s=self.cfg.vision.mulligan_resolve_timeout_s)
+        # the board draws in (in_game); an opponent who concedes in the window lands us on
+        # an end banner. mulligan (the from-state) is kept in scope so a cross-fade where
+        # both clear resolves exactly as a full classify would.
+        arrivals = {ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT}
+        attempts = max(1, self.cfg.vision.mulligan_confirm_tap_attempts)
+        cls = frame = None
+        taps_sent = 0
+        for attempt in range(attempts):
+            taps_sent = attempt + 1
+            dropped = False
+            try:
+                self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
+                          expected_change=None, allow_correction=False, what="mulligan_confirm")
+            except Halt as e:
+                if e.kind != Halt.NO_CHANGE:
+                    raise
+                dropped = True
+            if not dropped:
+                ok, cls, frame = self._wait_until(
+                    lambda c, _f: c.state not in (ScreenState.MULLIGAN, ScreenState.UNKNOWN),
+                    what="mulligan_confirm",
+                    expected=frozenset({ScreenState.MULLIGAN}) | frozenset(arrivals),
+                    # ...the wait must ALSO outlast the opponent's own mulligan. Until they
+                    # confirm, this client shows an "Opponent Still Choosing..." banner in
+                    # place of our "Starting Hand" anchor -- an anchorless frame that reads
+                    # UNKNOWN. The generic transition budget (~20 s) is far shorter than a
+                    # roping opponent, so it false-halted here even though Confirm worked
+                    # (the tap's own verify_ok fired the frame before). Wait to the
+                    # mulligan rope instead; never taps, so a bigger budget only defers.
+                    attempts=self.cfg.vision.mulligan_resolve_attempts,
+                    timeout_s=self.cfg.vision.mulligan_resolve_timeout_s)
+                if ok:
+                    return
+                # ok=False here means cls.state is EXACTLY MULLIGAN or UNKNOWN (anything
+                # else would have satisfied the predicate above). MULLIGAN persisting
+                # through the WHOLE budget, unmoved, is the dropped-tap signature -- safe
+                # to retap. UNKNOWN persisting is the roping-opponent signature (or a
+                # frame we simply can't name) -- NOT proof the tap dropped, and not safe
+                # to blind-tap into, so it falls through to the fail-closed halt below.
+                dropped = cls.state == ScreenState.MULLIGAN
+            if not dropped or attempt + 1 == attempts:
+                break
+            if self.debug:
+                self.debug.record("mulligan_confirm_tap_ignored", attempt=attempt + 1, of=attempts)
+            self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                            "mulligan_confirm_retry", attempt=attempt + 1)
+        # `dropped` here means the loop stopped because MULLIGAN stayed positively up for
+        # `attempts` full-budget tries -- a genuine dropped-committing-tap story. Breaking
+        # EARLY (fewer than `attempts` taps) because the look came back UNKNOWN is NOT that
+        # story -- it may be the opponent's rope still unresolved, or a frame we simply
+        # cannot name -- and must not be reported as a drop (this is the single most
+        # safety-critical distinction here: a false "dropped tap" diagnosis on a live
+        # roping opponent would point a human at the wrong knob entirely).
+        if cls is not None and cls.state == ScreenState.UNKNOWN:
+            self._record_unknown(frame, where="mulligan_confirm", confidence=round(cls.confidence, 3),
+                                 waiting_to_leave=ScreenState.MULLIGAN.value)
+            raise Halt(
+                f"mulligan Confirm did not dismiss the mulligan after {taps_sent} tap(s), "
+                "and the screen since could not be identified -- this may not be a "
+                "dropped tap (a roping opponent reads the same way); see the kept frame "
+                "for what followed.")
+        raise Halt(
+            f"mulligan Confirm did not dismiss the mulligan after {taps_sent} tap(s); the "
+            "mulligan is still up, so the tap is not registering (a dropped committing "
+            "tap, not a wrong coordinate). Only Confirm's own coordinate was ever tapped.")
 
     def _replace_card(self, slot: int, center_xf: float, decision_type: str) -> bool:
         """Mark one mulligan card for replacement. Returns whether it took.

@@ -213,6 +213,30 @@ class VisionConfig:
     deck_select_wait_attempts: int
     reconnecting_wait_attempts: int
     reconnect_attempt_cap: int
+    #: How many times to (re-)tap a generic, low-stakes dispatch dialog button (the ERROR_DIALOG
+    #: "OK" and the Collection back arrow) before failing closed -- the same silently-dropped-tap
+    #: signature `_tap_play`/`_replace_card`/`_concede` retry against, on two screens plain
+    #: enough (single button, no committing consequence, no special wait-budget needs) to share
+    #: ONE knob rather than a dedicated one each. 1 restores the old single-tap-then-halt
+    #: behaviour. See :meth:`hop.engine.Engine._tap_dispatch_button`.
+    dispatch_tap_attempts: int
+    #: How many times to (re-)tap 'No' on the "Complete deck automatically?" dialog before
+    #: failing closed -- same dropped-tap signature as Play/Concede, retried the same way
+    #: (positively-still-``INCOMPLETE_DECK`` gate before every retap, never a blind tap towards
+    #: 'Yes'). Uses the generic ``screen_wait_attempts``/``screen_wait_timeout_s`` budget per
+    #: attempt (this dialog has no roping-opponent-style reason to wait longer), so 3 attempts
+    #: costs about the same worst case as Concede's. 1 restores the old single-tap-then-halt
+    #: behaviour. See :meth:`hop.engine.Engine._decline_incomplete_deck`.
+    deck_decline_tap_attempts: int
+    #: How many times to (re-)tap Play before failing closed. Play is the loop's FIRST
+    #: committing tap, on a static screen with no ambient animation to mask a miss -- so a
+    #: dropped Play tap shows literally zero pixel change, the same `Halt.NO_CHANGE` signature
+    #: `_replace_card` already retries against, not a wrong coordinate. Unlike a mulligan card
+    #: there is no "keep it and carry on": exhausting the budget still fails closed, since Play
+    #: is how every game in the hunt starts. 1 restores the old single-tap-then-halt behaviour
+    #: (which failed the whole hunt closed on one dropped Play tap). See
+    #: :meth:`hop.engine.Engine._tap_play`.
+    play_tap_attempts: int
     mulligan_card_tap_attempts: int
     #: How many times to (re-)tap Concede before failing closed. Like a mulligan card, a
     #: Concede BUTTON tap can be silently dropped under a congested wireless link, and its
@@ -232,6 +256,17 @@ class VisionConfig:
     #: a generous budget only delays failing closed -- it can never cause a misdirected tap.
     mulligan_resolve_timeout_s: float
     mulligan_resolve_attempts: int
+    #: How many times to (re-)tap mulligan Confirm before failing closed. Unlike Concede/Play,
+    #: EVERY attempt here waits the full ``mulligan_resolve_attempts``/``mulligan_resolve_timeout_s``
+    #: budget above (sized to outlast a roping opponent) before deciding whether to retap --
+    #: shrinking it would reintroduce the false halt that budget exists to prevent, since a
+    #: genuinely slow (not dropped) opponent shows the SAME "still on `MULLIGAN`" signature for a
+    #: short wait as a dropped tap does. That makes each attempt here far more expensive than
+    #: Concede's (~4x by default), so this defaults to 2, not 3: enough to recover the one-dropped-
+    #: tap case this whole family targets, without tripling an already-large worst-case wait on a
+    #: tap that turns out to be un-recoverable. 1 restores the old single-tap-then-halt behaviour.
+    #: See :meth:`hop.engine.Engine._confirm_mulligan`.
+    mulligan_confirm_tap_attempts: int
     #: Total tries to READ the opponent's class off the mulligan before failing closed.
     #: The classifier has already confirmed the mulligan is up; a blank class is a transient
     #: (most likely the nameplate still drawing in), so we re-read a few times, not just once,

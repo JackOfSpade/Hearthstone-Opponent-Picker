@@ -256,6 +256,25 @@ reconnecting_wait_attempts = 12
 # ...and make at most this many Reconnect taps per run. A reconnect that keeps
 # failing means the network or the account needs a human, so fail closed.
 reconnect_attempt_cap = 3
+# Generic, low-stakes dispatch dialog buttons (the ERROR_DIALOG "OK" and the Collection back
+# arrow) share the same silently-dropped-tap signature as Play/Concede/mulligan cards, but are
+# plain enough -- single button, no committing consequence, no special wait-budget needs -- to
+# share ONE retry knob rather than a dedicated one each. 1 = the old single-tap-then-halt.
+dispatch_tap_attempts = 3
+# The "Complete deck automatically?" dialog's 'No' can be dropped like any other button tap.
+# Retried the same way as Concede -- re-tap only while the dialog is positively still up, never
+# a blind tap towards 'Yes' -- using the generic screen_wait budget per attempt (this dialog has
+# no roping-opponent-style reason to wait longer). 1 = the old single-tap-then-halt.
+deck_decline_tap_attempts = 3
+# Play is the loop's FIRST committing tap, on an otherwise static screen -- unlike Concede
+# there is no ambient board animation to mask a miss, so a dropped Play tap shows LITERALLY
+# ZERO pixel change on every post-tap look. This is the same input-drop the mulligan cards
+# and Concede already retry against (cause unknown; see CALIBRATION.md), and until now Play
+# was the one committing tap in the whole loop with no retry budget -- one dropped Play tap
+# failed the entire hunt closed before a single game was even queued. Retry the SAME Play
+# coordinate a bounded number of times before failing closed. 1 = the old
+# single-tap-then-halt behaviour.
+play_tap_attempts = 3
 # Hearthstone accepts a mulligan card tap only intermittently -- ~1 time in 3, while
 # accepting every button tap. Cause UNKNOWN; see CALIBRATION.md. Ruled out by
 # measurement: contact scale, position, dwell, micro-slip, event delivery, and (via a
@@ -288,6 +307,13 @@ concede_tap_attempts = 3
 # `hop capture --from-file` to turn the UNKNOWN polls into cheap scoped ones.)
 mulligan_resolve_timeout_s = 75.0  # wall-clock; a roping opponent + slow UNKNOWN full-scans
 mulligan_resolve_attempts = 30     # poll bound (a frozen-clock test needs this; timeout binds on-device)
+# Confirm can be dropped like any other button tap, retried the same way as Concede -- but
+# EVERY attempt here pays the full mulligan_resolve_* budget above (it cannot safely use a
+# smaller one: a genuinely slow, not-dropped, opponent shows the same "still on MULLIGAN"
+# signature for a short wait as a dropped tap does). That makes each attempt far pricier than
+# Concede's, so this defaults to 2, not 3 -- enough to recover one dropped tap without tripling
+# an already-large worst-case wait. 1 = the old single-tap-then-halt.
+mulligan_confirm_tap_attempts = 2
 # Reading the OPPONENT's class off the mulligan can whiff even once the mulligan is up:
 # the nameplate is still drawing in, so the class region reads blank (class='') though our
 # cards count fine. (NOT the "Opponent Still Choosing..." banner above -- that is a POST-confirm

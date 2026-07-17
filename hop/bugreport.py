@@ -219,6 +219,67 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
             "opponent-class read. Check the glow thresholds against a kept frame.")
 
 
+#: Every bounded-retry committing-tap site (`_concede`, `_tap_play`, ...) that exhausts its
+#: budget shares this exact phrase in its terminal Halt message -- see
+#: :meth:`hop.engine.Engine._concede` / :meth:`hop.engine.Engine._tap_play`. Matching the ONE
+#: substring covers every such site, present and future, without a table entry per screen.
+_DROPPED_COMMITTING_TAP_PHRASE = "not registering (a dropped committing tap"
+
+
+def _diagnose_dropped_committing_tap_halt(message: str) -> str:
+    """Name the cause of a bounded-retry committing-tap halt (Concede, Play, ...): the tap
+    was retried its full configured budget and every attempt showed zero pixel change.
+    Returns "" for any other halt.
+    """
+    if _DROPPED_COMMITTING_TAP_PHRASE not in (message or ""):
+        return ""
+    return ("hop already retried this exact tap its full configured budget (see the "
+            "*_tap_ignored count in 'kinds' and the dropped-taps tally below) and EVERY "
+            "attempt showed literally zero pixel change -- not a wrong coordinate, a "
+            "genuinely DROPPED committing tap. Corroborate with the capture-time TREND above "
+            "(a rising mean = a degrading wireless link) and the dropped-taps tally, though a "
+            "FLAT trend does not rule this out: this client drops some taps (mulligan cards "
+            "~1 in 3) with no known cause even on a healthy link (see CALIBRATION.md). Raise "
+            "the relevant vision.*_tap_attempts knob, or fix the link, rather than chasing a "
+            "coordinate change.")
+
+
+#: The bare message :meth:`hop.verify.Verifier._fail` raises for ``Halt.NO_CHANGE``. Matched
+#: as a SUBSTRING, not an exact equality: every halt this journals is wrapped by
+#: :meth:`hop.engine.Engine._notify_halt` as ``f"HALTED: {e.reason}"``, so the message on a
+#: real journal is never this literal string alone (an exact-equality check here matched
+#: nothing on any real run -- caught only by testing against a `HALTED: `-prefixed message,
+#: not the bare one every earlier test in this file happened to use). Still safe against a
+#: false match: neither `_concede`'s nor `_tap_play`'s own exhaustion message (they end in
+#: `_DROPPED_COMMITTING_TAP_PHRASE` instead) contains this substring anywhere.
+_BARE_NO_CHANGE_MESSAGE = "no screen change after action (missed tap / stuck)"
+
+
+def _diagnose_no_change_halt(message: str, last_tap_what: str) -> str:
+    """Name the cause of a bare ``Halt.NO_CHANGE`` straight out of ``_tap`` -- the one halt
+    shape ``_is_stuck_halt``'s family does not cover, since it never runs through
+    :meth:`hop.engine.Engine._wait_until_screen_leaves` (no ``wait_timeout``/
+    ``unknown_after_verify`` to key off). ``_tap`` already tried ONE evidence-based
+    correction (Layer 5) before raising, so this means BOTH taps at the same coordinate
+    produced zero pixel change -- the same committing-tap-drop `_concede`/`_replace_card`
+    already retry against, on a tap site that does not (yet) have that retry. Returns "" for
+    any other halt.
+    """
+    if _BARE_NO_CHANGE_MESSAGE not in (message or ""):
+        return ""
+    what = last_tap_what or "the last action"
+    return (f"the '{what}' tap -- and its one evidence-based correction -- both produced "
+            "LITERALLY ZERO pixel change. Not a wrong coordinate (the tap point is a fixed "
+            f"fraction of the panel, unaffected by this): a committing tap named {what!r} "
+            "that this client silently dropped, the same failure `_concede`/`_replace_card` "
+            "already retry against. Check whether this tap site has a bounded retry of its "
+            "own (grep engine.py for its `what=` string); a tap with no such budget still "
+            "fails the whole hunt closed on ONE drop. Corroborate with the capture-time TREND "
+            "above (a rising mean = a degrading link) and the dropped-taps tally, though a "
+            "flat trend does not rule this out -- this client drops some taps (mulligan cards "
+            "~1 in 3) with no known cause even on a healthy link.")
+
+
 def _norm_class(s) -> str:
     """Normalize a class token so an enum NAME compares equal to a DISPLAY name: uppercase,
     alphanumerics only. ``_norm_class("Death Knight") == _norm_class("DEATHKNIGHT") ==
@@ -692,7 +753,10 @@ def summarize_journal(journal_text: str) -> str:
             # stuck, resolved into the dropped-commit note below.
             wait_timeout_what = str(d.get("what", ""))
             wait_timeout_state = str(d.get("state", ""))
-        if k in ("mulligan_card_tap_ignored", "concede_tap_ignored"):
+        if k in ("mulligan_card_tap_ignored", "concede_tap_ignored", "play_tap_ignored",
+                 "error_ok_tap_ignored", "collection_back_tap_ignored",
+                 "deck_decline_tap_ignored", "mulligan_confirm_tap_ignored",
+                 "reconnect_tap_ignored"):
             dropped_taps += 1
         if k == "verify_ok":
             # the tap's OWN change-check passed: the screen provably moved after it.
@@ -1094,6 +1158,16 @@ def summarize_journal(journal_text: str) -> str:
         out.append(f"- likely FALSE halt (verified-then-stuck): {verified_then_halt}")
     if genuine_stuck_note:
         out.append(f"- likely GENUINE stuck (DROPPED committing tap): {genuine_stuck_note}")
+    # Only when neither of the above already told this exact story: a Concede exhaustion
+    # (unlike Play's) DOES run through `_wait_until`, so `genuine_stuck_note` already covers
+    # it via `wait_timeout_state` -- firing both would duplicate the same paragraph.
+    dropped_tap_note = ("" if (genuine_stuck_note or verified_then_halt)
+                        else _diagnose_dropped_committing_tap_halt(last_halt))
+    if dropped_tap_note:
+        out.append(f"- likely cause: {dropped_tap_note}")
+    no_change_note = _diagnose_no_change_halt(last_halt, last_tap_what)
+    if no_change_note:
+        out.append(f"- likely cause: {no_change_note}")
     mulligan_read_note = _diagnose_mulligan_read_halt(last_halt)
     if mulligan_read_note:
         # Name a "could not read mulligan" halt's cause (class blank vs garbled vs card

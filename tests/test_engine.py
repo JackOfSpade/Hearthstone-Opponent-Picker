@@ -575,6 +575,75 @@ def test_collection_is_backed_out_of_not_halted(cfg):
     assert eng.limiter.commits_this_run == 0   # backing out is not a committing action
 
 
+def test_a_dropped_error_ok_tap_retries_then_succeeds(cfg):
+    """error_ok and collection_back share one generic dispatch-button retry
+    (`_tap_dispatch_button`, `vision.dispatch_tap_attempts`) -- exercised here via
+    error_ok; collection_back's own smoke test below confirms the wiring."""
+    backend = FakeBackend()
+    from hop.geometry import PanelGeometry
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.ERROR_DIALOG]), reader=None,
+                 sleep=lambda s: None, rng=Random(2),
+                 capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.dispatch_tap_attempts))
+    assert cfg.vision.dispatch_tap_attempts >= 2
+    eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
+                             what="error_ok", label="the error dialog's OK button")
+    assert len(backend.gestures) == cfg.vision.dispatch_tap_attempts
+
+
+def test_error_ok_exhausts_its_retry_budget_then_fails_closed(cfg):
+    from hop.verify import Halt
+
+    from hop.geometry import PanelGeometry
+    debug = _TapDebug()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.ERROR_DIALOG]),
+                 reader=None, debug=debug, sleep=lambda s: None, rng=Random(2),
+                 capturer=_StuckCardCapturer())
+    with pytest.raises(Halt) as e:
+        eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
+                                 what="error_ok", label="the error dialog's OK button")
+    assert "not registering (a dropped committing tap" in str(e.value)
+    assert len(eng.backend.gestures) == cfg.vision.dispatch_tap_attempts
+    ignored = [d for k, d in debug.events if k == "error_ok_tap_ignored"]
+    assert len(ignored) == cfg.vision.dispatch_tap_attempts - 1
+
+
+def test_only_a_no_change_halt_is_retried_by_the_dispatch_button_helper(cfg):
+    """A coherence/non-repetition failure means the automation is wrong, not the
+    client -- it must not be retried or folded into the dropped-tap message."""
+    from hop.geometry import PanelGeometry
+    from hop.verify import Halt
+
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.ERROR_DIALOG]), reader=None,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+
+    def wrong_change(*a, **k):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
+                                 what="error_ok", label="the error dialog's OK button")
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert len(eng.backend.gestures) == 1   # not retried three times
+
+
+def test_a_dropped_collection_back_tap_retries_via_the_shared_helper(cfg):
+    """Smoke test that COLLECTION dispatch actually routes through the shared retrying
+    helper (not a bare `_tap`) -- the regression `_tap_play` was added for."""
+    backend = FakeBackend()
+    from hop.geometry import PanelGeometry
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.COLLECTION]), reader=None,
+                 sleep=lambda s: None, rng=Random(2),
+                 capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.dispatch_tap_attempts))
+    cls = eng.classifier.classify(gray_frame(80, 40))
+    eng._dispatch(cls, gray_frame(80, 40))   # must not raise
+    assert len(backend.gestures) == cfg.vision.dispatch_tap_attempts
+
+
 def test_collection_back_tap_stays_on_the_button_not_off_the_bottom():
     """Wide, short button: the hit radius must come from the smaller (height) half.
 
@@ -664,6 +733,65 @@ def test_reconnect_does_not_retap_while_reconnecting(cfg):
     frame = gray_frame(80, 40)
     eng._dispatch(eng.classifier.classify(frame), frame)
     assert len(backend.gestures) == 1, "must not emit a correction tap mid-reconnect"
+
+
+def test_a_dropped_reconnect_tap_does_not_crash_the_whole_hunt(cfg):
+    """Regression: the Reconnect BUTTON tap can be silently dropped too, not just the
+    async reconnect timing out after a tap that took. This dialog has no ambient
+    animation to mask a drop, so `_tap`'s own verify raises `Halt.NO_CHANGE`
+    immediately -- that must be swallowed here and left to the EXISTING
+    `reconnect_attempt_cap` retry (the same "let the outer loop re-enter _reconnect()"
+    mechanism the RECONNECT_DIALOG-persists case already relies on), not crash the
+    whole hunt on one dropped button tap the way Play used to.
+    """
+    from hop.geometry import PanelGeometry
+
+    debug = _TapDebug()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.RECONNECT_DIALOG]), reader=None, debug=debug,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+    eng._reconnect()   # must not raise
+    assert eng._reconnect_attempts == 1
+    assert len(eng.backend.gestures) == 1
+    ignored = [d for k, d in debug.events if k == "reconnect_tap_ignored"]
+    assert len(ignored) == 1
+
+
+def test_reconnect_still_fails_closed_after_the_cap_of_dropped_taps(cfg):
+    """The dropped-tap swallow above must not defeat the cap: enough dropped attempts
+    still fail closed, exactly as enough failed reconnect EPISODES already did."""
+    from hop.geometry import PanelGeometry
+    from hop.verify import Halt
+
+    cap = cfg.vision.reconnect_attempt_cap
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.RECONNECT_DIALOG]), reader=None,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+    for _ in range(cap):
+        eng._reconnect()   # every attempt's tap is dropped; none of these crash
+    with pytest.raises(Halt, match="failed to reconnect"):
+        eng._reconnect()
+    assert len(eng.backend.gestures) == cap   # never taps once the cap is reached
+
+
+def test_only_a_no_change_halt_is_swallowed_by_reconnect(cfg):
+    """A coherence/non-repetition failure on the Reconnect tap means the automation is
+    wrong, not the client -- it must propagate, not be swallowed as a dropped tap."""
+    from hop.geometry import PanelGeometry
+    from hop.verify import Halt
+
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.RECONNECT_DIALOG]), reader=None,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+
+    def wrong_change(*a, **k):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._reconnect()
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert len(eng.backend.gestures) == 1
 
 
 def test_reconnect_attempts_are_capped(cfg):
@@ -929,6 +1057,102 @@ def test_only_a_no_change_halt_counts_as_an_ignored_card_tap(cfg):
     assert len(eng.backend.gestures) == 1          # and not retried three times
 
 
+# ── Play: the loop's first committing tap can be dropped too ────────────────
+
+class _TapDebug:
+    """Records both `.record()` events and `.anomaly()` calls -- the surface `_tap`'s
+    Verifier failure path needs, which the bare event-only `_RecordingDebug` above
+    (defined for a test that never trips a Halt) does not implement."""
+
+    def __init__(self):
+        self.events = []
+
+    def record(self, kind, /, **detail):
+        self.events.append((kind, detail))
+
+    def anomaly(self, reason, before=None, after=None, **ctx):
+        self.events.append(("anomaly", {"reason": reason, **ctx}))
+
+
+class _StuckUntilNthTap:
+    """Every capture is identical until the Nth physical gesture has landed, after which
+    every capture reads as an obvious change -- a dropped tap that then takes."""
+
+    def __init__(self, backend, land_on_attempt):
+        self.backend = backend
+        self.land_on_attempt = land_on_attempt
+
+    def capture(self):
+        if len(self.backend.gestures) >= self.land_on_attempt:
+            return gray_frame(80, 40, 220)
+        return gray_frame(80, 40, 60)
+
+
+def _play_engine(cfg, capturer, *, debug=None):
+    from hop.geometry import PanelGeometry
+    return Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                  FakeClassifier([ScreenState.PLAY_SCREEN]), reader=None, debug=debug,
+                  sleep=lambda s: None, rng=Random(2), capturer=capturer)
+
+
+def test_a_dropped_play_tap_retries_then_succeeds(cfg):
+    """Play is a committing tap: unlike a mulligan card it must eventually take, or
+    halt. The first TWO Play taps are dropped (the screen never moves through the
+    whole motion-wait budget) and the third lands -- more retries than `_tap`'s own
+    single evidence-based correction alone could ever supply (that caps at ONE retap,
+    i.e. 2 physical taps total), so this is a genuine regression test for the outer
+    retry loop, not something the old single-tap-then-halt Play already handled.
+    """
+    backend = FakeBackend()
+    from hop.geometry import PanelGeometry
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.PLAY_SCREEN]), reader=None,
+                 sleep=lambda s: None, rng=Random(2),
+                 capturer=_StuckUntilNthTap(backend, land_on_attempt=3))
+    assert cfg.vision.play_tap_attempts >= 3
+    eng._tap_play()   # must not raise
+    assert len(backend.gestures) == 3   # two dropped, one that took
+
+
+def test_play_exhausts_its_retry_budget_then_fails_closed(cfg):
+    """Every tap comes back with literally zero pixel change: a genuinely dropped
+    committing tap, not a wrong coordinate -- so the hunt still fails closed."""
+    from hop.verify import Halt
+
+    debug = _TapDebug()
+    eng = _play_engine(cfg, _StuckCardCapturer(), debug=debug)
+    with pytest.raises(Halt) as e:
+        eng._tap_play()
+    assert "not registering (a dropped committing tap" in str(e.value)
+    assert "Quit" not in str(e.value)                     # sanity: not the concede message
+    assert len(eng.backend.gestures) == cfg.vision.play_tap_attempts
+    ignored = [d for k, d in debug.events if k == "play_tap_ignored"]
+    assert len(ignored) == cfg.vision.play_tap_attempts - 1
+
+
+def test_a_play_tap_that_lands_first_try_never_retries(cfg):
+    eng = _play_engine(cfg, ScriptedCapturer([gray_frame(80, 40, 20), gray_frame(80, 40, 220)]))
+    eng._tap_play()
+    assert len(eng.backend.gestures) == 1
+
+
+def test_only_a_no_change_halt_is_retried_for_play(cfg):
+    """A coherence/non-repetition failure means the automation is wrong, not the
+    client -- it must not be retried or folded into the dropped-tap message."""
+    from hop.verify import Halt
+
+    eng = _play_engine(cfg, _StuckCardCapturer())
+
+    def wrong_change(*a, **k):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._tap_play()
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert len(eng.backend.gestures) == 1                 # not retried three times
+
+
 def test_card_taps_are_verified_against_the_card_not_the_screen(cfg):
     """Regression: a whole-frame check called a real toggle 'no screen change'.
 
@@ -974,6 +1198,77 @@ def test_mulligan_confirm_halts_if_the_mulligan_never_leaves(cfg):
     eng, _ = _reconnect_engine(cfg, [ScreenState.MULLIGAN])
     with pytest.raises(Halt, match="did not dismiss"):
         eng._confirm_mulligan()
+
+
+def test_mulligan_confirm_does_not_blame_a_dropped_tap_on_a_roping_opponent(cfg):
+    """Regression, and the single most safety-critical property of this retry: breaking
+    early because the look came back UNKNOWN (the opponent's own mulligan still roping,
+    or a frame we simply cannot name) used to still claim "after {attempts} tap(s) ...
+    not registering (a dropped committing tap)" even though only ONE tap was ever sent
+    and Confirm may well have WORKED. MULLIGAN persisting is the drop signature; UNKNOWN
+    persisting is not, and must never trigger a retap into a live game."""
+    from hop.verify import Halt
+
+    eng, backend = _reconnect_engine(cfg, [ScreenState.UNKNOWN])
+    with pytest.raises(Halt) as e:
+        eng._confirm_mulligan()
+    assert "not registering (a dropped committing tap" not in str(e.value)
+    assert "after 1 tap(s)" in str(e.value)
+    assert len(backend.gestures) == 1   # never blind-retapped into an unrecognised screen
+
+
+def test_a_dropped_mulligan_confirm_makes_taps_own_verify_raise_and_still_recovers(cfg):
+    """Regression: unlike Concede's animated board, the mulligan's cards are static, so a
+    dropped Confirm here is a genuinely UNCHANGING frame and `_tap` itself raises
+    `Halt.NO_CHANGE` (not just a `_wait_until_screen_leaves` timeout) -- an earlier
+    version of this fix let that exception escape uncaught, skipping the retry loop
+    entirely. The last of N taps lands and a fresh look confirms we're in game."""
+    from hop.geometry import PanelGeometry
+
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.IN_GAME]), reader=None,
+                 sleep=lambda s: None, rng=Random(2),
+                 capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.mulligan_confirm_tap_attempts))
+    assert cfg.vision.mulligan_confirm_tap_attempts >= 2
+    eng._confirm_mulligan()   # must not raise
+    assert len(backend.gestures) == cfg.vision.mulligan_confirm_tap_attempts
+
+
+def test_mulligan_confirm_exhausts_its_retry_budget_then_fails_closed(cfg):
+    from hop.geometry import PanelGeometry
+    from hop.verify import Halt
+
+    debug = _TapDebug()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None, debug=debug,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+    with pytest.raises(Halt) as e:
+        eng._confirm_mulligan()
+    assert "not registering (a dropped committing tap" in str(e.value)
+    assert len(eng.backend.gestures) == cfg.vision.mulligan_confirm_tap_attempts
+    ignored = [d for k, d in debug.events if k == "mulligan_confirm_tap_ignored"]
+    assert len(ignored) == cfg.vision.mulligan_confirm_tap_attempts - 1
+
+
+def test_only_a_no_change_halt_is_retried_for_mulligan_confirm(cfg):
+    """A coherence/non-repetition failure means the automation is wrong, not the
+    client -- it must not be retried or folded into the dropped-tap message."""
+    from hop.geometry import PanelGeometry
+    from hop.verify import Halt
+
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, rng=Random(2), capturer=_StuckCardCapturer())
+
+    def wrong_change(*a, **k):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._confirm_mulligan()
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert len(eng.backend.gestures) == 1   # not retried
 
 
 class _PollClockCapturer:
