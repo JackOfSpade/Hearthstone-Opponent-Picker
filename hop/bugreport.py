@@ -239,7 +239,7 @@ def _diagnose_dropped_committing_tap_halt(message: str) -> str:
             "genuinely DROPPED committing tap. Corroborate with the capture-time TREND above "
             "(a rising mean = a degrading wireless link) and the dropped-taps tally, though a "
             "FLAT trend does not rule this out: this client drops some taps (mulligan cards "
-            "~1 in 3) with no known cause even on a healthy link (see CALIBRATION.md). Raise "
+            "~1 in 3) with no known cause even on a healthy link. Raise "
             "the relevant vision.*_tap_attempts knob, or fix the link, rather than chasing a "
             "coordinate change.")
 

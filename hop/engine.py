@@ -798,8 +798,8 @@ class Engine:
         ZERO pixel change on every post-tap look -- `_tap`'s own multi-poll
         `_await_screen_motion` and its one evidence-based correction both agree nothing
         moved (``Halt.NO_CHANGE``). That is exactly the failure `_replace_card` already
-        retries against (this client drops button taps too, not just card taps, for
-        reasons CALIBRATION.md never pinned down) -- and until now Play was the one
+        retries against (this client drops button taps too, not just card taps) -- and
+        until now Play was the one
         committing tap in the whole loop with NO retry budget, so one dropped Play tap
         failed the entire hunt closed before a single game was even queued.
 
@@ -1516,8 +1516,8 @@ class Engine:
         misses the card leaves the card unchanged and still fails.
 
         **Hearthstone accepts it only intermittently** - about 1 tap in 3, while
-        accepting every button tap. The cause is *unknown*; see CALIBRATION.md for the
-        suspects that measurement has killed (contact scale, position, dwell,
+        accepting every button tap. The cause is *unknown*; suspected factors include
+        contact scale, position, dwell,
         micro-slip, event delivery, an unfinished deal-in animation, and stale latched
         centres). The kernel sees a clean DOWN/UP at the right coordinates on a hand
         that has been at rest for ten seconds, and the game ignores it anyway. So retry

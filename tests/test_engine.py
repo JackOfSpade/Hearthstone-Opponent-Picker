@@ -1036,8 +1036,8 @@ def test_a_card_tap_that_takes_stops_retrying(cfg):
 
 
 def test_only_a_no_change_halt_counts_as_an_ignored_card_tap(cfg):
-    """`stats.ignored_card_taps` is the statistic CALIBRATION.md chases the ~67%
-    card-tap mystery with. Folding coherence or non-repetition failures into it both
+    """`stats.ignored_card_taps` isolates failed card taps. Folding coherence or
+    non-repetition failures into it both
     hides a real fault and poisons the evidence that would reveal it.
 
     Only "the screen did not move" means the game ignored the tap.

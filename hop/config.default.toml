@@ -269,14 +269,14 @@ deck_decline_tap_attempts = 3
 # Play is the loop's FIRST committing tap, on an otherwise static screen -- unlike Concede
 # there is no ambient board animation to mask a miss, so a dropped Play tap shows LITERALLY
 # ZERO pixel change on every post-tap look. This is the same input-drop the mulligan cards
-# and Concede already retry against (cause unknown; see CALIBRATION.md), and until now Play
+# and Concede already retry against (cause unknown), and until now Play
 # was the one committing tap in the whole loop with no retry budget -- one dropped Play tap
 # failed the entire hunt closed before a single game was even queued. Retry the SAME Play
 # coordinate a bounded number of times before failing closed. 1 = the old
 # single-tap-then-halt behaviour.
 play_tap_attempts = 3
 # Hearthstone accepts a mulligan card tap only intermittently -- ~1 time in 3, while
-# accepting every button tap. Cause UNKNOWN; see CALIBRATION.md. Ruled out by
+# accepting every button tap. Cause UNKNOWN. Ruled out by
 # measurement: contact scale, position, dwell, micro-slip, event delivery, and (via a
 # screenrecord of the deal-in) both "the cards are still animating" and "the latched
 # centres are stale" -- the hand is at rest 0.2s after the banner matches and the

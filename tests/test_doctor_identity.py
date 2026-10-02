@@ -1,4 +1,4 @@
-"""Tests for `hop doctor`'s touchscreen-identity parser (CALIBRATION.md §4).
+"""Tests for `hop doctor`'s touchscreen-identity parser.
 
 The parser feeds panel-matched [uhid] cloning. The format below is the real
 `dumpsys input` layout on a Pixel 7a / Android 17 (SDK 37): per-device blocks

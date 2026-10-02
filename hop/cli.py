@@ -187,7 +187,7 @@ def cmd_doctor(args) -> int:
                       f"vendor_id = 0x{ident['vendor']:04x}, product_id = 0x{ident['product']:04x}")
             else:
                 print("        (could not parse a touchscreen identity from `dumpsys input`; "
-                      "set [uhid] manually - see CALIBRATION.md §4)")
+                      "set [uhid] manually)")
         except Exception:
             pass
 
@@ -607,7 +607,7 @@ def _device_model(adb) -> str:
 def parse_touch_identity(dump: str) -> dict | None:
     """Parse ``dumpsys input`` for the touchscreen's InputDevice identity.
 
-    Used to panel-match the virtual UHID digitizer (CALIBRATION.md §4). Modern
+    Used to panel-match the virtual UHID digitizer. Modern
     Android (11+) prints, under each device block::
 
         2: goodix_ts0
