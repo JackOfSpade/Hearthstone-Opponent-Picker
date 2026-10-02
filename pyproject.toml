@@ -12,7 +12,7 @@ dependencies = []
 # Vision/OCR. numpy accelerates template matching + card counting; without it
 # hop falls back to slower pure-Python paths. Pillow decodes screencap PNGs.
 # pytesseract is the OCR engine for the class label (snapped to 11 known words).
-vision = ["numpy>=1.24", "Pillow>=10.0", "pytesseract>=0.3.10"]
+vision = ["numpy>=2.4.6", "Pillow>=10.0", "pytesseract>=0.3.10"]
 # Local web dashboard.
 web = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0"]
 # Global hotkeys (start/stop/panic) from the Mac.
@@ -23,7 +23,7 @@ hotkeys = ["pynput>=1.7.6"]
 mac = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=10.0"]
 dev = ["pytest>=7.4"]
 all = [
-    "numpy>=1.24", "Pillow>=10.0", "pytesseract>=0.3.10",
+    "numpy>=2.4.6", "Pillow>=10.0", "pytesseract>=0.3.10",
     "fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0",
     "pynput>=1.7.6", "pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=10.0",
     "pytest>=7.4",
