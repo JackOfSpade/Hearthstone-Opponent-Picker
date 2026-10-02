@@ -20,12 +20,12 @@ hotkeys = ["pynput>=1.7.6"]
 # The Mac menu-bar control panel (`hop app`) and its native stats window. The CLI and
 # the web dashboard work without it; the NSStatusItem UI needs the Cocoa bridge, and the
 # in-window dashboard (a native WKWebView, not a browser) needs the WebKit bridge.
-mac = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=10.0"]
+mac = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=12.2.2"]
 dev = ["pytest>=7.4"]
 all = [
     "numpy>=1.24", "Pillow>=10.0", "pytesseract>=0.3.10",
     "fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0",
-    "pynput>=1.7.6", "pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=10.0",
+    "pynput>=1.7.6", "pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=12.2.2",
     "pytest>=7.4",
 ]
 
