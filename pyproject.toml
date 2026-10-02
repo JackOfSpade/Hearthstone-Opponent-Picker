@@ -14,7 +14,7 @@ dependencies = []
 # pytesseract is the OCR engine for the class label (snapped to 11 known words).
 vision = ["numpy>=2.4.6", "Pillow>=10.0", "pytesseract>=0.3.10"]
 # Local web dashboard.
-web = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0"]
+web = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=17.1"]
 # Global hotkeys (start/stop/panic) from the Mac.
 hotkeys = ["pynput>=1.8.2"]
 # The Mac menu-bar control panel (`hop app`) and its native stats window. The CLI and
@@ -24,7 +24,7 @@ mac = ["pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=12.2.2"]
 dev = ["pytest>=9.1.1"]
 all = [
     "numpy>=2.4.6", "Pillow>=10.0", "pytesseract>=0.3.10",
-    "fastapi>=0.110", "uvicorn>=0.29", "websockets>=12.0",
+    "fastapi>=0.110", "uvicorn>=0.29", "websockets>=17.1",
     "pynput>=1.8.2", "pyobjc-framework-Cocoa>=10.0", "pyobjc-framework-WebKit>=12.2.2",
     "pytest>=9.1.1",
 ]
