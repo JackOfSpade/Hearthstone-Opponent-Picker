@@ -292,7 +292,12 @@ def cmd_connect(args) -> int:
         print(f"failed to connect to {addr}", file=sys.stderr)
         return 1
     panel = adb.measure_panel()
-    print(f"connected: {addr}")
+    if adb.active_address == addr:
+        print(f"connected: {addr}")
+    elif adb.using_usb:
+        print(f"connected: {adb.active_address} (USB fallback; configured Wi-Fi: {addr})")
+    else:
+        print(f"connected: {adb.active_address} (recovered from configured Wi-Fi: {addr})")
     print(f"panel: {panel.width_px}x{panel.height_px} @ {panel.dpi:.0f} dpi")
     print(f"UHID tool: {'yes' if adb.has_hid_tool() else 'no (will use adb input)'}")
     return 0

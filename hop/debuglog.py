@@ -162,6 +162,17 @@ class DebugLog:
                     self._save_frame(frame, self.run_dir / f"anomaly_{self._n}_{tag}.png")
             self._prune_frames()
 
+    def terminal_screen(self, reason: str, frame: Frame | None = None, **context: Any) -> None:
+        """Keep the final named-but-unhandled screen, too.
+
+        Unknown screens already have a durable colour capture.  A *misclassified* overlay is
+        harder: it can look like a perfectly named board, so the engine would halt after a
+        bounded wait without retaining the pixels that explain why.  Recording it as an anomaly
+        gives the bug-report harness an OCR-able terminal frame while preserving the existing
+        bounded per-run retention policy.
+        """
+        self.anomaly(reason, before=frame, terminal=True, **context)
+
     def unknown_screen(self, frame: Frame | None, *, where: str, **context: Any) -> Path | None:
         """Persist a frame the classifier could not name. Returns the path written.
 

@@ -922,6 +922,97 @@ def test_capture_retry_forces_a_reconnect_between_attempts(cfg):
     assert adb.reconnects == 2       # one reconnect before each of the two retries
 
 
+def test_transport_lifecycle_is_journalled_before_a_stale_writer_breaks(cfg):
+    """A reconnect can kill the resident ``adb shell hid -`` process while captures
+    recover. The journal needs the before/after epochs and the terminal writer state
+    before Engine.run() closes the process and erases that evidence."""
+    class Debug:
+        def __init__(self):
+            self.events = []
+
+        def record(self, kind, **detail):
+            self.events.append((kind, detail))
+
+    class GenerationAdb(FakeAdb):
+        def __init__(self):
+            super().__init__()
+            self.connection_generation = 7
+
+        def reconnect(self):
+            self.connection_generation += 1
+
+    class StaleWriter(FakeBackend):
+        def __init__(self, adb):
+            super().__init__()
+            self.adb = adb
+
+        def transport_status(self):
+            return {
+                "kind": "uhid", "opened": True, "pid": 441,
+                "connection_generation": self.adb.connection_generation,
+                "stream_generation": 7, "reopen_count": 0,
+                "last_command": "report", "returncode": 1,
+                "stderr_tail": "hid: stream closed",
+            }
+
+        def emit(self, gesture):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    adb = GenerationAdb()
+    backend = StaleWriter(adb)
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+    debug = Debug()
+    eng.adb, eng.backend, eng.debug = adb, backend, debug
+
+    eng._recover_capture_link()
+    with pytest.raises(BrokenPipeError):
+        eng._emit_gesture(object(), what="pass_turn")
+
+    reconnect = next(detail for kind, detail in debug.events if kind == "capture_link_reconnect")
+    assert reconnect["outcome"] == "succeeded"
+    assert reconnect["adb_generation_before"] == 7
+    assert reconnect["adb_generation_after"] == 8
+    assert reconnect["transport_after"]["stream_generation"] == 7
+    failure = next(detail for kind, detail in debug.events if kind == "transport_failure")
+    assert failure["what"] == "pass_turn"
+    assert failure["transport"]["returncode"] == 1
+    assert "stream closed" in failure["transport"]["stderr_tail"]
+
+
+def test_emit_logs_a_generation_driven_uhid_reregistration(cfg):
+    """The successful repair is observable too: the first gesture after reconnect
+    must leave a lifecycle marker rather than making the report infer recovery."""
+    class Debug:
+        def __init__(self):
+            self.events = []
+
+        def record(self, kind, **detail):
+            self.events.append((kind, detail))
+
+    class RenewingWriter(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.status = {"kind": "uhid", "connection_generation": 8,
+                           "stream_generation": 7, "reopen_count": 0}
+
+        def transport_status(self):
+            return dict(self.status)
+
+        def emit(self, gesture):
+            self.status.update(stream_generation=8, reopen_count=1,
+                               last_reopen_reason="adb generation changed",
+                               last_reopen_ok=True)
+
+    eng, _ = _engine(cfg, [ScreenState.MENU])
+    eng.backend, eng.debug = RenewingWriter(), Debug()
+    eng._emit_gesture(object(), what="pass_turn")
+    kind, detail = eng.debug.events[-1]
+    assert kind == "transport_stream_reopened"
+    assert detail["what"] == "pass_turn"
+    assert detail["transport_before"]["stream_generation"] == 7
+    assert detail["transport_after"]["stream_generation"] == 8
+
+
 def test_run_halts_cleanly_when_the_adb_link_stays_down(cfg):
     """A link that stays down through every retry must end the run with a named stop_reason,
     NOT escape as a raw error to the controller thread (a bare traceback, stats lost)."""

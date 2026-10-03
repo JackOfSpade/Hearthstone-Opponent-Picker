@@ -172,14 +172,30 @@ class EngineController:
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_tb,
             "uptime_s": round(time.time() - self._started_at, 1) if self._started_at else 0,
-            # the day-scoped distribution shows even before the first run / while idle, so
-            # the chart carries yesterday-cleared, same-day-restored counts on app open.
+            # The dashboard's original distribution is deliberately day-scoped: it shows even
+            # before the first run / while idle, so the chart carries yesterday-cleared,
+            # same-day-restored counts on app open.  Keep that API intact, but name its scope so
+            # report consumers never confuse a prior run's target with this run's opponent.
             "class_distribution": self.observed_distribution(),
+            "class_distribution_scope": "day" if self._observed is not None else "run",
         }
         if eng is None:
             return base
         s, st, lim = eng.stats, eng.state, eng.limiter
         crit = eng.cfg.criteria
+        # A persistent UHID writer can die after an ADB reconnect.  Keep its bounded
+        # in-process status alongside the controller's caught error so a bug report
+        # still has the child's exit/stderr snapshot even when the journal is disabled
+        # or the crash escaped Engine.run.  Optional for old/fake engines.
+        transport_status = {}
+        transport_probe = getattr(eng, "transport_status", None)
+        if callable(transport_probe):
+            try:
+                candidate = transport_probe()
+                if isinstance(candidate, dict):
+                    transport_status = candidate
+            except Exception:
+                pass
         base.update({
             # the criteria THIS run is actually using (config + dashboard/menu overrides,
             # merged at construction). Surfaced so a bug report shows what the run hunted
@@ -195,9 +211,13 @@ class EngineController:
             "concedes_until_target": s.concedes_until_target,
             "last_opponent": s.last_opponent,
             "stop_reason": s.stop_reason,
-            # the observed class distribution (day-scoped; see observed_distribution) +
-            # the coin split, for the dashboard charts
+            # Keep the observed total for the dashboard, but expose the engine's own current
+            # run separately for diagnostics.  The two legitimately differ after a restart:
+            # a day's Priest target plus this run's rejected Hunter must never look like one
+            # run that stopped on Hunter.  Additive field: existing dashboard clients continue
+            # reading `class_distribution` unchanged.
             "class_distribution": self.observed_distribution(),
+            "run_class_distribution": dict(s.class_distribution),
             "going_first": s.going_first,
             "going_second": s.going_second,
             # Non-fatal, but a rising count means our touch profile is drifting from
@@ -219,4 +239,6 @@ class EngineController:
                 "session_minutes": round(lim.session_seconds / 60, 1),
             },
         })
+        if transport_status:
+            base["transport_status"] = transport_status
         return base

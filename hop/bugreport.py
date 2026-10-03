@@ -387,6 +387,17 @@ def _diagnose_last_error(last_error: str) -> str:
         return ("an ADB command timed out -- the wireless link to the phone stalled (device "
                 "asleep/Doze, Wi-Fi power-save, or the Mac slept). See the Host power/network "
                 "section for which. Transient stalls now self-heal (capture_retry_attempts).")
+    if ("could not connect" in m
+            and ("network is unreachable" in m or "no route to host" in m)):
+        return ("the INITIAL `adb connect` could not route a packet to the configured phone IP -- "
+                "it never reached the phone or adbd. This is a network-path failure, NOT a dead "
+                "wireless-ADB listener, so re-running `adb tcpip 5555` cannot repair it until the "
+                "Mac can reach the phone. Check whether the phone changed Wi-Fi IP, whether the "
+                "Mac and phone are on reachable LAN/VLANs, and whether a VPN/split-tunnel owns the "
+                "phone subnet. The Host power/network section now records macOS's route plus the "
+                "Wi-Fi IPv4 of a sole USB-attached phone, when available, to distinguish those "
+                "cases directly. If one authorized phone is attached by USB, hop can use that "
+                "transport for this session while leaving the configured wireless address unchanged.")
     if "could not connect" in m and "refused" in m:
         return ("the INITIAL `adb connect` was REFUSED, not timed out -- the phone answered and "
                 "closed the socket, meaning adbd's wireless TCP listener isn't running on this "
@@ -408,6 +419,164 @@ def _diagnose_last_error(last_error: str) -> str:
                 "as opposed to the phone being off the network entirely, which would also fail "
                 "the ping.")
     return ""
+
+
+def _one_line(value, limit: int = 280) -> str:
+    """Collapse diagnostic text to one bounded, report-safe line."""
+    text = " ".join(str(value or "").split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _transport_epoch(status: dict) -> str:
+    """Compact ``UHID stream epoch / ADB epoch`` relation, or ``""`` if absent."""
+    if not isinstance(status, dict):
+        return ""
+    stream = status.get("stream_generation")
+    adb = status.get("connection_generation")
+    if stream is None or adb is None:
+        return ""
+    suffix = " (STALE)" if stream != adb else ""
+    return f"UHID stream generation {stream}; ADB generation {adb}{suffix}"
+
+
+def _transport_lifecycle_lines(
+    reconnects: list[tuple[int, dict]],
+    reopens: list[tuple[int, dict]],
+    failure: tuple[int, dict] | None,
+) -> list[str]:
+    """Render the causal lifecycle trail for a persistent transport.
+
+    A normal ADB reconnect tears down its shell channels. A persistent UHID writer
+    therefore needs an explicit generation-aware re-registration before its next
+    report. The old report had a bare ``BrokenPipeError`` but not these three facts:
+    the reconnect happened, the stream was stale afterward, and the next action was
+    the first write. Journal events added by :mod:`hop.engine` carry that proof.
+
+    The parser is intentionally tolerant: reports from older backends may have a
+    reconnect event with no transport snapshot, or a failure with only an error.
+    """
+    lines: list[str] = []
+    if reconnects:
+        _idx, latest = reconnects[-1]
+        outcome = str(latest.get("outcome") or "unknown")
+        before_gen = latest.get("adb_generation_before")
+        after_gen = latest.get("adb_generation_after")
+        bits = [f"{len(reconnects)} capture-link reconnect(s); last {outcome}"]
+        if before_gen is not None or after_gen is not None:
+            bits.append(f"ADB generation {before_gen if before_gen is not None else '?'}→"
+                        f"{after_gen if after_gen is not None else '?'}")
+        epoch = _transport_epoch(latest.get("transport_after") or {})
+        if epoch:
+            bits.append(epoch)
+        error = _one_line(latest.get("error"), 180)
+        if error:
+            bits.append(f"error: {error}")
+        lines.append("- transport lifecycle: " + "; ".join(bits) + ".")
+
+    if reopens:
+        _idx, latest = reopens[-1]
+        after = latest.get("transport_after") or {}
+        before = latest.get("transport_before") or {}
+        what = latest.get("what") or "the next gesture"
+        bits = [f"{len(reopens)} UHID stream re-registration(s); latest before {what!r}"]
+        before_epoch = _transport_epoch(before)
+        after_epoch = _transport_epoch(after)
+        if before_epoch or after_epoch:
+            bits.append((before_epoch or "UHID stream epoch unavailable") + " → "
+                        + (after_epoch or "UHID stream epoch unavailable"))
+        count = after.get("reopen_count")
+        if count is not None:
+            bits.append(f"reopen #{count}")
+        reason = _one_line(after.get("last_reopen_reason"), 140)
+        if reason:
+            bits.append(f"reason: {reason}")
+        if after.get("last_reopen_ok") is False:
+            bits.append("FAILED")
+        lines.append("- transport lifecycle: " + "; ".join(bits) + ".")
+
+    if failure is None:
+        return lines
+
+    failure_index, detail = failure
+    status = detail.get("transport") or {}
+    if not isinstance(status, dict):
+        status = {}
+    action = detail.get("what") or "?"
+    operation = detail.get("operation") or "emit"
+    error = _one_line(detail.get("error"), 320) or "unspecified transport error"
+    bits = [f"{operation} for {action!r} raised {error}"]
+    if status.get("pid") is not None:
+        bits.append(f"child pid {status['pid']}")
+    if status.get("returncode") is not None:
+        bits.append(f"child exit {status['returncode']}")
+    command = _one_line(status.get("last_command"), 80)
+    if command:
+        bits.append(f"last stream command {command!r}")
+    epoch = _transport_epoch(status)
+    if epoch:
+        bits.append(epoch)
+    child_failure = _one_line(status.get("failure"), 220)
+    if child_failure and child_failure not in error:
+        bits.append(f"child failure: {child_failure}")
+    stderr = _one_line(status.get("stderr_tail"), 260)
+    if stderr:
+        bits.append(f"stderr: {stderr}")
+    lines.append("- transport failure: " + "; ".join(bits) + ".")
+
+    # The decisive signature of the pasted failure: a capture retry reconnected ADB,
+    # leaving the resident `adb shell hid -` stream on its old epoch; the next action
+    # wrote to that dead pipe before it had re-registered. Do not make that claim when
+    # a successful re-registration is journalled in between, or when the epochs are
+    # unavailable -- then the child exit/stderr above is the honest evidence.
+    preceding = [item for item in reconnects if item[0] < failure_index]
+    if preceding:
+        reconnect_index, reconnect = preceding[-1]
+        reopens_after = [item for item in reopens
+                         if reconnect_index < item[0] < failure_index]
+        post = reconnect.get("transport_after") or {}
+        stale_after_reconnect = (_transport_epoch(post).endswith("(STALE)"))
+        stale_at_failure = _transport_epoch(status).endswith("(STALE)")
+        if (stale_after_reconnect or stale_at_failure) and not reopens_after:
+            before_gen = reconnect.get("adb_generation_before")
+            after_gen = reconnect.get("adb_generation_after")
+            transition = (f" (ADB generation {before_gen}→{after_gen})"
+                          if before_gen is not None or after_gen is not None else "")
+            lines.append(
+                "- likely transport cause: the capture-retry reconnect replaced ADB's shell "
+                "transport" + transition + ", but the persistent UHID stream stayed on its "
+                "old generation and did not re-register before this next write. That stale "
+                "writer is why the pipe closed; re-register the UHID stream after every ADB "
+                "reconnect.")
+    return lines
+
+
+def _live_transport_status_line(status) -> str:
+    """One compact, non-journal transport snapshot for the report header."""
+    if not isinstance(status, dict):
+        return ""
+    bits = []
+    kind = _one_line(status.get("kind"), 40)
+    if kind:
+        bits.append(kind)
+    if "opened" in status:
+        bits.append("open" if status.get("opened") else "closed")
+    if status.get("pid") is not None:
+        bits.append(f"pid {status['pid']}")
+    if status.get("returncode") is not None:
+        bits.append(f"child exit {status['returncode']}")
+    epoch = _transport_epoch(status)
+    if epoch:
+        bits.append(epoch)
+    command = _one_line(status.get("last_command"), 80)
+    if command:
+        bits.append(f"last command {command!r}")
+    failure = _one_line(status.get("failure"), 180)
+    if failure:
+        bits.append(f"failure: {failure}")
+    stderr = _one_line(status.get("stderr_tail"), 220)
+    if stderr:
+        bits.append(f"stderr: {stderr}")
+    return "; ".join(bits)
 
 
 def summarize_journal(journal_text: str) -> str:
@@ -553,10 +722,16 @@ def summarize_journal(journal_text: str) -> str:
     # (queue -> error_dialog -> deck_select). It's what a truncated journal tail hides, and
     # it's derivable from the classify stream the summary already walks.
     state_trail: list[str] = []
+    # A persistent UHID writer belongs to one ADB connection generation. Capture recovery can
+    # deliberately reconnect ADB; retain the before/after snapshots plus a terminal writer
+    # failure so the summary can prove (rather than guess) whether the stream re-registered.
+    capture_link_reconnects: list[tuple[int, dict]] = []
+    transport_stream_reopens: list[tuple[int, dict]] = []
+    transport_failure: tuple[int, dict] | None = None
     first_t: float | None = None
     prev_t: float | None = None
     prev_kind = ""
-    for e in events:
+    for event_index, e in enumerate(events):
         k = e.get("kind", "?")
         kinds[k] = kinds.get(k, 0) + 1
         d = e.get("detail", {})
@@ -681,6 +856,14 @@ def summarize_journal(journal_text: str) -> str:
                 seg_perception += float(ms) / 1000.0   # the hung time WAS wall-clock spent
             if d.get("error"):
                 capture_retry_last_err = str(d.get("error"))
+        if k == "capture_link_reconnect" and isinstance(d, dict):
+            capture_link_reconnects.append((event_index, d))
+        if k == "transport_stream_reopened" and isinstance(d, dict):
+            transport_stream_reopens.append((event_index, d))
+        if k == "transport_failure" and isinstance(d, dict):
+            # Keep the final failure only: it is the one nearest the halt, and a prior
+            # transient that recovered must not be mistaken for the terminal cause.
+            transport_failure = (event_index, d)
         if k == "non_repetition_reject":
             nonrep_rejects += 1
             attempt = d.get("attempt")
@@ -756,7 +939,7 @@ def summarize_journal(journal_text: str) -> str:
         if k in ("mulligan_card_tap_ignored", "concede_tap_ignored", "play_tap_ignored",
                  "error_ok_tap_ignored", "collection_back_tap_ignored",
                  "deck_decline_tap_ignored", "mulligan_confirm_tap_ignored",
-                 "reconnect_tap_ignored"):
+                 "reconnect_tap_ignored", "end_dismiss_tap_ignored"):
             dropped_taps += 1
         if k == "verify_ok":
             # the tap's OWN change-check passed: the screen provably moved after it.
@@ -1123,6 +1306,12 @@ def summarize_journal(journal_text: str) -> str:
         if capture_retry_last_err:
             note += f". Last retry error: {capture_retry_last_err}"
         out.append(note)
+    # Keep the writer/reconnect story adjacent to the capture-retry line: that is the
+    # causal sequence a raw BrokenPipe traceback used to hide (reconnect -> old shell
+    # dies -> first later UHID write fails), not merely another generic tap anomaly.
+    out.extend(_transport_lifecycle_lines(capture_link_reconnects,
+                                          transport_stream_reopens,
+                                          transport_failure))
     if classify_ms:
         total = sum(classify_ms) / 1000.0
         mean_ms = total * 1000.0 / len(classify_ms)
@@ -1269,6 +1458,34 @@ def _ocr_unknown_frames(unknowns_dir: Path, names: list[str], *,
     return out
 
 
+def terminal_evidence_frame(journal_text: str) -> str | None:
+    """Return the saved frame name for the final named-but-stuck screen, if any.
+
+    A state can be *wrongly named* rather than UNKNOWN: the ranked-progress medal in
+    particular leaves the board's End Turn anchor visible behind it and is therefore
+    classified as ``in_game``. Engine records that terminal frame as an anomaly with
+    ``terminal=true``. Keeping the selection here rather than listing every anomaly means a
+    pasted report leads with the one image that explains the halt.
+    """
+    candidate: tuple[int, str] | None = None
+    for line in journal_text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("kind") != "anomaly":
+            continue
+        detail = event.get("detail") or {}
+        if not detail.get("terminal"):
+            continue
+        index = detail.get("index")
+        if isinstance(index, int) and index > 0:
+            candidate = (index, str(detail.get("reason") or "terminal screen"))
+    if candidate is None:
+        return None
+    return f"anomaly_{candidate[0]}_before.png"
+
+
 def latest_run_dir(runs_root: Path) -> Path | None:
     """The newest run directory (names are %Y%m%d-%H%M%S, so lexical == chronological)."""
     try:
@@ -1276,6 +1493,133 @@ def latest_run_dir(runs_root: Path) -> Path | None:
     except OSError:
         return None
     return dirs[-1] if dirs else None
+
+
+def _recent_run_outcome(journal_text: str) -> str:
+    """Return one compact, run-scoped outcome from a journal.
+
+    The live dashboard tally intentionally spans the day, while ``Latest run summary``
+    intentionally describes only one directory.  A report that showed both without a
+    bridge made a prior target (for example, Priest) look causally related to a later,
+    correctly-rejected opponent (for example, Hunter).  This lightweight reconstruction
+    gives every retained run one decision/outcome sentence; the detailed latest-run
+    summary remains the source for timing and diagnosis.
+
+    Malformed or pre-journal records are deliberately tolerated.  We only state a
+    criterion verdict when that run recorded ``run_criteria`` before its decision.
+    """
+    events = []
+    for line in journal_text.splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    if not events:
+        return ""
+
+    crit_seen = False
+    crit_targets: list = []
+    crit_avoid: list = []
+    crit_require_second = False
+    last_read: tuple[str, bool] | None = None
+    last_reject: tuple[str, bool, str, int] | None = None
+    target: tuple[str, bool] | None = None
+    terminal: tuple[str, int] | None = None
+
+    for index, event in enumerate(events):
+        kind = event.get("kind")
+        detail = event.get("detail")
+        if not isinstance(detail, dict):
+            detail = {}
+        if kind == "run_criteria":
+            targets = detail.get("target_classes")
+            avoid = detail.get("avoid_classes")
+            crit_targets = list(targets) if isinstance(targets, (list, tuple)) else []
+            crit_avoid = list(avoid) if isinstance(avoid, (list, tuple)) else []
+            crit_require_second = bool(detail.get("require_second"))
+            crit_seen = True
+        elif kind == "mulligan_read":
+            opponent = detail.get("opponent")
+            cards = detail.get("cards", 3)
+            # Match the engine/summary's usable-read rule: a valid class plus a 3- or
+            # 4-card mulligan.  Legacy lines without `cards` stay usable.
+            if opponent and opponent != "?" and cards in (3, 4):
+                last_read = (str(opponent), bool(detail.get("second")))
+        elif kind == "reject_plan" and last_read is not None:
+            opponent, second = last_read
+            reason = (_reject_reason(opponent, second, crit_require_second,
+                                     crit_targets, crit_avoid)
+                      if crit_seen else "")
+            last_reject = (opponent, second, reason, index)
+            last_read = None       # one reject consumes one game/read pairing
+        elif kind == "target_found":
+            target = (str(detail.get("opponent") or "?"), bool(detail.get("second")))
+        elif kind in ("halt", "stop") and detail.get("message"):
+            terminal = (str(detail["message"]), index)
+
+    if crit_seen:
+        criteria = (f"targets={crit_targets or 'ANY'} "
+                    f"require_second={crit_require_second}")
+    else:
+        criteria = "criteria not journalled"
+
+    if target is not None:
+        opponent, second = target
+        decision = f"TARGET FOUND {opponent} (going {'2nd' if second else '1st'})"
+        if crit_seen:
+            keep = (_reject_reason(opponent, second, crit_require_second,
+                                   crit_targets, crit_avoid) == "misfire")
+            decision += (" — matched the recorded criteria" if keep
+                         else " — DOES NOT match the recorded criteria (MISFIRE)")
+    elif last_reject is not None:
+        opponent, second, reason, reject_index = last_reject
+        decision = f"REJECTED {opponent} (going {'2nd' if second else '1st'})"
+        if reason == "misfire":
+            decision += " — criteria say KEEP (MISFIRE)"
+        elif reason:
+            decision += f" correctly: {_REJECT_LABELS[reason]}"
+        else:
+            decision += " (criteria unavailable)"
+        if terminal is not None and terminal[1] > reject_index:
+            message = " ".join(terminal[0].split())
+            if len(message) > 180:
+                message = message[:179] + "…"
+            decision += f"; terminal stop came later: {message}"
+    elif terminal is not None:
+        message = " ".join(terminal[0].split())
+        if len(message) > 180:
+            message = message[:179] + "…"
+        decision = f"terminal stop: {message}"
+    else:
+        decision = "no resolved matchup decision or terminal outcome journalled"
+    return f"{criteria}; {decision}."
+
+
+def summarize_recent_runs(runs_root: Path, *, max_runs: int = 5) -> str:
+    """Summarize the retained run outcomes in chronological order.
+
+    ``DebugLog`` normally retains five run directories.  Keep this report section to the
+    same small window and mark the newest entry, which is the run expanded below.  The
+    timeline is deliberately per-run rather than a cumulative counter, so a prior
+    target cannot be mistaken for the latest run's decision.
+    """
+    try:
+        dirs = sorted((p for p in runs_root.iterdir() if p.is_dir()), key=lambda p: p.name)
+    except OSError:
+        return ""
+    if max_runs <= 0:
+        return ""
+    selected = dirs[-max_runs:]
+    lines = []
+    for pos, run_dir in enumerate(selected):
+        outcome = _recent_run_outcome(_read(run_dir / "journal.jsonl"))
+        if not outcome:
+            continue
+        latest = " (latest; detailed below)" if pos == len(selected) - 1 else ""
+        lines.append(f"- {run_dir.name}{latest}: {outcome}")
+    return "\n".join(lines)
 
 
 def format_status(status: dict) -> str:
@@ -1320,6 +1664,12 @@ def format_status(status: dict) -> str:
         why = _diagnose_last_error(str(g("last_error")))
         if why:
             lines.append(f"  ↳ likely cause: {why}")
+    transport_line = _live_transport_status_line(g("transport_status"))
+    if transport_line:
+        # This is a live/surviving snapshot, complementary to the structured journal
+        # lifecycle below. It keeps a child-process exit visible at the TOP of a report
+        # even if a crash happened before a run journal could be opened.
+        lines.append(f"- input transport: {transport_line}")
     if "games" in status:
         lines.append(f"- games: {g('games')}   concedes: {g('concedes')}   "
                      f"target_found: {g('target_found')}   last_opponent: {g('last_opponent')}")
@@ -1333,9 +1683,29 @@ def format_status(status: dict) -> str:
     if hs:
         lines.append(f"- human_state: attention={hs.get('attention')} confidence={hs.get('confidence')} "
                      f"fatigue={hs.get('fatigue')} familiarity={hs.get('familiarity')} actions={hs.get('actions')}")
+    # `class_distribution` is the dashboard's observed total, normally day-scoped and
+    # persistent across runs.  It was previously printed without a scope, which made a
+    # historical ``Priest×1`` beside the latest run's ``Hunter×1`` read like one run had
+    # stopped on Hunter.  Controller status now supplies the run-local tally separately;
+    # retain a cautious label for older callers that do not yet supply the scope metadata.
+    run_dist_present = "run_class_distribution" in status
+    run_dist = g("run_class_distribution") or {}
+    if run_dist_present:
+        lines.append("- class_distribution (this run): " +
+                     (", ".join(f"{k}×{v}" for k, v in run_dist.items()) if run_dist else "none yet"))
     dist = g("class_distribution") or {}
-    if dist:
-        lines.append("- class_distribution: " + ", ".join(f"{k}×{v}" for k, v in dist.items()))
+    scope = g("class_distribution_scope")
+    if dist and not (scope == "run" and run_dist_present):
+        if scope == "day":
+            label = "observed class_distribution (today, across runs)"
+        elif scope == "run":
+            label = "class_distribution (this run)"
+        else:
+            label = "class_distribution (scope unspecified; may include earlier runs)"
+        lines.append(f"- {label}: " + ", ".join(f"{k}×{v}" for k, v in dist.items()))
+    if scope == "day" and run_dist_present:
+        lines.append("- distribution scope: the observed-today total is historical context; "
+                     "use the this-run line and latest journal to tell what this hunt decided.")
     tb = g("last_error_traceback")
     if tb:
         # The full traceback of the last crash, fenced so it renders as a code block
@@ -1421,6 +1791,28 @@ def _bounded_run(args: list[str], timeout: float, run) -> str | None:
     return "\n".join(p for p in parts if p.strip())
 
 
+def _adb_host_port(adb_address: str) -> tuple[str, str]:
+    """Extract an ADB host and optional numeric port without mangling IPv6.
+
+    Wireless ADB normally uses ``IPv4:port``.  Bracketed IPv6 is also unambiguous;
+    an unbracketed multi-colon value is deliberately rejected rather than reporting a
+    truncated pseudo-host in a diagnostic.
+    """
+    address = (adb_address or "").strip()
+    if not address:
+        return "", ""
+    bracketed = re.fullmatch(r"\[([^\]]+)\](?::(\d+))?", address)
+    if bracketed:
+        return bracketed.group(1), bracketed.group(2) or ""
+    if ":" not in address:
+        return address, ""
+    if address.count(":") == 1:
+        host, port = address.split(":", 1)
+        if host and port.isdigit():
+            return host, port
+    return "", ""
+
+
 def _host_diagnostics(adb_address: str = "", *, run=None, system=None) -> str:
     """macOS power / sleep / network facts, so a report can answer 'was it the Mac?' itself.
 
@@ -1492,9 +1884,29 @@ def _host_diagnostics(adb_address: str = "", *, run=None, system=None) -> str:
             lines.extend("    " + ln for ln in tail)
 
     # Is the phone reachable NOW? Distinguishes "still down" (network/phone) from "recovered"
-    # (a transient stall, or a Mac-side sleep that has since woken).
-    host = (adb_address or "").split(":", 1)[0].strip()
+    # (a transient stall, or a Mac-side sleep that has since woken).  Ping says whether a
+    # packet got a reply, but a fast ``Network is unreachable`` needs one earlier fact: did
+    # macOS even have a route for the configured phone IP?  A route through ``utun*`` also
+    # identifies a VPN/split-tunnel path without disclosing the user's SSID or host address.
+    host, configured_port = _adb_host_port(adb_address)
+    route_unreachable = False
     if host:
+        route = _bounded_run(["route", "-n", "get", host], 3, run)
+        if route:
+            route_l = route.lower()
+            route_unreachable = any(needle in route_l for needle in (
+                "network is unreachable", "no route to host", "not in table"))
+            if route_unreachable:
+                lines.append("- macOS route to phone: NO ROUTE (the configured IP is not "
+                             "reachable from this Mac right now -- check the phone's current "
+                             "Wi-Fi IP, LAN/VLAN reachability, or VPN/split-tunnel routing)")
+            else:
+                interface_m = re.search(r"^\s*interface:\s*(\S+)", route, re.MULTILINE)
+                if interface_m:
+                    interface = interface_m.group(1)
+                    note = (" (VPN tunnel -- verify its local-LAN/split-tunnel route)"
+                            if interface.startswith("utun") else "")
+                    lines.append(f"- macOS route to phone: via {interface}{note}")
         ping = _bounded_run(["ping", "-c", "1", "-t", "2", host], 4, run)
         if ping is not None:
             reachable = "1 packets received" in ping or "1 received" in ping or " 0.0% packet loss" in ping
@@ -1523,15 +1935,47 @@ def _host_diagnostics(adb_address: str = "", *, run=None, system=None) -> str:
         if adb_bin and (state or "").strip() != "device":
             devices = _bounded_run([adb_bin, "devices", "-l"], 4, run)
             if devices is not None:
-                from .adb import parse_usb_serials
+                from .adb import parse_usb_serials, parse_wlan_ipv4
                 usb = parse_usb_serials(devices)
-                if usb:
-                    lines.append(f"- USB-attached device detected right now: {usb[0]} -- hop "
-                                 "will re-pin the wireless listener automatically on its next "
-                                 f"connect attempt, or run `{adb_bin} -s {usb[0]} tcpip 5555` "
-                                 "yourself right now (this is the actual fix for a refused "
-                                 "wireless connect; Android's 'Wireless debugging' toggle does "
-                                 "not do this)")
+                # More than one USB phone is ambiguous: never pick one (or expose its IP) by
+                # accident.  ``Adb._rescue_via_usb`` follows the same sole-device rule.
+                if len(usb) == 1:
+                    serial = usb[0]
+                    wlan = _bounded_run(
+                        [adb_bin, "-s", serial, "shell", "ip", "-f", "inet",
+                         "addr", "show", "dev", "wlan0"],
+                        4, run)
+                    phone_ip = parse_wlan_ipv4(wlan or "")
+                    if phone_ip:
+                        if phone_ip == host:
+                            lines.append(f"- USB phone Wi-Fi IPv4: {phone_ip} (matches the "
+                                         "configured device.adb_address host; the address is "
+                                         "current, so investigate routing or the ADB listener)")
+                        else:
+                            endpoint = f"{phone_ip}:{configured_port or '5555'}"
+                            lines.append(f"- USB phone Wi-Fi IPv4: {phone_ip} (DIFFERS from "
+                                         f"configured host {host}; device.adb_address is stale -- "
+                                         f"update it to `{endpoint}`)")
+                    elif wlan:
+                        # ``parse_wlan_ipv4`` deliberately declines ambiguous/non-routable
+                        # results.  Say the probe happened without exposing raw shell output.
+                        lines.append("- USB phone Wi-Fi IPv4: unavailable or ambiguous (not "
+                                     "guessed or included in this report)")
+                    if route_unreachable:
+                        lines.append(f"- USB-attached device detected right now: {serial} -- a "
+                                     "USB connection can keep this session running, but `adb tcpip` "
+                                     "cannot fix the NO ROUTE result above; restore network "
+                                     "reachability or update device.adb_address first")
+                    else:
+                        lines.append(f"- USB-attached device detected right now: {serial} -- hop "
+                                     "will re-pin the wireless listener automatically on its next "
+                                     f"connect attempt, or run `{adb_bin} -s {serial} tcpip 5555` "
+                                     "yourself right now (this is the actual fix for a refused "
+                                     "wireless connect; Android's 'Wireless debugging' toggle does "
+                                     "not do this)")
+                elif len(usb) > 1:
+                    lines.append("- USB-attached devices: more than one authorized phone is "
+                                 "present, so hop will not guess which one to inspect or rescue")
 
     return "\n".join(lines)
 
@@ -1603,9 +2047,9 @@ def collect(description: str, paths: ReportPaths, *, version: str,
     module importing the transport, and so tests can run without a phone.
     ``status_probe`` is an optional callable returning a live engine-status string (see
     :func:`format_status`); the dashboard supplies it since it holds the controller.
-    ``ocr_probe(unknowns_dir, names) -> {name: text}`` reads the banner text off the newest
-    unrecognised-screen frames (defaults to :func:`_ocr_unknown_frames`); injectable so
-    tests need no tesseract and no real PNGs.
+    ``ocr_probe(directory, names) -> {name: text}`` reads text off saved evidence frames
+    (defaults to :func:`_ocr_unknown_frames`); injectable so tests need no tesseract and no
+    real PNGs. It handles both unknown-screen captures and the terminal named-screen capture.
     """
     if ocr_probe is None:
         ocr_probe = _ocr_unknown_frames
@@ -1648,12 +2092,32 @@ def collect(description: str, paths: ReportPaths, *, version: str,
         host = f"(host diagnostics failed: {e})"
     sections.append(Section("Host power / sleep / network (macOS)", host))
 
+    # A day-scoped dashboard total can legitimately contain a prior target while the newest
+    # journal contains a later reject.  Put the retained per-run timeline before the detailed
+    # latest summary so that provenance is explicit instead of inferred from mixed scopes.
+    recent_runs = summarize_recent_runs(paths.runs_root)
+    if recent_runs:
+        sections.append(Section("Recent run outcomes (run-scoped; newest is current)", recent_runs))
+
     run_dir = latest_run_dir(paths.runs_root)
     if run_dir is not None:
         journal_text = _read(run_dir / "journal.jsonl")
         if journal_text:
             summary = summarize_journal(journal_text)
             sections.append(Section(f"Latest run summary ({run_dir.name})", summary))
+            terminal_frame = terminal_evidence_frame(journal_text)
+            if terminal_frame and (run_dir / terminal_frame).is_file():
+                try:
+                    ocr = ocr_probe(run_dir, [terminal_frame]) or {}
+                except Exception:
+                    ocr = {}
+                text = ocr.get(terminal_frame)
+                evidence = (f"- {terminal_frame} (the final screen recorded at the halt)"
+                            + (f'\n    reads: "{text}"' if text else ""))
+                sections.append(Section(
+                    "Terminal screen evidence",
+                    "The final screen was positively classified but did not clear. Its saved "
+                    "frame is OCR'd here so a hidden overlay is visible in the report:\n\n" + evidence))
             sections.append(Section("Latest run journal (tail)",
                                     tail(journal_text, journal_tail_lines), fenced=True, lang="json"))
 

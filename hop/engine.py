@@ -89,6 +89,65 @@ def _phase_label(state) -> str:
 _CAPTURE_RETRY_BACKOFF_S = 1.0
 
 
+# Only keep the small, causal subset of a transport's diagnostic snapshot in the
+# per-run journal.  A backend owns live subprocesses and could expose arbitrary
+# objects or a very large stderr buffer; the journal must stay cheap and safe to
+# paste into a bug report.  These fields are enough to answer the important
+# question when a persistent ``adb shell hid -`` writer dies: did an ADB reconnect
+# advance the connection epoch, did the writer re-register against that epoch, and
+# if not, what did its child process say before the pipe closed?
+_TRANSPORT_STATUS_FIELDS = (
+    "kind", "opened", "pid", "returncode",
+    "connection_generation", "stream_generation", "reopen_count",
+    "last_reopen_reason", "last_reopen_ok",
+    "last_command", "last_write_at", "stderr_tail", "failure",
+)
+_TRANSPORT_STATUS_TEXT_LIMIT = 800
+
+
+def _transport_snapshot(backend) -> dict:
+    """Return a bounded, JSON-safe transport diagnostic snapshot.
+
+    Backends deliberately do not have to implement ``transport_status``: this
+    observability layer is additive, so existing test fakes and the ADB-input
+    fallback retain their minimal interface.  A status probe is diagnostic only;
+    it must never turn a recoverable transport failure into a logging failure.
+    """
+    probe = getattr(backend, "transport_status", None)
+    if not callable(probe):
+        return {}
+    try:
+        raw = probe()
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in _TRANSPORT_STATUS_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, str):
+            out[key] = value[-_TRANSPORT_STATUS_TEXT_LIMIT:]
+        elif value is None or isinstance(value, (bool, int, float)):
+            out[key] = value
+    return out
+
+
+def _transport_stream_reopened(before: dict, after: dict) -> bool:
+    """Whether a successful emit replaced a persistent transport stream.
+
+    ``reopen_count`` is the explicit modern signal; comparing the stream epoch
+    also supports a backend that has the generation contract but not a counter.
+    Require a value in *both* snapshots so the initial tap on an older backend
+    never looks like a recovery event.
+    """
+    for key in ("reopen_count", "stream_generation"):
+        if key in before and key in after and before[key] != after[key]:
+            return True
+    return False
+
+
 @dataclass
 class RunStats:
     games: int = 0
@@ -248,6 +307,14 @@ class Engine:
     def request_stop(self) -> None:
         self._stop = True
 
+    def transport_status(self) -> dict:
+        """Bounded backend diagnostics for an in-process status/report snapshot.
+
+        Kept on the engine rather than teaching the controller about every backend,
+        and deliberately returns an empty mapping for legacy/degraded transports.
+        """
+        return _transport_snapshot(self.backend)
+
     def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep, but honour a stop request within ~one slice rather than after the
         full delay. A single hunt iteration can wait through a 12 s requeue delay or a
@@ -365,10 +432,73 @@ class Engine:
         self.sleep(_CAPTURE_RETRY_BACKOFF_S)
         recover = getattr(self.adb, "reconnect", None)
         if recover is not None:
+            # A reconnect replaces ADB's transport underneath any resident ``adb shell``
+            # child. Record both epochs and the UHID stream snapshot before it happens, so a
+            # later BrokenPipe is mechanically attributable to this transition rather than
+            # inferred from timestamps in a truncated journal.
+            before_generation = getattr(self.adb, "connection_generation", None)
+            before_transport = _transport_snapshot(self.backend)
             try:
                 recover()
-            except Exception:
-                pass
+            except Exception as e:
+                self._record_transport_event(
+                    "capture_link_reconnect", outcome="failed",
+                    adb_generation_before=before_generation,
+                    adb_generation_after=getattr(self.adb, "connection_generation", None),
+                    transport_before=before_transport,
+                    transport_after=_transport_snapshot(self.backend),
+                    error=f"{type(e).__name__}: {e}"[:_TRANSPORT_STATUS_TEXT_LIMIT],
+                )
+            else:
+                self._record_transport_event(
+                    "capture_link_reconnect", outcome="succeeded",
+                    adb_generation_before=before_generation,
+                    adb_generation_after=getattr(self.adb, "connection_generation", None),
+                    transport_before=before_transport,
+                    transport_after=_transport_snapshot(self.backend),
+                )
+
+    def _record_transport_event(self, kind: str, **detail) -> None:
+        """Best-effort journal record for transport lifecycle evidence.
+
+        A disk/serialization fault while trying to explain a transport problem must
+        never replace the real failure. ``DebugLog`` normally handles all values
+        here, but this boundary intentionally makes the instrumentation inert when
+        a third-party debug sink is unhealthy.
+        """
+        if self.debug is None:
+            return
+        try:
+            self.debug.record(kind, **detail)
+        except Exception:
+            pass
+
+    def _emit_gesture(self, gesture: Gesture, *, what: str) -> None:
+        """Emit one gesture and preserve persistent-transport lifecycle evidence.
+
+        The reporter needs this *before* :meth:`run` unwinds into ``backend.close()``,
+        which necessarily tears down the child process and would otherwise erase its
+        exit status/stderr. The wrapper changes no recovery or input behaviour: it
+        only snapshots optional diagnostics around the existing emit call and reraises
+        the original exception unchanged.
+        """
+        before = _transport_snapshot(self.backend)
+        try:
+            self.backend.emit(gesture)
+        except Exception as e:
+            after = _transport_snapshot(self.backend)
+            self._record_transport_event(
+                "transport_failure", operation="emit", what=what or "?",
+                error=f"{type(e).__name__}: {e}"[:_TRANSPORT_STATUS_TEXT_LIMIT],
+                transport=after or before,
+            )
+            raise
+        after = _transport_snapshot(self.backend)
+        if _transport_stream_reopened(before, after):
+            self._record_transport_event(
+                "transport_stream_reopened", what=what or "?",
+                transport_before=before, transport_after=after,
+            )
 
     def _tap(
         self,
@@ -423,7 +553,7 @@ class Engine:
             self.debug.record("tap", what=what or "?", point=(round(tx), round(ty)),
                               expected=expected_change or "any",
                               scoped=verify_region is not None)
-        self.backend.emit(gesture)
+        self._emit_gesture(gesture, what=what)
         self.limiter.register_action(committing)
         self.limiter.remember_trajectory(gesture)
 
@@ -468,7 +598,7 @@ class Engine:
             # old code registered it but never remembered it).
             before2 = self._capture()
             g2 = self._synth_non_repeating_tap(tx, ty, radius)
-            self.backend.emit(g2)
+            self._emit_gesture(g2, what=what)
             self.limiter.register_action(committing)
             self.limiter.remember_trajectory(g2)
             self._sleep_for(timing.human_delay(self.rng, 0.6, self.cfg.timing),
@@ -960,7 +1090,7 @@ class Engine:
         elif st == ScreenState.MULLIGAN:
             self._handle_mulligan(frame)
         elif st in (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
-                    ScreenState.QUEST_POPUP):
+                    ScreenState.RANK_PROGRESS, ScreenState.QUEST_POPUP):
             self._clear_end_screens()
         elif st == ScreenState.CONCEDE_MENU:
             # commit, not reject: the decision to concede was already made; tapping the
@@ -1719,14 +1849,87 @@ class Engine:
 
     #: Screens ``_clear_end_screens`` is allowed to tap ``end_dismiss`` on. The tap is
     #: a fixed point, so the set of screens it may land on has to be closed and named.
-    END_SCREENS = (ScreenState.VICTORY, ScreenState.DEFEAT,
-                   ScreenState.REWARDS, ScreenState.QUEST_POPUP)
+    END_SCREENS = (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
+                   ScreenState.RANK_PROGRESS, ScreenState.QUEST_POPUP)
     #: Screens that mean "the post-game stack is cleared". DECK_SELECT belongs here:
     #: Hearthstone drops back to the deck LIST after a game, and dispatch knows how to
     #: reopen the deck from there. Leaving it out is what let the loop tap end_dismiss
     #: on the deck list - i.e. on "My Collection" and the deck boxes.
     HOME_SCREENS = (ScreenState.PLAY_SCREEN, ScreenState.QUEUE,
                     ScreenState.MENU, ScreenState.DECK_SELECT)
+
+    def _dismiss_end_screen(self, state: ScreenState, *, end_scope, max_attempts: int) -> int:
+        """Dismiss one positively identified end screen, returning taps sent.
+
+        ``end_dismiss`` is unusually hazardous as a generic retry target: its fixed point
+        overlaps the mulligan's Confirm control and reaches controls on other screens.  A
+        dropped tap is nevertheless recoverable -- unlike a slow transition it leaves every
+        post-tap look literally static and :meth:`_tap` raises :attr:`Halt.NO_CHANGE`.
+
+        The recovery is therefore deliberately two-stage:
+
+        * re-classify after that specific failure; and
+        * re-send the exact same point only if the *same named* end screen is positively
+          still present.
+
+        A different named screen means the old tap may have landed late, so the caller returns
+        to its closed-loop state machine.  UNKNOWN or an unlisted screen is never evidence for
+        a retry and fails closed.  ``max_attempts`` is already clipped to the enclosing stack's
+        total-tap cap, so even a succession of dropped screens cannot create extra actions.
+        """
+        attempts = max(1, min(self.cfg.vision.end_dismiss_tap_attempts, max_attempts))
+        taps_sent = 0
+        for attempt in range(attempts):
+            try:
+                self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
+                          expected_change="full_transition", allow_correction=False,
+                          what="end_dismiss")
+            except Halt as e:
+                # A changed-but-wrong screen, an incoherent gesture, a rotated display, etc.
+                # is NOT a dropped input.  Propagate it rather than turning it into another
+                # tap at a coordinate whose target we no longer know.
+                if e.kind != Halt.NO_CHANGE:
+                    raise
+                taps_sent += 1
+
+                # `_tap` has already spent its full motion-look budget.  Before considering a
+                # retap, take a fresh, scoped look: it is the proof that makes a retap safe.
+                cls, frame = self._classify_settled(end_scope)
+                if cls.state != state:
+                    if cls.state == ScreenState.UNKNOWN:
+                        self._record_unknown(frame, where="end_dismiss",
+                                             confidence=round(cls.confidence, 3),
+                                             waiting_to_leave=state.value)
+                        raise Halt(
+                            f"end-screen dismiss on {state.value!r} saw an unknown screen "
+                            "after no pixel change; refusing to blind-retap end_dismiss")
+                    if cls.state not in end_scope:
+                        raise Halt(
+                            f"unexpected screen {cls.state.value!r} after end_dismiss; "
+                            "refusing to blind-tap end_dismiss there")
+                    # A positive, different in-scope state is a late transition (or at least
+                    # a state we can safely route on the next outer-loop iteration), not proof
+                    # that the original end screen is still under this coordinate.
+                    return taps_sent
+
+                if attempt + 1 == attempts:
+                    break
+                if self.debug:
+                    self.debug.record("end_dismiss_tap_ignored", screen=state.value,
+                                      attempt=attempt + 1, of=attempts)
+                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
+                                "end_dismiss_retry", screen=state.value,
+                                attempt=attempt + 1)
+            else:
+                return taps_sent + 1
+
+        # We re-observed the exact same named end screen after every failed tap.  This is the
+        # same evidence as the bounded Play/Confirm retries, but scoped to a coordinate that is
+        # safe only on this screen -- make the diagnosis explicit for the run report.
+        raise Halt(
+            f"end-screen dismiss on {state.value!r} did not advance after {taps_sent} tap(s); "
+            "the screen is still up, so the tap is not registering (a dropped committing tap, "
+            "not a wrong coordinate). Only end_dismiss's own coordinate was ever tapped.")
 
     def _clear_end_screens(self, max_taps: int = 8) -> None:
         """Tap through victory/defeat/rewards/quest popups until back at a home screen.
@@ -1773,6 +1976,20 @@ class Engine:
                 # housing that anchors IN_GAME is still drawn while the Defeat
                 # banner is not yet. Wait it out; do not tap the dissolving board.
                 if waits >= max_waits:
+                    if self.debug and hasattr(self.debug, "terminal_screen"):
+                        context = {"state": cls.state.value,
+                                   "confidence": round(cls.confidence, 3),
+                                   "waits": waits}
+                        if hasattr(self.classifier, "rank"):
+                            try:
+                                context["near_misses"] = [
+                                    {"state": st.value, "score": round(sc, 3), "thr": th}
+                                    for st, sc, th in self.classifier.rank(frame)[:6]
+                                ]
+                            except Exception:
+                                pass
+                        self.debug.terminal_screen(
+                            "board never finished dissolving after the concede", frame, **context)
                     raise Halt("board never finished dissolving after the concede")
                 waits += 1
                 self._sleep_for(timing.human_delay(self.rng, 1.2, self.cfg.timing),
@@ -1783,9 +2000,11 @@ class Engine:
                            f"screens; refusing to blind-tap end_dismiss there")
             if taps >= max_taps:
                 raise Halt(f"end screens did not clear after {taps} dismiss taps")
-            self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
-                      expected_change="full_transition", allow_correction=False, what="end_dismiss")
-            taps += 1
+            # Count physical gestures (including a dropped retry) against the post-game stack's
+            # hard cap.  `_dismiss_end_screen` may return after a late, positively identified
+            # transition; the next loop iteration always classifies before deciding what to do.
+            taps += self._dismiss_end_screen(cls.state, end_scope=end_scope,
+                                              max_attempts=max_taps - taps)
 
     # ── alerts ───────────────────────────────────────────────────────────────
 

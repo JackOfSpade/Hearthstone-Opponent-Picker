@@ -295,6 +295,13 @@ mulligan_card_tap_attempts = 3
 # full screen_wait budget first, so a slow-but-honoured concede never retaps. 1 = the old
 # single-tap-then-halt (which failed the whole hunt closed on one dropped committing tap).
 concede_tap_attempts = 3
+# A post-game end screen's central dismiss button can be dropped too. Unlike the Game Menu,
+# these screens are static, so a drop produces literally zero pixel change and `_tap` raises
+# NO_CHANGE. Re-look first, then re-tap ONLY when the SAME named end screen is still positively
+# up -- the fixed point overlaps the mulligan Confirm and is unsafe on reconnect/deck screens.
+# This is a per-screen retry budget; `_clear_end_screens` still has its own hard total cap for
+# the whole victory/rewards/quest stack. 1 = old single-tap-then-halt behaviour.
+end_dismiss_tap_attempts = 3
 # After we tap Confirm, the wait for the mulligan to LEAVE has to cover the OPPONENT
 # finishing their own mulligan too -- not just our board drawing in. While they choose,
 # this client replaces the "Starting Hand" banner (our mulligan anchor) with an

@@ -115,6 +115,18 @@ def test_diagnose_last_error_names_a_non_screencap_adb_timeout():
     assert "screencap over wireless" not in why.lower()             # not the first branch
 
 
+def test_diagnose_last_error_names_a_network_route_failure():
+    """ENETUNREACH happens before adbd can answer.  It must not receive the otherwise
+    tempting (but useless) dead-listener/tcpip diagnosis."""
+    why = br._diagnose_last_error(
+        "AdbError: could not connect to 192.168.99.139:5555: failed to connect to "
+        "'192.168.99.139:5555': Network is unreachable")
+    assert why
+    assert "network-path" in why.lower()
+    assert "never reached the phone or adbd" in why.lower()
+    assert "route" in why.lower() and "wi-fi ipv4" in why.lower()
+
+
 def test_diagnose_last_error_names_a_refused_connect():
     """A REFUSED `adb connect` (adbd not listening on the wireless port) is a distinct failure
     from the timeout branches above: it strikes BEFORE the hunt starts and no retry fixes it."""
@@ -151,6 +163,97 @@ def test_host_diagnostics_names_a_usb_fix_command_when_wireless_is_refused():
     assert "tcpip 5555" in out
 
 
+def test_host_diagnostics_proves_a_stale_wireless_ip_from_the_sole_usb_phone():
+    """The report needs the phone's current Wi-Fi IPv4, rather than merely a USB serial:
+    that makes stale config decisive.  It must retain only the IPv4, not Android's MAC or
+    any other raw shell output."""
+    wlan_calls = []
+
+    def wlan_probe(args):
+        if "wlan0" not in args:
+            return False
+        wlan_calls.append(args)
+        return True
+
+    rules = [
+        (lambda a: a[:3] == ["route", "-n", "get"],
+         _Proc(stderr=b"route: writing to routing socket: Network is unreachable\n")),
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"1 packets transmitted, 0 packets received, 100.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device not found\n")),
+        (lambda a: "devices" in a,
+         _Proc(b"List of devices attached\nR58N70ABCDE device usb:1-1\n")),
+        (wlan_probe,
+         _Proc(b"3: wlan0: <BROADCAST,MULTICAST,UP> mtu 1500\n"
+               b"    link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff\n"
+               b"    inet 192.168.99.201/24 brd 192.168.99.255 scope global wlan0\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555",
+                                 run=_router(rules), system=lambda: "Darwin")
+    assert "macOS route to phone: NO ROUTE" in out
+    assert "USB phone Wi-Fi IPv4: 192.168.99.201" in out
+    assert "DIFFERS from configured host 192.168.99.139" in out
+    assert "update it to `192.168.99.201:5555`" in out
+    assert "aa:bb:cc:dd:ee:ff" not in out       # never leak a MAC from the shell output
+    assert wlan_calls[0][-8:] == ["shell", "ip", "-f", "inet", "addr", "show", "dev", "wlan0"]
+
+
+def test_host_diagnostics_confirms_current_ip_and_vpn_route():
+    """When the USB phone confirms the configured address, the report should point at the
+    route (including a split-tunnel interface) instead of incorrectly suggesting config drift."""
+    rules = [
+        (lambda a: a[:3] == ["route", "-n", "get"],
+         _Proc(b"route to: 192.168.99.139\n  interface: utun4\n")),
+        (lambda a: a and a[0] == "ping",
+         _Proc(b"1 packets transmitted, 0 packets received, 100.0% packet loss\n")),
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device not found\n")),
+        (lambda a: "devices" in a,
+         _Proc(b"List of devices attached\nR58N70ABCDE device usb:1-1\n")),
+        (lambda a: "wlan0" in a,
+         _Proc(b"3: wlan0: <UP>\n    inet 192.168.99.139/24 scope global wlan0\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555",
+                                 run=_router(rules), system=lambda: "Darwin")
+    assert "macOS route to phone: via utun4" in out
+    assert "VPN tunnel" in out
+    assert "matches the configured device.adb_address host" in out
+    assert "is stale" not in out
+
+
+def test_host_diagnostics_does_not_guess_or_leak_an_ambiguous_usb_wifi_ip():
+    rules = [
+        (lambda a: "get-state" in a, _Proc(stderr=b"error: device not found\n")),
+        (lambda a: "devices" in a,
+         _Proc(b"List of devices attached\nR58N70ABCDE device usb:1-1\n")),
+        (lambda a: "wlan0" in a,
+         _Proc(b"3: wlan0: <UP>\n"
+               b"    inet 192.168.1.41/24 scope global wlan0\n"
+               b"    inet 192.168.1.42/24 scope global secondary wlan0\n")),
+    ]
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555",
+                                 run=_router(rules), system=lambda: "Darwin")
+    assert "Wi-Fi IPv4: unavailable or ambiguous" in out
+    assert "192.168.1.41" not in out and "192.168.1.42" not in out
+
+
+def test_host_diagnostics_does_not_guess_between_multiple_usb_phones():
+    """Only the sole authorized USB phone can be safely inspected or used for recovery."""
+    seen_shell = []
+
+    def run(args, capture_output=True, timeout=None):
+        if "get-state" in args:
+            return _Proc(stderr=b"error: device not found\n")
+        if "devices" in args:
+            return _Proc(b"List of devices attached\nA device usb:1-1\nB device usb:1-2\n")
+        if "shell" in args:
+            seen_shell.append(args)
+        raise FileNotFoundError(" ".join(args))
+
+    out = _REAL_HOST_DIAGNOSTICS("192.168.99.139:5555", run=run, system=lambda: "Darwin")
+    assert "more than one authorized phone" in out
+    assert not seen_shell
+
+
 def test_host_diagnostics_skips_usb_probe_when_wireless_already_connected():
     """No fix needed (and no noise) when the wireless link is fine."""
     rules = [
@@ -172,6 +275,12 @@ def test_host_diagnostics_survives_missing_tools():
     # every command raises (tools absent) -> no lines, never an exception
     out = _REAL_HOST_DIAGNOSTICS("1.2.3.4:5555", run=_router([]), system=lambda: "Darwin")
     assert out == ""
+
+
+def test_adb_host_port_does_not_mangle_ipv6():
+    assert br._adb_host_port("192.168.8.42:5555") == ("192.168.8.42", "5555")
+    assert br._adb_host_port("[fe80::1]:5555") == ("fe80::1", "5555")
+    assert br._adb_host_port("fe80::1") == ("", "")
 
 
 def test_the_self_improve_prompt_is_first_and_present():
@@ -439,6 +548,40 @@ def test_summarize_journal_surfaces_capture_retries():
     assert "capture retries: 1 screencap(s) stalled/failed" in s
     assert "20.0s hung total" in s
     assert "timed out after 20s" in s
+
+
+def test_summarize_journal_proves_a_stale_uhid_stream_after_capture_reconnect():
+    """The original report had the retry and a later BrokenPipe, but no causal bridge.
+    These lifecycle records must make the exact mechanism self-identifying: reconnect
+    advanced ADB's generation, the resident hid writer stayed on the old one, and the
+    next pass_turn write hit its dead pipe before a re-registration occurred."""
+    import json
+
+    events = [
+        {"kind": "capture_retry", "detail": {"attempt": 1, "of": 3, "ms": 11000,
+                                                "error": "screencap stalled"}},
+        {"kind": "capture_link_reconnect", "detail": {
+            "outcome": "succeeded", "adb_generation_before": 7, "adb_generation_after": 8,
+            "transport_before": {"kind": "uhid", "opened": True, "pid": 441,
+                                 "connection_generation": 7, "stream_generation": 7},
+            "transport_after": {"kind": "uhid", "opened": True, "pid": 441,
+                                "connection_generation": 8, "stream_generation": 7},
+        }},
+        {"kind": "tap", "detail": {"what": "pass_turn"}},
+        {"kind": "transport_failure", "detail": {
+            "operation": "emit", "what": "pass_turn",
+            "error": "BrokenPipeError: [Errno 32] Broken pipe",
+            "transport": {"kind": "uhid", "opened": True, "pid": 441, "returncode": 1,
+                          "connection_generation": 8, "stream_generation": 7,
+                          "last_command": "report", "stderr_tail": "hid: stream closed"},
+        }},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "capture-link reconnect" in s and "ADB generation 7→8" in s
+    assert "UHID stream generation 7; ADB generation 8 (STALE)" in s
+    assert "emit for 'pass_turn' raised BrokenPipeError" in s
+    assert "child exit 1" in s and "last stream command 'report'" in s
+    assert "did not re-register before this next write" in s
 
 
 def test_summarize_journal_surfaces_non_repetition_rejects_and_collapse():
@@ -825,9 +968,9 @@ def test_summarize_journal_genuine_stuck_yields_to_the_unknown_destination_false
 
 
 def test_summarize_journal_tallies_dropped_taps():
-    """A cluster of silently-ignored-then-re-sent taps (mulligan cards, concede, Play, and
-    now every other retrying tap site) is the wireless link dropping INPUT -- surfaced as
-    one count so it corroborates a dropped-commit."""
+    """A cluster of silently-ignored-then-re-sent taps (including end-screen dismiss) is
+    the wireless link dropping INPUT -- surfaced as one count so it corroborates a
+    dropped-commit."""
     import json
     events = [
         {"kind": "mulligan_card_tap_ignored", "detail": {"slot": 1, "attempt": 1, "of": 3}},
@@ -839,9 +982,10 @@ def test_summarize_journal_tallies_dropped_taps():
         {"kind": "deck_decline_tap_ignored", "detail": {"attempt": 1, "of": 3}},
         {"kind": "mulligan_confirm_tap_ignored", "detail": {"attempt": 1, "of": 2}},
         {"kind": "reconnect_tap_ignored", "detail": {"attempt": 1}},
+        {"kind": "end_dismiss_tap_ignored", "detail": {"attempt": 1, "of": 3}},
     ]
     s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
-    assert "dropped taps re-sent: 9" in s
+    assert "dropped taps re-sent: 10" in s
 
 
 def test_diagnose_dropped_committing_tap_halt_covers_the_newest_retry_sites():
@@ -1097,6 +1241,48 @@ def test_collect_bundles_config_journal_log_and_unknowns(tmp_path):
     assert "unknown_x_dispatch.png" in md                 # unknowns listed
 
 
+def test_recent_run_outcomes_separate_a_prior_target_from_a_latest_reject(tmp_path):
+    """The exact provenance that was missing from the Hunter report: Priest was a
+    prior successful run, while the newest Priest-configured run correctly rejected
+    Hunter and only halted later while dismissing the post-concede screen."""
+    import json
+
+    prior = tmp_path / "runs" / "20261002-203445"
+    current = tmp_path / "runs" / "20261002-204119"
+    prior.mkdir(parents=True)
+    current.mkdir(parents=True)
+    prior_events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["PRIEST"],
+                                             "avoid_classes": [], "require_second": False}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Priest", "cards": 4,
+                                                  "second": True}},
+        {"kind": "target_found", "detail": {"opponent": "Priest", "second": True}},
+    ]
+    current_events = [
+        {"kind": "run_criteria", "detail": {"target_classes": ["PRIEST"],
+                                             "avoid_classes": [], "require_second": False}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Hunter", "cards": 3,
+                                                  "second": False}},
+        {"kind": "reject_plan", "detail": {"concede_point": "turn2"}},
+        {"kind": "tap", "detail": {"what": "end_dismiss"}},
+        {"kind": "halt", "detail": {"message": "HALTED: no screen change after action"}},
+    ]
+    prior.joinpath("journal.jsonl").write_text("\n".join(map(json.dumps, prior_events)))
+    current.joinpath("journal.jsonl").write_text("\n".join(map(json.dumps, current_events)))
+
+    timeline = br.summarize_recent_runs(tmp_path / "runs")
+    assert timeline.index("20261002-203445") < timeline.index("20261002-204119")
+    assert "TARGET FOUND Priest (going 2nd) — matched the recorded criteria" in timeline
+    assert "REJECTED Hunter (going 1st) correctly: opponent class not in the target list" in timeline
+    assert "terminal stop came later: HALTED: no screen change after action" in timeline
+    assert "20261002-204119 (latest; detailed below)" in timeline
+
+    md = br.collect("why did it stop at hunter?", _paths(tmp_path), version="2.0.0",
+                    clock=lambda: 0.0)
+    assert "## Recent run outcomes (run-scoped; newest is current)" in md
+    assert "TARGET FOUND Priest" in md and "REJECTED Hunter" in md
+
+
 def test_collect_includes_the_host_power_section(tmp_path):
     """The host power/sleep/network section is added from the config's adb_address with no
     extra call-site wiring, so both the CLI and the app path get it."""
@@ -1198,6 +1384,22 @@ def test_collect_ocrs_unknown_frames_and_shows_the_banner(tmp_path):
     assert 'reads: "Opponent Still Choosing..."' in md
 
 
+def test_collect_includes_the_terminal_named_screen_evidence(tmp_path):
+    paths = _paths(tmp_path)
+    run = paths.runs_root / "20261002-213115"
+    run.mkdir(parents=True)
+    (run / "journal.jsonl").write_text(
+        '{"kind":"anomaly","detail":{"index":6,"terminal":true,'
+        '"reason":"board never finished dissolving after the concede"}}\n')
+    (run / "anomaly_6_before.png").write_bytes(b"not-a-real-png")
+
+    md = br.collect("stuck", paths, version="1", clock=lambda: 0.0,
+                    ocr_probe=lambda directory, names: {names[0]: "Gold 3"})
+    assert "Terminal screen evidence" in md
+    assert "anomaly_6_before.png" in md
+    assert "Gold 3" in md
+
+
 def test_a_failing_ocr_probe_never_breaks_the_report(tmp_path):
     """OCR is diagnostic sugar; a broken engine drops the text, never the report or the
     filename list."""
@@ -1257,6 +1459,38 @@ def test_format_status_surfaces_running_actions_and_distribution():
     assert "running: True" in out
     assert "actions: 5" in out and "concedes: 1" in out
     assert "Mage×2" in out and "Rogue×1" in out
+
+
+def test_format_status_separates_this_run_from_the_day_tally():
+    """A cumulative dashboard chart must not make a historical target look like part of
+    the latest run.  The report needs both scopes side by side, with an explicit warning
+    that only the run-local line answers what this hunt decided."""
+    out = br.format_status({
+        "running": False, "uptime_s": 42,
+        "class_distribution": {"Priest": 1, "Hunter": 1},
+        "class_distribution_scope": "day",
+        "run_class_distribution": {"Hunter": 1},
+    })
+    assert "class_distribution (this run): Hunter×1" in out
+    assert "observed class_distribution (today, across runs): Priest×1, Hunter×1" in out
+    assert "historical context" in out
+
+
+def test_format_status_surfaces_surviving_uhid_process_diagnostics():
+    """The live status section is a fallback when a crash escapes before the journal
+    exists: retain the closed child process's generation, exit code, and stderr tail."""
+    out = br.format_status({
+        "running": False, "uptime_s": 42,
+        "last_error": "UhidTransportError: UHID stream write failed",
+        "transport_status": {
+            "kind": "uhid", "opened": False, "pid": 441, "returncode": 1,
+            "connection_generation": 8, "stream_generation": 7,
+            "last_command": "report", "stderr_tail": "hid: stream closed",
+        },
+    })
+    assert "input transport: uhid; closed; pid 441; child exit 1" in out
+    assert "UHID stream generation 7; ADB generation 8 (STALE)" in out
+    assert "last command 'report'" in out and "hid: stream closed" in out
 
 
 def test_format_status_names_a_target_found_stop_as_success_not_a_crash():

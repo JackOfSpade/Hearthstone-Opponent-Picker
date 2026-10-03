@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import time
 
+from ..adb import AdbError
 from ..config import UhidConfig
 from ..geometry import PanelGeometry
 from ..orientation import display_to_native
@@ -55,6 +56,17 @@ def _q(v: int) -> int:
     return int(v)
 
 
+class UhidTransportError(AdbError):
+    """A resident ``hid -`` stream was lost or could not be (re)registered.
+
+    It deliberately subclasses :class:`~hop.adb.AdbError`: losing this stream is
+    an ADB-transport failure, and the engine already knows how to stop cleanly
+    for that class of failure.  Crucially, callers must never replay the gesture
+    that encountered it: a write can fail after an earlier report in that gesture
+    reached the device.
+    """
+
+
 class UhidBackend(TouchBackend):
     fidelity = "full"
 
@@ -65,6 +77,28 @@ class UhidBackend(TouchBackend):
         self._proc = None        # long-lived `hid -` process; holds the device
         self._opened = False
         self._axes = hd.DEFAULT_AXES
+        # `adb disconnect` can kill this resident shell while one-shot ADB calls
+        # later recover.  We remember the ADB epoch at registration and renew the
+        # stream *before* the next gesture when it changes.
+        self._stream_generation: int | None = None
+        self._last_command: str | None = None
+        self._last_write_at: float | None = None
+        self._reopen_count = 0
+        self._last_reopen_reason: str | None = None
+        self._last_reopen_ok: bool | None = None
+        self._last_failure: str | None = None
+        # Keep terminal process facts after close() clears `_proc`: bug reports
+        # are often taken after Engine.run() has reached its finally block.
+        self._last_proc_status: dict[str, int | str | None] = {
+            "pid": None,
+            "returncode": None,
+            "stderr_tail": "",
+        }
+        # Retain the most recently closed process object for a later, nonblocking
+        # poll.  A BrokenPipe can arrive a few scheduler ticks before `poll()`
+        # observes the exit; retaining it lets a subsequent bug report collect the
+        # final return code/stderr even though the active stream was cleared.
+        self._last_proc = None
 
     # ── availability probe ───────────────────────────────────────────────────
 
@@ -108,22 +142,47 @@ class UhidBackend(TouchBackend):
             return
         self._panel = panel
         self._axes = self._detect_axes()
+        self._start_stream()
+
+    def _start_stream(self) -> None:
+        """Start and register one resident stream using the retained panel/axes.
+
+        This is used for the first open and for a known-safe recovery at the
+        *start* of a later gesture.  It intentionally never replays a gesture.
+        """
+        panel = self._panel
+        assert panel is not None
         # One persistent reader of a bare-object stream on stdin (no FIFO: see
         # module docstring for the SELinux rationale).
-        self._proc = self.adb.popen_shell("hid -")
+        try:
+            self._proc = self.adb.popen_shell("hid -")
+        except Exception as e:
+            self._record_failure("could not start UHID hid process", e)
+            raise UhidTransportError(f"could not start UHID hid process: {e}") from e
         self._opened = True
 
-        descriptor = hd.build_digitizer_descriptor(panel.width_px, panel.height_px,
-                                                   hd.MAX_CONTACTS, self._axes)
-        self._send({
-            "id": 1,
-            "command": "register",
-            "name": self.cfg.device_name,
-            "vid": _q(self.cfg.vendor_id),
-            "pid": _q(self.cfg.product_id),
-            "bus": self.cfg.bus,
-            "descriptor": descriptor,
-        })
+        try:
+            descriptor = hd.build_digitizer_descriptor(panel.width_px, panel.height_px,
+                                                       hd.MAX_CONTACTS, self._axes)
+            self._send({
+                "id": 1,
+                "command": "register",
+                "name": self.cfg.device_name,
+                "vid": _q(self.cfg.vendor_id),
+                "pid": _q(self.cfg.product_id),
+                "bus": self.cfg.bus,
+                "descriptor": descriptor,
+            })
+        except UhidTransportError:
+            # `_raw_write` has already separately closed a broken stdin, but
+            # keep this defensive cleanup for a failure while building/registering.
+            self._discard_stream()
+            raise
+        except Exception as e:
+            self._record_failure("could not register UHID digitizer", e)
+            self._discard_stream()
+            raise UhidTransportError(f"could not register UHID digitizer: {e}") from e
+        self._stream_generation = self._connection_generation()
         # Let the framework enumerate the new InputDevice before the first
         # gesture, so early reports aren't dropped before dispatch is wired up.
         if self.cfg.register_settle_ms > 0:
@@ -131,7 +190,15 @@ class UhidBackend(TouchBackend):
 
     def emit(self, gesture: Gesture) -> None:
         if not self._opened:
+            if self._last_failure:
+                raise UhidTransportError(f"UHID stream is unavailable: {self._last_failure}")
             raise RuntimeError("UhidBackend.emit before open()")
+        # A stream re-register is safe only here, before any report from this
+        # gesture has been sent.  A changed ADB epoch means `adb disconnect` or
+        # a new endpoint may have severed the old shell.  An exited local process
+        # is the same safe-before-gesture case.  A write error below is different:
+        # it may be mid-gesture, so it is converted to a typed failure, never retried.
+        self._renew_stream_before_gesture()
         panel = self._panel
         assert panel is not None
         # Gestures are synthesized in DISPLAY space; the panel is native. Rotate
@@ -160,21 +227,155 @@ class UhidBackend(TouchBackend):
                 active.pop(s.pointer_id, None)
 
     def close(self) -> None:
-        if not self._opened:
+        self._discard_stream()
+
+    # ── persistent-stream lifecycle / diagnostics ─────────────────────────
+
+    def _connection_generation(self) -> int | None:
+        """Current ADB persistent-stream epoch, if the handle exposes one.
+
+        Tiny fake ADBs and third-party callers can predate this contract; ``None``
+        preserves their existing behavior while production :class:`Adb` supplies
+        an integer that advances around disconnect/reconnect.
+        """
+        try:
+            generation = getattr(self.adb, "connection_generation", None)
+            return None if generation is None else int(generation)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _poll(proc) -> int | None:
+        try:
+            value = proc.poll()
+            return None if value is None else int(value)
+        except Exception:
+            return None
+
+    def _read_stderr_tail(self, proc, returncode: int | None) -> str:
+        """Read stderr only after exit, when EOF makes it non-blocking."""
+        if returncode is None:
+            return ""
+        stream = getattr(proc, "stderr", None)
+        if stream is None:
+            return ""
+        try:
+            data = stream.read()
+        except Exception:
+            return ""
+        if isinstance(data, bytes):
+            data = data.decode(errors="replace")
+        return str(data)[-1200:]
+
+    def _snapshot_proc(self, proc) -> dict[str, int | str | None]:
+        if proc is None:
+            return dict(self._last_proc_status)
+        returncode = self._poll(proc)
+        status: dict[str, int | str | None] = {
+            "pid": getattr(proc, "pid", None),
+            "returncode": returncode,
+            "stderr_tail": self._read_stderr_tail(proc, returncode),
+        }
+        # A fake/process wrapper could expose an unusual pid; retain only JSON-safe
+        # primitives so status collection can never itself cause a dashboard crash.
+        status["pid"] = status["pid"] if isinstance(status["pid"], int) else None
+        return status
+
+    def _remember_proc(self, proc) -> None:
+        if proc is None:
             return
-        try:
-            if self._proc is not None and self._proc.stdin:
-                self._proc.stdin.flush()
-                self._proc.stdin.close()   # EOF -> hid exits -> device destroyed
-        except Exception:
-            pass
-        try:
-            if self._proc is not None:
-                self._proc.terminate()
-        except Exception:
-            pass
+        status = self._snapshot_proc(proc)
+        # Preserve a previously captured stderr tail when a later poll occurs after
+        # its pipe has already been consumed.
+        if not status["stderr_tail"]:
+            status["stderr_tail"] = self._last_proc_status.get("stderr_tail", "")
+        self._last_proc_status = status
+
+    def transport_status(self) -> dict[str, int | float | str | bool | None]:
+        """A serializable snapshot for controller/bug-report telemetry.
+
+        It does not probe the device or block on a live process.  The stderr tail is
+        read only once a process has exited, and remains available after ``close()``.
+        """
+        status = self._snapshot_proc(self._proc if self._proc is not None else self._last_proc)
+        if not status["stderr_tail"]:
+            status["stderr_tail"] = self._last_proc_status.get("stderr_tail", "")
+        return {
+            "kind": "uhid",
+            "opened": self._opened,
+            "pid": status["pid"],
+            "returncode": status["returncode"],
+            "last_command": self._last_command,
+            "last_write_at": self._last_write_at,
+            "stderr_tail": status["stderr_tail"],
+            "failure": self._last_failure,
+            "connection_generation": self._connection_generation(),
+            "stream_generation": self._stream_generation,
+            "reopen_count": self._reopen_count,
+            "last_reopen_reason": self._last_reopen_reason,
+            "last_reopen_ok": self._last_reopen_ok,
+        }
+
+    def _record_failure(self, context: str, exc: Exception | None = None) -> None:
+        detail = f"{type(exc).__name__}: {exc}" if exc is not None else ""
+        self._last_failure = f"{context}{(': ' + detail) if detail else ''}"
+        self._remember_proc(self._proc)
+
+    def _discard_stream(self) -> None:
+        """Best-effort teardown which closes stdin even when ``flush`` broke.
+
+        A BufferedWriter whose flush saw EPIPE remains open; its later finalizer
+        otherwise emits a noisy delayed BrokenPipe warning.  Keep flush and close
+        in independent tries so close still marks that writer closed.
+        """
+        proc = self._proc
+        if proc is not None:
+            stdin = getattr(proc, "stdin", None)
+            if stdin is not None:
+                try:
+                    stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    stdin.close()  # EOF -> hid exits -> device is destroyed
+                except Exception:
+                    pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._remember_proc(proc)
+            self._last_proc = proc
         self._opened = False
         self._proc = None
+        self._stream_generation = None
+
+    def _reopen_stream(self, reason: str) -> None:
+        """Renew the digitizer at a safe gesture boundary, preserving panel/axes."""
+        self._reopen_count += 1
+        self._last_reopen_reason = reason
+        self._last_reopen_ok = False
+        self._discard_stream()
+        try:
+            self._start_stream()
+        except UhidTransportError:
+            # `_start_stream` retained the failure/process facts for telemetry.
+            raise
+        self._last_reopen_ok = True
+
+    def _renew_stream_before_gesture(self) -> None:
+        proc = self._proc
+        if proc is None:
+            raise UhidTransportError("UHID stream disappeared before a gesture")
+        connection_generation = self._connection_generation()
+        if (connection_generation is not None
+                and connection_generation != self._stream_generation):
+            self._reopen_stream(
+                f"ADB transport generation {self._stream_generation} -> {connection_generation}")
+            return
+        returncode = self._poll(proc)
+        if returncode is not None:
+            self._reopen_stream(f"hid process exited before gesture (status {returncode})")
 
     # ── encoding ─────────────────────────────────────────────────────────────
 
@@ -212,12 +413,24 @@ class UhidBackend(TouchBackend):
     def _send(self, obj: dict) -> None:
         """Write one bare JSON object followed by a newline (the modern ``hid``
         tool reads a stream of objects, not a JSON array)."""
+        self._last_command = str(obj.get("command", "json"))
         self._raw_write(json.dumps(obj) + "\n")
 
     def _raw_write(self, text: str) -> None:
         p = self._proc
         if p is None or p.stdin is None:
-            raise RuntimeError("UHID hid process not open")
+            raise UhidTransportError("UHID hid process is not open")
         # adb.popen_shell opens stdin in binary mode; stream UTF-8 bytes.
-        p.stdin.write(text.encode("utf-8"))
-        p.stdin.flush()
+        try:
+            p.stdin.write(text.encode("utf-8"))
+            p.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            # Do not reopen and replay here: some earlier report of this gesture
+            # may already have reached Android.  Tear down robustly and let the
+            # engine's typed transport-failure path halt before another blind tap.
+            command = self._last_command or "command"
+            self._record_failure(f"UHID stream lost while sending {command}", e)
+            self._discard_stream()
+            raise UhidTransportError(
+                f"UHID stream lost while sending {command}: {type(e).__name__}: {e}") from e
+        self._last_write_at = time.time()

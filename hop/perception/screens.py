@@ -72,6 +72,11 @@ class ScreenState(str, Enum):
     VICTORY = "victory"
     DEFEAT = "defeat"
     REWARDS = "rewards"           # post-game rewards popups
+    # The ranked-ladder progress reveal (for example, the "Gold 3" medal) sits over
+    # a dimmed, still-visible board after a game.  It must outrank IN_GAME: otherwise
+    # the End Turn anchor behind it wins and the post-game loop waits for a board that
+    # cannot disappear until this overlay is dismissed.
+    RANK_PROGRESS = "rank_progress"
     # "Your Quests" - Hearthstone throws this over the play screen after a game.
     # An overlay, so the screen beneath still matches: it needs a higher priority.
     QUEST_POPUP = "quest_popup"
@@ -115,7 +120,7 @@ class Classification:
 INTERRUPT_FLOOR = frozenset({
     ScreenState.RECONNECT_DIALOG, ScreenState.RECONNECTING, ScreenState.ERROR_DIALOG,
     ScreenState.INCOMPLETE_DECK, ScreenState.QUEST_POPUP, ScreenState.CONCEDE_MENU,
-    ScreenState.VICTORY, ScreenState.DEFEAT,
+    ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.RANK_PROGRESS,
 })
 
 

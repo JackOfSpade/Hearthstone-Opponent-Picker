@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from hop.adb import Adb, AdbError, parse_usb_serials, resolve_adb
+from hop.adb import Adb, AdbError, parse_usb_serials, parse_wlan_ipv4, resolve_adb
 
 
 def test_resolve_adb_prefers_path(monkeypatch):
@@ -63,6 +63,79 @@ def test_screencap_timeout_becomes_a_typed_adberror(monkeypatch):
         a.screencap_png()
     msg = str(ei.value).lower()
     assert "timed out" in msg and "unreachable" in msg    # names the wireless-drop cause
+
+
+def test_disconnect_invalidates_the_persistent_shell_epoch_even_if_it_errors(monkeypatch):
+    """A failed reconnect can be followed by successful one-shot ADB commands.
+
+    Its old resident `adb shell hid -` is still unsafe after the disconnect was
+    attempted, so persistent consumers must see a new epoch even when the local
+    `adb disconnect` invocation itself raises.
+    """
+    import subprocess
+
+    a = Adb("192.168.99.139:5555", adb_bin="adb", timeout=1.0)
+    a._use_wireless("192.168.99.139:5555")
+    before = a.connection_generation
+    monkeypatch.setattr(subprocess, "run", lambda *a_, **k: (_ for _ in ()).throw(OSError("boom")))
+
+    a.disconnect()  # best effort by design
+
+    assert a.connection_generation == before + 1
+
+
+def test_reconnect_advances_the_persistent_shell_epoch(monkeypatch):
+    """A successful `adb reconnect` is visible to the resident UHID writer."""
+    import subprocess
+
+    address = "192.168.99.139:5555"
+    a = Adb(address, adb_bin="adb", timeout=1.0)
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        if args == ["adb", "disconnect", address]:
+            return _Proc()
+        if args == ["adb", "connect", address]:
+            return _Proc(stdout=f"connected to {address}\n".encode())
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.reconnect()
+
+    # disconnect + fresh-attempt + accepted endpoint: any positive movement is
+    # enough for UhidBackend to re-register before its next gesture.
+    assert a.connection_generation >= 3
+
+
+def test_ensure_connected_advances_epoch_when_it_has_to_reconnect(monkeypatch):
+    """The implicit health-check recovery must invalidate resident shell streams too."""
+    import subprocess
+
+    address = "192.168.99.139:5555"
+    a = Adb(address, adb_bin="adb", timeout=1.0)
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        if args == ["adb", "-s", address, "get-state"]:
+            return _Proc(stderr=b"device offline\n", returncode=1)
+        if args == ["adb", "connect", address]:
+            return _Proc(stdout=f"connected to {address}\n".encode())
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.ensure_connected()
+
+    assert a.connection_generation >= 2  # reconnect attempt + fresh endpoint
 
 
 def test_spawn_time_oserror_becomes_a_typed_adberror(monkeypatch):
@@ -122,6 +195,217 @@ def test_parse_usb_serials_filters_wireless_and_unauthorized_entries():
         "ZY223JQZ8G              unauthorized usb:1-2\n"
     )
     assert parse_usb_serials(out) == ["R58N70ABCDE"]
+
+
+def test_parse_wlan_ipv4_requires_one_usable_address():
+    """The USB recovery must not guess between a VPN/cellular/alias address and Wi-Fi."""
+    assert parse_wlan_ipv4(
+        "42: wlan0    inet 192.168.99.144/24 brd 192.168.99.255 scope global wlan0\n"
+    ) == "192.168.99.144"
+    # Local-only and malformed candidates are not possible LAN endpoints; they do not make the
+    # otherwise unique valid address ambiguous.
+    assert parse_wlan_ipv4(
+        "1: lo    inet 127.0.0.1/8 scope host lo\n"
+        "42: wlan0    inet 10.0.0.44/24 scope global wlan0\n"
+        "42: wlan0    inet 999.1.1.1/24 scope global wlan0\n"
+    ) == "10.0.0.44"
+    assert parse_wlan_ipv4(
+        "42: wlan0    inet 10.0.0.44/24 scope global wlan0\n"
+        "42: wlan0    inet 10.0.0.45/24 scope global secondary wlan0\n"
+    ) is None
+    assert parse_wlan_ipv4("42: wlan0    inet 169.254.3.4/16 scope link wlan0\n") is None
+
+
+def test_connect_recovers_a_stale_unreachable_address_from_live_usb_wlan_ip(monkeypatch):
+    """A DHCP-changed phone may already be listening at its live address.
+
+    The recovery should query the sole USB phone, try that address directly, and preserve it as
+    session state without restarting adbd or overwriting the configured endpoint.
+    """
+    import subprocess
+
+    old = "192.168.99.139:5555"
+    live = "10.0.0.44:5555"
+    serial = "R58N70ABCDE"
+    a = Adb(old, adb_bin="adb", timeout=1.0)
+    calls = []
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        args = list(args)
+        calls.append(args)
+        if args[:2] == ["adb", "connect"]:
+            if args[2] == old:
+                return _Proc(stderr=b"failed to connect: Network is unreachable\n", returncode=1)
+            if args[2] == live:
+                return _Proc(stdout=f"connected to {live}\n".encode())
+        if args == ["adb", "devices"]:
+            return _Proc(stdout=f"List of devices attached\n{serial} device usb:1-1\n".encode())
+        if args == ["adb", "-s", serial, "shell", "ip -f inet addr show dev wlan0"]:
+            return _Proc(stdout=b"42: wlan0    inet 10.0.0.44/24 scope global wlan0\n")
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.connect(retries=4)
+
+    assert a.address == old and a.configured_address == old     # config remains immutable
+    assert a.wireless_address == live and a.active_address == live
+    assert not a.using_usb
+    assert [c[2] for c in calls if c[:2] == ["adb", "connect"]] == [old, live]
+    assert not any("tcpip" in c for c in calls)                 # live listener already worked
+
+
+def test_connect_repins_only_a_reachable_discovered_address_that_refuses(monkeypatch):
+    """Never `tcpip` a no-route address: it cannot repair routing and can lose USB fallback."""
+    import subprocess
+
+    old = "192.168.99.139:5555"
+    live = "10.0.0.44:5555"
+    serial = "R58N70ABCDE"
+    a = Adb(old, adb_bin="adb", timeout=1.0)
+    calls = []
+    live_attempts = 0
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        nonlocal live_attempts
+        args = list(args)
+        calls.append(args)
+        if args[:2] == ["adb", "connect"]:
+            if args[2] == old:
+                return _Proc(stdout=b"failed to connect: Network is unreachable\n", returncode=1)
+            if args[2] == live:
+                live_attempts += 1
+                if live_attempts == 1:
+                    return _Proc(stdout=b"failed to connect: Connection refused\n", returncode=1)
+                return _Proc(stdout=f"connected to {live}\n".encode())
+        if args == ["adb", "devices"]:
+            return _Proc(stdout=f"List of devices attached\n{serial} device usb:1-1\n".encode())
+        if args == ["adb", "-s", serial, "shell", "ip -f inet addr show dev wlan0"]:
+            return _Proc(stdout=b"42: wlan0    inet 10.0.0.44/24 scope global wlan0\n")
+        if args == ["adb", "-s", serial, "tcpip", "5555"]:
+            return _Proc()
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda *_a: None)
+    a.connect()
+
+    assert a.active_address == live and a.wireless_address == live
+    direct = calls.index(["adb", "connect", live])
+    tcpip = calls.index(["adb", "-s", serial, "tcpip", "5555"])
+    retry = len(calls) - 1
+    assert direct < tcpip < retry
+    assert calls[retry] == ["adb", "connect", live]
+
+
+def test_connect_uses_verified_usb_when_live_wlan_address_is_still_unreachable(monkeypatch):
+    """When neither configured nor live WLAN IP has a route, preserve a working USB session."""
+    import subprocess
+
+    old = "192.168.99.139:5555"
+    live = "10.0.0.44:5555"
+    serial = "R58N70ABCDE"
+    a = Adb(old, adb_bin="adb", timeout=1.0)
+    calls = []
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        args = list(args)
+        calls.append(args)
+        if args[:2] == ["adb", "connect"]:
+            return _Proc(stderr=b"failed to connect: Network is unreachable\n", returncode=1)
+        if args == ["adb", "devices"]:
+            return _Proc(stdout=f"List of devices attached\n{serial} device usb:1-1\n".encode())
+        if args == ["adb", "-s", serial, "shell", "ip -f inet addr show dev wlan0"]:
+            return _Proc(stdout=b"42: wlan0    inet 10.0.0.44/24 scope global wlan0\n")
+        if args == ["adb", "-s", serial, "get-state"]:
+            return _Proc(stdout=b"device\n")
+        if args == ["adb", "-s", serial, "shell", "echo hi"]:
+            return _Proc(stdout=b"hi\n")
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.connect()
+
+    assert a.address == old and a.wireless_address == old
+    assert a.using_usb and a.active_address == serial
+    assert not any("tcpip" in c for c in calls)
+    assert a.shell("echo hi") == "hi\n"                       # every later command targets USB
+    assert calls[-1] == ["adb", "-s", serial, "shell", "echo hi"]
+
+
+def test_unreachable_connect_fails_without_exponential_backoff_when_usb_cannot_help(monkeypatch):
+    """ENETUNREACH is a route fact; repeated 2+4+8+16 second connects cannot fix it."""
+    import subprocess
+
+    a = Adb("192.168.99.139:5555", adb_bin="adb", timeout=1.0)
+    calls, sleeps = [], []
+
+    class _Proc:
+        def __init__(self, stdout=b"", stderr=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        args = list(args)
+        calls.append(args)
+        if args[:2] == ["adb", "connect"]:
+            return _Proc(stderr=b"failed to connect: Network is unreachable\n", returncode=1)
+        if args == ["adb", "devices"]:
+            return _Proc(stdout=b"List of devices attached\n")
+        raise AssertionError(f"unexpected adb call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    with pytest.raises(AdbError) as ei:
+        a.connect(retries=4)
+
+    assert len([c for c in calls if c[:2] == ["adb", "connect"]]) == 1
+    assert sleeps == []
+    assert "routing/stale" in str(ei.value)
+    assert "adb tcpip" in str(ei.value)
+
+
+def test_reconnect_leaves_a_healthy_usb_fallback_alone(monkeypatch):
+    """`adb disconnect SERIAL` is not a recovery operation; USB mode rechecks only its state."""
+    import subprocess
+
+    serial = "R58N70ABCDE"
+    a = Adb("192.168.99.139:5555", adb_bin="adb", timeout=1.0)
+    a._active_address = serial       # establish the internal state produced by USB recovery
+    a._usb_serial = serial
+    calls = []
+
+    class _Proc:
+        stdout = b"device\n"
+        stderr = b""
+        returncode = 0
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    a.reconnect()
+
+    assert calls == [["adb", "-s", serial, "get-state"]]
 
 
 def test_connect_auto_rescues_via_usb_when_refused(monkeypatch):

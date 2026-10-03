@@ -7,6 +7,7 @@ race closed in both interleavings.
 """
 
 import threading
+from types import SimpleNamespace
 
 from hop.runner import EngineController
 
@@ -67,6 +68,44 @@ def test_status_shows_the_day_distribution_while_idle(tmp_path):
     assert st["running"] is False
     assert st["class_distribution"] == {"Mage": 3, "Paladin": 2}
     assert "games" not in st                          # per-run stats absent while idle
+
+
+def test_status_keeps_the_day_chart_but_exposes_the_current_run_separately(tmp_path):
+    """The dashboard's original field remains cumulative for compatibility, but a
+    report must be able to distinguish a prior Priest target from this run's Hunter."""
+    from hop.observed import ObservedDistribution
+
+    store = ObservedDistribution(tmp_path / "obs.json", date="2026-10-02",
+                                 counts={"Priest": 1})
+    c = EngineController(lambda o: _FakeEngine(), observed=store)
+    c._engine = SimpleNamespace(
+        stats=SimpleNamespace(
+            games=0, concedes=1, target_found=False, concedes_until_target=None,
+            last_opponent="Hunter", stop_reason="halt:no screen change",
+            class_distribution={"Hunter": 1}, going_first=1, going_second=0,
+            ignored_card_taps=0,
+        ),
+        state=SimpleNamespace(attention=1.0, confidence=1.0, fatigue=0.0,
+                              familiarity=0.0, actions_taken=9),
+        limiter=SimpleNamespace(actions_this_run=9, commits_this_run=1,
+                                games_this_session=0, session_seconds=42,
+                                committing_ratio=lambda: 0.1),
+        cfg=SimpleNamespace(criteria=SimpleNamespace(
+            target_classes=(SimpleNamespace(name="PRIEST"),), require_second=False,
+            mode="casual")),
+        transport_status=lambda: {"kind": "uhid", "returncode": 1,
+                                  "connection_generation": 8, "stream_generation": 7},
+    )
+
+    status = c.status()
+    # Existing consumers keep receiving the day-scoped dashboard total unchanged.
+    assert status["class_distribution"] == {"Priest": 1, "Hunter": 1}
+    assert status["class_distribution_scope"] == "day"
+    # The additive field is authoritative for this engine/run only.
+    assert status["run_class_distribution"] == {"Hunter": 1}
+    # The controller keeps the engine's bounded process snapshot for the bug-report header.
+    assert status["transport_status"]["returncode"] == 1
+    assert status["transport_status"]["stream_generation"] == 7
 
 
 def test_stop_after_the_engine_exists_calls_request_stop():

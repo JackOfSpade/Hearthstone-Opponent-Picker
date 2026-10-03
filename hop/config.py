@@ -245,6 +245,14 @@ class VisionConfig:
     #: retry the SAME Concede coordinate while the menu is positively still up. 1 restores
     #: the old single-tap-then-halt behaviour. See :meth:`hop.engine.Engine._concede`.
     concede_tap_attempts: int
+    #: How many times to (re-)tap a named post-game screen's dismiss button before failing
+    #: closed. A dropped ``end_dismiss`` is normally a literally-static frame, so the
+    #: engine re-looks and re-taps only when that SAME named end screen is positively still
+    #: up; it never carries the fixed point into a mulligan, reconnect dialog, or deck list.
+    #: This is per named screen in the post-game stack; ``_clear_end_screens`` retains its
+    #: separate total tap cap. 1 restores the old single-tap-then-halt behaviour. See
+    #: :meth:`hop.engine.Engine._dismiss_end_screen`.
+    end_dismiss_tap_attempts: int
     #: The wait for the mulligan to leave after we tap Confirm is NOT a normal button
     #: transition: it must also absorb the OPPONENT finishing THEIR mulligan. While they
     #: deliberate, this client swaps the "Starting Hand" banner (our mulligan anchor) for

@@ -51,6 +51,9 @@ class _RecordingDebug:
         self.unknowns.append((where, frame, ctx))
         return None
 
+    def terminal_screen(self, reason, frame=None, **ctx):
+        self.records.append(("terminal_screen", {"reason": reason, **ctx}))
+
 
 def _engine(cfg, states, *, debug=None):
     backend = FakeBackend()
@@ -220,6 +223,130 @@ def test_end_screens_are_dismissed_until_a_home_screen(cfg):
                                  ScreenState.DECK_SELECT])
     eng._clear_end_screens()
     assert len(backend.gestures) == 2
+
+
+def test_rank_progress_overlay_is_a_dismissible_end_screen(cfg):
+    """A ranked medal overlays a dimmed board, so it must beat IN_GAME and dismiss safely."""
+    assert ScreenState.RANK_PROGRESS in Engine.END_SCREENS
+    eng, backend = _engine(cfg, [ScreenState.RANK_PROGRESS, ScreenState.PLAY_SCREEN])
+    eng._clear_end_screens()
+    assert len(backend.gestures) == 1
+
+
+def test_postgame_timeout_keeps_named_terminal_screen_evidence(cfg):
+    debug = _RecordingDebug()
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME], debug=debug)
+    with pytest.raises(Halt, match="board never finished dissolving"):
+        eng._clear_end_screens()
+    assert backend.gestures == []
+    evidence = [d for kind, d in debug.records if kind == "terminal_screen"]
+    assert len(evidence) == 1
+    assert evidence[0]["state"] == ScreenState.IN_GAME.value
+    assert evidence[0]["waits"] == cfg.vision.screen_wait_attempts
+
+
+class _EndDismissStuckUntilNthTap:
+    """A static end screen until the Nth physical dismissal gesture lands."""
+
+    def __init__(self, backend, land_on_attempt):
+        self.backend = backend
+        self.land_on_attempt = land_on_attempt
+
+    def capture(self):
+        if len(self.backend.gestures) >= self.land_on_attempt:
+            return gray_frame(80, 40, 220)
+        return gray_frame(80, 40, 60)
+
+
+def test_end_dismiss_retries_a_dropped_tap_only_on_the_same_named_end_screen(cfg):
+    """The report's failure: an ignored Defeat dismiss must not end the hunt.
+
+    The retry is not a blind second tap.  Every dropped attempt is followed by a fresh
+    positive Defeat classification; only then may the exact same dismiss coordinate be
+    sent again.  The final gesture changes the screen and the next state is home.
+    """
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    attempts = cfg.vision.end_dismiss_tap_attempts
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.DEFEAT] * attempts + [ScreenState.PLAY_SCREEN]),
+                 reader=None, debug=debug, sleep=lambda s: None, clock=lambda: 0.0,
+                 rng=Random(3), layout=GameLayout(),
+                 capturer=_EndDismissStuckUntilNthTap(backend, land_on_attempt=attempts))
+
+    assert attempts >= 2
+    eng._clear_end_screens()
+    assert len(backend.gestures) == attempts
+    dismiss = eng.layout.end_dismiss.to_px(eng.panel)
+    dismiss_pt = (round(dismiss[0]), round(dismiss[1]))
+    taps = [d["point"] for kind, d in debug.records
+            if kind == "tap" and d["what"] == "end_dismiss"]
+    assert taps == [dismiss_pt] * attempts
+    ignored = [d for kind, d in debug.records if kind == "end_dismiss_tap_ignored"]
+    assert len(ignored) == attempts - 1
+    assert all(d["screen"] == ScreenState.DEFEAT.value for d in ignored)
+
+
+def test_end_dismiss_exhausts_its_own_retry_budget_then_fails_closed(cfg):
+    """Static pixels plus a positively persistent end screen are the drop signature."""
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.VICTORY]), reader=None, debug=debug,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_EndDismissStuckUntilNthTap(backend, 999))
+    with pytest.raises(Halt) as e:
+        eng._clear_end_screens()
+    assert "not registering (a dropped committing tap" in str(e.value)
+    assert len(backend.gestures) == cfg.vision.end_dismiss_tap_attempts
+    ignored = [d for kind, d in debug.records if kind == "end_dismiss_tap_ignored"]
+    assert len(ignored) == cfg.vision.end_dismiss_tap_attempts - 1
+
+
+def test_end_dismiss_static_retry_respects_the_outer_stack_tap_budget(cfg):
+    """The per-screen retry budget must never exceed ``_clear_end_screens(max_taps)``."""
+    assert cfg.vision.end_dismiss_tap_attempts == 3
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.VICTORY]), reader=None, debug=debug,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_EndDismissStuckUntilNthTap(backend, 999))
+
+    with pytest.raises(Halt) as e:
+        eng._clear_end_screens(max_taps=2)
+
+    assert "did not advance" in str(e.value)
+    assert len(backend.gestures) == 2
+    ignored = [d for kind, d in debug.records if kind == "end_dismiss_tap_ignored"]
+    assert len(ignored) == 1
+
+
+def test_end_dismiss_never_retries_when_the_post_failure_look_is_not_the_same_screen(cfg):
+    """Its point overlaps Mulligan Confirm, so a differing screen is a hard stop, not a retap."""
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.VICTORY, ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_EndDismissStuckUntilNthTap(backend, 999))
+    with pytest.raises(Halt) as e:
+        eng._clear_end_screens()
+    assert "refusing to blind-tap end_dismiss" in str(e.value)
+    assert len(backend.gestures) == 1
+
+
+def test_only_a_no_change_halt_is_retried_for_end_dismiss(cfg):
+    """A changed-but-wrong screen is not evidence for another fixed-point tap."""
+    eng, backend = _engine(cfg, [ScreenState.VICTORY])
+
+    def wrong_change(*_args, **_kwargs):
+        raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
+
+    eng.verifier.verify = wrong_change
+    with pytest.raises(Halt) as e:
+        eng._clear_end_screens()
+    assert e.value.kind == Halt.WRONG_CHANGE
+    assert len(backend.gestures) == 1
 
 
 def test_exhausting_the_tap_budget_halts_rather_than_returning_quietly(cfg):
