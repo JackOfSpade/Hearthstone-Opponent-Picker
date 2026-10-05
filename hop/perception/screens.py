@@ -80,6 +80,11 @@ class ScreenState(str, Enum):
     # "Your Quests" - Hearthstone throws this over the play screen after a game.
     # An overlay, so the screen beneath still matches: it needs a higher priority.
     QUEST_POPUP = "quest_popup"
+    # The Black Market early-concede confirmation is drawn over the Game Menu.
+    # It must be distinguished from the exposed Game Menu title beneath it: the
+    # two actions have different fixed coordinates and this modal is safe to
+    # handle only inside the already-owned post-concede trace.
+    CONCEDE_WARNING = "concede_warning"
     CONCEDE_MENU = "concede_menu" # the settings/gear overlay with Concede
     UNKNOWN = "unknown"
 
@@ -119,7 +124,8 @@ class Classification:
 #: fixed coordinate straight into a co-drawn reconnect dialog's Cancel.
 INTERRUPT_FLOOR = frozenset({
     ScreenState.RECONNECT_DIALOG, ScreenState.RECONNECTING, ScreenState.ERROR_DIALOG,
-    ScreenState.INCOMPLETE_DECK, ScreenState.QUEST_POPUP, ScreenState.CONCEDE_MENU,
+    ScreenState.INCOMPLETE_DECK, ScreenState.QUEST_POPUP, ScreenState.CONCEDE_WARNING,
+    ScreenState.CONCEDE_MENU,
     ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.RANK_PROGRESS,
 })
 

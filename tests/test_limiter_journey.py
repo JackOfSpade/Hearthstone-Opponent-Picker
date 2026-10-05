@@ -48,30 +48,22 @@ def test_non_repetition_detects_replay(cfg, panel):
     assert not lim.is_near_duplicate(g2)
 
 
-def test_mulligan_plan_always_interacts():
+def test_target_mulligan_plan_keeps_its_existing_card_decisions():
     for seed in range(50):
-        decs = journey.plan_mulligan(Random(seed), 4, keeping=False)
+        decs = journey.plan_keep(Random(seed), 4)
         assert len(decs) == 4
-        # keeps at least one card (never a zero-touch that looks robotic-perfect)
+        # A target matchup retains the careful, normal mulligan behavior.
         assert sum(1 for d in decs if not d.replace) >= 1
 
 
-def test_concede_point_favours_playing_into_the_game():
-    """The anti-barcode invariant: a normal user rarely bails at the mulligan, so
-    the concede almost never lines up with the class reveal."""
-    points = [journey.choose_concede_point(Random(s)) for s in range(400)]
-    assert points.count("mulligan") < points.count("turn1")
-    assert points.count("mulligan") < points.count("turn2")
+def test_reject_concede_point_is_always_immediate_post_mulligan():
+    assert {journey.choose_concede_point(Random(seed)) for seed in range(400)} == {"mulligan"}
 
 
-def test_reject_plan_shape():
-    plan = journey.plan_reject(Random(3), 4)
-    assert plan.concede_point in ("mulligan", "turn1", "turn2")
-    assert len(plan.mulligan) == 4
-
-
-def test_reject_plan_extra_reads_are_bounded():
-    """A normal user can play a beat, but should not stack several idle reads first."""
+def test_reject_plan_has_no_performative_interactions():
     for seed in range(200):
         plan = journey.plan_reject(Random(seed), 4)
-        assert plan.extra_reads <= 1
+        assert plan.concede_point == "mulligan"
+        assert plan.mulligan == []
+        assert plan.hesitate_before_concede is False
+        assert plan.extra_reads == 0

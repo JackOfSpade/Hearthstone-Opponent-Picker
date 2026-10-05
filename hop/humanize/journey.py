@@ -1,20 +1,9 @@
 """Layer 5 - the Hearthstone journey grammar.
 
-Standard: *"real sessions have structure a flat ratio misses ... Define a
-per-vertical journey grammar."* The vertical here is Hearthstone laddering, and
-the grammar's whole job is to make a *rejected* game look like an impatient
-human quitting a bad matchup, not a barcode bot insta-conceding at class reveal.
-
-The load-bearing anti-barcode rule (from the design discussion): **detect-time
-is decoupled from concede-time.** We know at the mulligan whether to keep or
-reject, but a reject still: performs the mulligan like a human (keep/replace a
-plausible subset), enters the game, plays a beat or two, and concedes at a
-*randomly chosen* point. Instant concedes are the single most detectable thing
-this tool could do, so the grammar never emits one.
-
-This module plans the cognitive *shape* (which cards to replace, which turn to
-bail on, where to hesitate). The concrete screen taps live in the engine; the
-timing of each beat is costed by :mod:`hop.humanize.timing`.
+For this fixed-phone workflow, a rejected matchup follows one short, predictable
+path: leave the starting hand untouched and concede directly from the positively
+named mulligan. The engine owns the screen transitions and actual tap timing; this
+module only describes that path and the target-match mulligan.
 """
 
 from __future__ import annotations
@@ -36,20 +25,15 @@ class MulliganDecision:
     decision_type: str  # "commit" | "reject"
 
 
-# Concede points, in order. Weighted toward the later ones (see
-# choose_concede_point) so a normal user plays a beat before bailing.
-_CONCEDE_POINTS = ("mulligan", "turn1", "turn2")
-
-
 def plan_mulligan(rng: Random, num_cards: int, keeping: bool) -> list[MulliganDecision]:
     """Decide which mulligan cards to replace and how each is deliberated.
 
     We can't know the game-theoretic-optimal mulligan, and we don't need to -
     we need *plausible*. Heuristic: usually keep 1-3 cards, replace the rest,
     biased toward keeping cheaper (left-most tends to be lower cost after the
-    engine sorts, but we don't rely on that) with per-slot noise. A game we're
-    keeping deliberates a touch more carefully (real stakes); a reject is a bit
-    more careless but still *interacts* - never a zero-touch mulligan.
+    engine sorts, but we don't rely on that) with per-slot noise. Target games
+    receive the normal, careful mulligan; the ``keeping`` argument remains for
+    compatibility with callers that request the older generic behavior.
     """
     decisions: list[MulliganDecision] = []
     # target number to keep: keepers ~ Binomial-ish, clamped to [1, num_cards].
@@ -70,45 +54,41 @@ def plan_mulligan(rng: Random, num_cards: int, keeping: bool) -> list[MulliganDe
 
 
 def choose_concede_point(rng: Random) -> str:
-    """Pick where in a rejected game to concede.
+    """Return the immediate post-mulligan concede point.
 
-    Weighted toward playing a beat into the game before conceding, so the exit
-    never correlates with the class reveal. A ``"mulligan"`` concede still
-    performs the full mulligan first; the grammar never emits an instant concede.
+    ``rng`` is retained in the public signature so existing callers need no
+    migration; this fixed policy intentionally makes no random draw.
     """
-    # mulligan : turn1 : turn2  ~=  1.0 : 1.8 : 2.0  ->  ~21% / 37% / 42%.
-    weights = (1.0, 1.8, 2.0)
-    total = sum(weights)
-    r = rng.random() * total
-    acc = 0.0
-    for point, w in zip(_CONCEDE_POINTS, weights):
-        acc += w
-        if r <= acc:
-            return point
-    return _CONCEDE_POINTS[-1]
+    del rng
+    return "mulligan"
 
 
 @dataclass(frozen=True)
 class RejectPlan:
-    """The full plan for exiting a rejected game plausibly."""
+    """The immediate, no-extra-actions plan for a rejected matchup.
 
-    concede_point: str                 # "mulligan" | "turn1" | "turn2"
+    The fields stay stable for the engine's journal and dispatch code.  Their
+    fixed values prevent replacement taps, board-play beats, and extra pauses.
+    """
+
+    concede_point: str                 # always "mulligan"
     mulligan: list[MulliganDecision]
-    hesitate_before_concede: bool      # insert a hesitation beat (real quitters pause)
-    extra_reads: int                   # number of idle "reading the board" pauses
+    hesitate_before_concede: bool      # always False
+    extra_reads: int                   # always 0
 
 
 def plan_reject(rng: Random, num_cards: int) -> RejectPlan:
-    """Compose a complete plausible-exit plan for a matchup we will concede."""
-    point = choose_concede_point(rng)
-    mull = plan_mulligan(rng, num_cards, keeping=False)
-    hesitate = rng.random() < 0.5   # ~half the time, pause before conceding (real quitters do)
-    extra = {"mulligan": 0, "turn1": rng.choice([0, 0, 1]), "turn2": rng.choice([0, 1])}[point]
+    """Plan a direct concede from a named, untouched mulligan.
+
+    ``rng`` and ``num_cards`` remain accepted for engine compatibility, but a
+    rejected matchup deliberately spends neither on decorative interactions.
+    """
+    del num_cards
     return RejectPlan(
-        concede_point=point,
-        mulligan=mull,
-        hesitate_before_concede=hesitate,
-        extra_reads=extra,
+        concede_point=choose_concede_point(rng),
+        mulligan=[],
+        hesitate_before_concede=False,
+        extra_reads=0,
     )
 
 

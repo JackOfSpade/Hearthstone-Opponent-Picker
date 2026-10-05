@@ -1,9 +1,9 @@
 """Configuration loading and the typed views the code consumes.
 
 Standard, cross-cutting: *"Config over constants. No hardcoded ADB paths,
-screen-fraction coordinates, thresholds, or caps in code - everything in
-config, overridable per app. Code ships calibrated defaults; live values are
-verified on-device."*
+screen-fraction coordinates, thresholds, or caps in code. Code ships calibrated
+defaults; ordinary values are overridable per app, while safety floors are sealed
+to that shipped calibration and may only be made more conservative."*
 
 The defaults live in ``config.default.toml`` (the §8 priors). A user config
 (``~/.config/hop/config.toml`` by default, or an explicit path) is deep-merged
@@ -16,12 +16,41 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass, field
+from functools import lru_cache
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 from typing import Any
+from types import MappingProxyType
 
 from .hero_classes import HeroClass, parse_class
 
 _DEFAULT_PATH = Path(__file__).with_name("config.default.toml")
+
+# Intentional UI-opening pauses are responsiveness affordances, not semantic
+# state-resolution waits. Keep their hard policy limit close to the UI so both
+# configuration validation and the engine enforce the same bound.
+MAX_UI_OPEN_DELAY_S = 1.0
+
+# The post-concede boundary must leave room for one real wireless screenshot and
+# its NCC scan after the last blind Play-location tap.  Retained Pixel 7a runs
+# measured 2.870 s capture plus 0.528 s classification at their maxima, so this
+# sealed 4 s budget is deliberately rounded upward.
+POST_CONCEDE_BOUNDARY_CAPTURE_BUDGET_S = 4.0
+
+
+@lru_cache(maxsize=1)
+def _sealed_timing_baseline():
+    """The unmerged shipped calibration, immutable across user overrides.
+
+    The values are deliberately read from the same TOML source that supplies the
+    defaults, so there is one numeric source of truth.  ``validate_config`` uses
+    this sealed view for lower/upper safety bounds rather than ``cfg.raw``, which
+    may contain a user's merged override.
+    """
+    with open(_DEFAULT_PATH, "rb") as f:
+        timing = tomllib.load(f)["timing"]
+    return MappingProxyType(dict(timing))
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -58,8 +87,8 @@ class Criteria:
 
         Uses a uniform class prior unless a meta weighting is supplied. The
         go-second factor is ~0.5 (coin is a coin flip). This is intentionally
-        approximate - it exists to warn about barcode-shaped criteria (§ the
-        anti-barcode design), not to be exact.
+        approximate - it exists to warn about a very high filter/concede rate,
+        not to be exact.
         """
         weights = meta_weights or {c: 1.0 / len(HeroClass) for c in HeroClass}
         if self.target_classes:
@@ -117,6 +146,23 @@ class TimingConfig:
     think_reject_shift: float
     think_reject_mu: float
     think_reject_sigma: float
+    play_to_mulligan_cooldown_s: float
+    mulligan_confirm_cooldown_s: float
+    #: Exact UI-opening allowance for the Game Menu containing Concede (<= 1 s).
+    gear_menu_cooldown_s: float
+    concede_resolve_cooldown_s: float
+    end_dismiss_cooldown_s: float
+    #: Earliest post-concede boundary time, measured from the first Play-location
+    #: tap.  It overlaps the open-loop burst rather than following it.
+    post_concede_queue_cooldown_s: float
+    #: Exact UI-opening allowance for the Concede confirmation popup (<= 1 s).
+    post_concede_start_cooldown_s: float
+    post_concede_click_interval_s: float
+    post_concede_click_interval_max_s: float
+    post_concede_click_count: int
+    post_concede_burst_max_s: float
+    #: Retained measurement, not a randomized wait: hard observed Play->Mulligan floor.
+    play_to_mulligan_observed_min_s: float
 
 
 @dataclass(frozen=True)
@@ -203,8 +249,6 @@ class VisionConfig:
     motion_wait_attempts: int
     #: Polls of a live board at the top of the loop before abandoning the game.
     in_game_wait_attempts: int
-    #: Polls of the matchmaking queue before declaring it soft-locked.
-    queue_wait_attempts: int
     #: Polls of the deck LIST (waiting for the user to re-select their deck) before failing
     #: closed. hop lands here after a dismissed "error starting your game" and cannot itself
     #: reopen a deck (it can't tell which one was in play), so it PAUSES -- alerting and
@@ -238,12 +282,10 @@ class VisionConfig:
     #: :meth:`hop.engine.Engine._tap_play`.
     play_tap_attempts: int
     mulligan_card_tap_attempts: int
-    #: How many times to (re-)tap Concede before failing closed. Like a mulligan card, a
-    #: Concede BUTTON tap can be silently dropped under a congested wireless link, and its
-    #: own change-check can't catch it (the board animates behind the semi-transparent Game
-    #: Menu, so verify passes on ambient motion). Only the menu LEAVING is proof it took, so
-    #: retry the SAME Concede coordinate while the menu is positively still up. 1 restores
-    #: the old single-tap-then-halt behaviour. See :meth:`hop.engine.Engine._concede`.
+    #: Number of same-coordinate Concede taps in the calibrated reject fast path. They are
+    #: upper-menu taps only (never Options/Quit), followed by the bounded Play-location
+    #: burst. Exceptional recoveries retain :meth:`hop.engine.Engine._concede`'s semantic
+    #: named-screen retry. 1 permits a single Concede tap.
     concede_tap_attempts: int
     #: How many times to (re-)tap a named post-game screen's dismiss button before failing
     #: closed. A dropped ``end_dismiss`` is normally a literally-static frame, so the
@@ -275,23 +317,6 @@ class VisionConfig:
     #: tap that turns out to be un-recoverable. 1 restores the old single-tap-then-halt behaviour.
     #: See :meth:`hop.engine.Engine._confirm_mulligan`.
     mulligan_confirm_tap_attempts: int
-    #: Total tries to READ the opponent's class off the mulligan before failing closed.
-    #: The classifier has already confirmed the mulligan is up; a blank class is a transient
-    #: (most likely the nameplate still drawing in), so we re-read a few times, not just once,
-    #: before giving up. (>=1; 1 restores the old single-read-no-retry behaviour.)
-    mulligan_read_attempts: int
-    #: Consecutive GAMES whose CLASS never reads (blank/garbled after every re-read) before the
-    #: hunt fails closed. One unreadable game is a transient hop recovers from -- it concedes +
-    #: requeues, like a human who can't ID the matchup -- rather than halting the whole
-    #: unattended run. A *run* of them in a row means the reader is broken RIGHT NOW (a shifted
-    #: nameplate region, a UI change breaking every read), so at this many hop stops for a human.
-    #: The streak resets on any usable read, so this catches an ACUTE, class-independent break,
-    #: NOT a failure correlated to one class's word (that one is surfaced by the report's "class
-    #: NEVER read" line + the "?" games in the observed distribution -- visible, not auto-halted,
-    #: since auto-halting on a scattered rate would false-stop a healthy hunt). The trade this
-    #: makes is deliberate: an unreadable game that happens to be a target is conceded rather
-    #: than halting the hunt on it. (>=1; 1 restores the old halt-on-first-unreadable-class.)
-    mulligan_unreadable_halt_streak: int
     glow_green_bias: int
     glow_min_green: int
     glow_col_min_frac: float
@@ -334,6 +359,81 @@ class Config:
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
+def validate_config(cfg: Config) -> None:
+    """Reject unsafe open-loop timing before the engine can emit a gesture.
+
+    ``dataclasses.replace`` is intentionally common in tests and callers, so this
+    is invoked by both :func:`load_config` and ``Engine.__init__`` rather than being
+    hidden only in TOML parsing.
+    """
+    t = cfg.timing
+    baseline = _sealed_timing_baseline()
+
+    def positive_real(name: str) -> float:
+        value = getattr(t, name)
+        if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value):
+            raise ValueError(f"timing.{name} must be a finite number")
+        if value <= 0:
+            raise ValueError(f"timing.{name} must be positive")
+        return float(value)
+
+    semantic_cooldowns = (
+        "play_to_mulligan_cooldown_s", "mulligan_confirm_cooldown_s",
+        "concede_resolve_cooldown_s",
+        "end_dismiss_cooldown_s", "post_concede_queue_cooldown_s",
+    )
+    ui_open_delays = ("gear_menu_cooldown_s", "post_concede_start_cooldown_s")
+    for name in (
+        *semantic_cooldowns, *ui_open_delays,
+        "post_concede_click_interval_s", "post_concede_click_interval_max_s",
+        "post_concede_burst_max_s", "play_to_mulligan_observed_min_s",
+    ):
+        positive_real(name)
+
+    # Measured semantic waits may be made longer, never shorter.  The click
+    # interval is likewise a lower bound; a shorter burst cap is conservative.
+    for name in semantic_cooldowns + ("post_concede_click_interval_s",):
+        if float(getattr(t, name)) < float(baseline[name]):
+            raise ValueError(f"timing.{name} is below the sealed shipped calibration")
+    for name in ui_open_delays:
+        if float(getattr(t, name)) < float(baseline[name]):
+            raise ValueError(f"timing.{name} is below the sealed shipped calibration")
+        if float(getattr(t, name)) > MAX_UI_OPEN_DELAY_S:
+            raise ValueError(f"timing.{name} must be at most {MAX_UI_OPEN_DELAY_S:g} second")
+    if float(t.post_concede_burst_max_s) > float(baseline["post_concede_burst_max_s"]):
+        raise ValueError("post_concede_burst_max_s exceeds the sealed shipped cap")
+    if float(t.play_to_mulligan_observed_min_s) != float(
+            baseline["play_to_mulligan_observed_min_s"]):
+        raise ValueError("play_to_mulligan_observed_min_s must equal shipped evidence")
+
+    count = t.post_concede_click_count
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("timing.post_concede_click_count must be a positive integer")
+    low = float(t.post_concede_click_interval_s)
+    high = float(t.post_concede_click_interval_max_s)
+    maximum = float(t.post_concede_burst_max_s)
+    if high < low:
+        raise ValueError("timing.post_concede_click_interval_max_s is below its minimum")
+    # Before any gesture can be emitted, prove the configured N-1 maximum gaps
+    # fit the hard start-time cap. A cap at or beyond the sealed observed
+    # Play->Mulligan floor would remove the safety margin entirely.
+    if (count - 1) * high > maximum:
+        raise ValueError("post-concede burst gaps exceed post_concede_burst_max_s")
+    floor = float(baseline["play_to_mulligan_observed_min_s"])
+    if maximum >= floor:
+        raise ValueError("post_concede_burst_max_s must remain below observed mulligan floor")
+    # The boundary due time overlaps the burst, but either can be the later of
+    # the two.  Leave a sealed capture+classification margin after that later
+    # moment so a normal Wi-Fi boundary still observes a fast successor before
+    # its mulligan can pass unseen.  A pathological stalled capture sends no
+    # further input and fails closed at its eventual named boundary.
+    boundary_start = max(maximum, float(t.post_concede_queue_cooldown_s))
+    if boundary_start + POST_CONCEDE_BOUNDARY_CAPTURE_BUDGET_S >= floor:
+        raise ValueError(
+            "post-concede burst/boundary timing must leave the sealed "
+            "capture/classification margin before the observed mulligan floor")
+
+
 def _classes(values: list[str]) -> tuple[HeroClass, ...]:
     return tuple(parse_class(v) for v in values)
 
@@ -361,7 +461,7 @@ def load_config(path: str | Path | None = None) -> Config:
     v = merged["vision"]
     dbg = merged["debug"]
 
-    return Config(
+    cfg = Config(
         criteria=Criteria(
             target_classes=_classes(c["target_classes"]),
             avoid_classes=_classes(c["avoid_classes"]),
@@ -404,6 +504,8 @@ def load_config(path: str | Path | None = None) -> Config:
         debug=DebugConfig(**{k: dbg[k] for k in DebugConfig.__annotations__}),
         raw=merged,
     )
+    validate_config(cfg)
+    return cfg
 
 
 def _default_user_path() -> Path:

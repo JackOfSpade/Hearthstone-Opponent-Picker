@@ -98,14 +98,22 @@ class GameLayout:
     # In the in-game "Game Menu" the order is Concede / Options / Quit. The old
     # y=0.42 landed between Options and Quit; Concede is the TOP entry at y~0.196.
     concede_button: Point = Point(0.5025, 0.196, 0.014)
-    # NOTE: there is deliberately NO `concede_confirm` point. This client concedes
-    # immediately, and the Game Menu reads Concede / Options / Quit -- the old
-    # (0.50, 0.56, 0.06) "confirm" landed dead centre on **Quit** (its 0.9*144 px
-    # truncation disc lies almost entirely on the Quit plate; verified against the
-    # concede_menu capture). So the recovery path for "the Concede tap was ignored"
-    # was "quit Hearthstone". _concede() now waits for the menu to leave and fails
-    # closed instead. A client that really shows a confirm dialog would show a
-    # distinct screen, and distinct screens get anchors, not fixed points.
+    # The Black Market early-concede warning can appear immediately after Concede
+    # when a quest is active.  Its gold "Concede Now" button measured
+    # x=829..1172, y=681..769 on this Pixel 7a (2400x1080 landscape), hence the
+    # centre below.  The reject fast path sends this point exactly once whether
+    # that modal appears or not; without it, this coordinate is inert on this
+    # calibrated phone.  This is deliberately a distinct point from the Game
+    # Menu's Concede control, not a generic confirmation location.
+    concede_now_button: Point = Point(0.4167, 0.6713, 0.014)
+    # NOTE: there is deliberately NO generic/retry `concede_confirm` point for the
+    # Game Menu. It reads Concede / Options / Quit, and the old (0.50, 0.56, 0.06)
+    # "confirm" landed dead centre on **Quit** (its 0.9*144 px truncation disc lies
+    # almost entirely on the Quit plate). So the recovery path for "the Concede tap
+    # was ignored" was "quit Hearthstone". _concede() re-sends only the top Concede
+    # coordinate while that menu is named. The separately calibrated Black Market
+    # `concede_now_button` above is a different modal control, used once only in the
+    # direct reject trace; it is not a Game Menu retry or a generic confirmation.
     #
     # Dismisses victory/defeat/rewards/quest. LIVE-VERIFIED on a victory screen
     # (a tap at 1208,941 advanced to the rewards screen first try) and on the
@@ -279,6 +287,117 @@ def card_interiors(frame: Frame, layout: GameLayout, vision) -> list[tuple[int, 
     return out if hand_is_coherent(out, layout, vision, frame.width) else []
 
 
+def mulligan_card_count_diagnostics(frame: Frame, layout: GameLayout, vision) -> dict:
+    """Return bounded, JSON-safe evidence for a mulligan card-count miss.
+
+    This deliberately mirrors :func:`card_interiors` without changing the hot
+    path.  It is for the exceptional ``cards == 0`` path, where knowing whether
+    the fault was no colour, missing glow strips, a width/brightness rejection,
+    or the marked-card coherence guard matters much more than saving a few
+    vector operations.  It contains measurements rather than image pixels; the
+    caller can retain the bounded anomaly frame separately.
+
+    Glow runs are row-relative (as returned by :func:`glow_strip_runs`), while
+    candidate interiors are absolute screen x spans.  Lists are capped so a
+    pathological image cannot make a bug report enormous.
+    """
+    max_spans = 24
+    rgb = getattr(frame, "rgb", None)
+    rx, ry, rw, rh = layout.card_row.to_px(frame)
+    expected = layout.card_inner_w_f * frame.width
+    tolerance = vision.card_width_tolerance * expected
+    result: dict = {
+        "frame": {
+            "width": int(frame.width),
+            "height": int(frame.height),
+            "has_rgb": rgb is not None,
+        },
+        "card_row": {"x": int(rx), "y": int(ry), "width": int(rw), "height": int(rh)},
+        "thresholds": {
+            "glow_green_bias": int(vision.glow_green_bias),
+            "glow_min_green": int(vision.glow_min_green),
+            "glow_col_min_frac": float(vision.glow_col_min_frac),
+            "glow_column_min_rows": int(vision.glow_col_min_frac * rh),
+            "glow_min_strip_width_px": max(
+                4, int(vision.glow_min_strip_frac * frame.width)
+            ),
+            "expected_width_px": round(expected, 1),
+            "width_tolerance_px": round(tolerance, 1),
+            "min_mean_rgb": float(vision.card_min_gray),
+            "min_frame_width": int(vision.min_count_frame_width),
+        },
+        "glow_run_count": 0,
+        "glow_runs": [],
+        "glow_runs_truncated": False,
+        "candidates": [],
+        "candidates_truncated": False,
+        "candidate_interiors": [],
+        "coherent": None,
+        "count": 0,
+        "rejection": "",
+    }
+    if rgb is None:
+        result["rejection"] = "no_rgb"
+        return result
+    if frame.width < vision.min_count_frame_width:
+        result["rejection"] = "frame_too_narrow"
+        return result
+
+    # ``glow_strip_runs`` returns ``None`` both for a missing colour frame and
+    # an empty crop.  Colour was checked above, so distinguish the latter here.
+    band = rgb[ry:ry + rh, rx:rx + rw]
+    if getattr(band, "size", 0) == 0:
+        result["rejection"] = "empty_card_row"
+        return result
+    runs = glow_strip_runs(frame, layout, vision) or []
+    result["glow_run_count"] = len(runs)
+    result["glow_runs"] = [[int(start), int(end)] for start, end in runs[:max_spans]]
+    result["glow_runs_truncated"] = len(runs) > max_spans
+    if len(runs) < 2:
+        result["rejection"] = "insufficient_glow_strips"
+        return result
+
+    interiors: list[tuple[int, int]] = []
+    candidates: list[dict] = []
+    for (_, left_end), (right_start, _) in zip(runs, runs[1:]):
+        width = right_start - left_end
+        width_ok = abs(width - expected) <= tolerance
+        segment = band[:, left_end:right_start]
+        mean_rgb = float(segment.mean()) if getattr(segment, "size", 0) else None
+        brightness_ok = mean_rgb is not None and mean_rgb >= vision.card_min_gray
+        selected = width_ok and brightness_ok
+        if len(candidates) < max_spans:
+            candidates.append({
+                "start": int(rx + left_end),
+                "end": int(rx + right_start),
+                "width_px": int(width),
+                "width_ok": bool(width_ok),
+                "mean_rgb": round(mean_rgb, 1) if mean_rgb is not None else None,
+                "brightness_ok": bool(brightness_ok),
+                "selected": bool(selected),
+            })
+        if selected:
+            interiors.append((rx + left_end, rx + right_start))
+    result["candidates"] = candidates
+    result["candidates_truncated"] = len(runs) - 1 > max_spans
+    result["candidate_interiors"] = [[int(start), int(end)] for start, end in interiors[:max_spans]]
+
+    if not interiors:
+        result["rejection"] = "no_candidate_interiors"
+        return result
+    coherent = hand_is_coherent(interiors, layout, vision, frame.width)
+    result["coherent"] = bool(coherent)
+    if not coherent:
+        result["rejection"] = "incoherent_hand"
+        return result
+    if len(interiors) not in (3, 4):
+        result["rejection"] = "implausible_card_total"
+        return result
+    result["count"] = len(interiors)
+    result["rejection"] = "ok"
+    return result
+
+
 def hand_is_coherent(interiors: list[tuple[int, int]], layout: GameLayout,
                      vision, frame_width: int) -> bool:
     """Do these card interiors look like a whole, untouched mulligan hand?
@@ -332,8 +451,10 @@ def count_mulligan_cards(frame: Frame, layout: GameLayout, vision) -> int:
 
     The two tests are orthogonal - a wide dark span is not a card, nor is a narrow
     bright one - and each has a margin of roughly 3x. An implausible total (not 3
-    or 4) returns 0, which makes :attr:`MulliganRead.usable` false so the engine
-    fails closed rather than guess at the signal that decides whether to concede.
+    or 4) returns 0, which makes :attr:`MulliganRead.usable` false.  The engine
+    requires that full two-signal read whenever the configured criteria depend
+    on the coin; a class-only criterion can still safely decide from a known
+    opponent class without inventing a turn result.
 
     Do **not** be tempted to count the strips instead: a strip is one card edge
     when the hand is spread out and two merged edges when it is packed, so 3 cards
@@ -367,7 +488,9 @@ def read_mulligan(
 
     ``vision`` is the :class:`~hop.config.VisionConfig`; it carries the keep-glow
     thresholds used to count cards. A frame captured without colour, or one whose
-    glow strips don't cohere, yields ``num_cards == 0`` and an unusable read.
+    glow strips don't cohere, yields ``num_cards == 0`` and an incomplete
+    two-signal read.  The engine retains it as colour evidence and only permits
+    a class-only decision when its criteria do not need the turn.
     """
     rx, ry, rw, rh = layout.opponent_class_region.to_px(frame)
     label = frame.crop(rx, ry, rw, rh)

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,7 @@ def prune_runs(root: str | Path, keep: int = DEFAULT_KEEP_RUNS) -> list[Path]:
 @dataclass
 class JournalEntry:
     t: float
+    ts: str
     kind: str
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -142,7 +144,12 @@ class DebugLog:
         # carry a `kind=` key would otherwise raise "got multiple values for argument
         # 'kind'" and crash the recorder mid-anomaly. Positional-only makes that key
         # land in `detail` instead of colliding with this parameter.
-        entry = JournalEntry(t=self._clock(), kind=kind, detail=_jsonable(detail))
+        # Sample once: `ts` is a readable local rendering of the same instant as
+        # the long-standing numeric `t`, rather than a second clock read that could
+        # drift (or make a frozen/injected clock's journal internally inconsistent).
+        now = self._clock()
+        entry = JournalEntry(t=now, ts=_local_iso8601(now), kind=kind,
+                             detail=_jsonable(detail))
         with self._journal.open("a") as f:
             f.write(json.dumps(asdict(entry)) + "\n")
 
@@ -151,15 +158,25 @@ class DebugLog:
         reason: str,
         before: Frame | None = None,
         after: Frame | None = None,
+        *,
+        colour: bool = False,
         **context: Any,
     ) -> None:
-        """Record an anomaly and, if possible, dump before/after frames."""
+        """Record an anomaly and, if possible, dump before/after frames.
+
+        Most anomaly evidence is grayscale because screen-state anchors and OCR
+        diagnostics do not need hue.  A small number of perception signals do:
+        the mulligan-card counter is defined by the green keep glow.  ``colour``
+        preserves RGB for those callers while retaining the same bounded per-run
+        retention and stable anomaly filenames.
+        """
         self._n += 1
         self.record("anomaly", reason=reason, index=self._n, **context)
         if pil_available():
             for tag, frame in (("before", before), ("after", after)):
                 if frame is not None:
-                    self._save_frame(frame, self.run_dir / f"anomaly_{self._n}_{tag}.png")
+                    self._save_frame(frame, self.run_dir / f"anomaly_{self._n}_{tag}.png",
+                                     colour=colour)
             self._prune_frames()
 
     def terminal_screen(self, reason: str, frame: Frame | None = None, **context: Any) -> None:
@@ -239,6 +256,18 @@ class DebugLog:
 
 def _jsonable(d: dict[str, Any]) -> dict[str, Any]:
     return {str(k): _json_value(v) for k, v in d.items()}
+
+
+def _local_iso8601(t: float) -> str:
+    """Render one epoch timestamp in the host's local zone, including its UTC offset.
+
+    Converting from an explicitly UTC-aware datetime preserves the offset that applied
+    at that instant (including DST) and works just as deterministically for injected
+    epoch clocks as for ``time.time``.
+    """
+    return datetime.fromtimestamp(t, tz=timezone.utc).astimezone().isoformat(
+        timespec="microseconds"
+    )
 
 
 def _json_value(v: Any) -> Any:

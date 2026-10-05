@@ -93,13 +93,13 @@ def _cfg(**over):
     return UhidConfig(**base)
 
 
-def _tap_gesture():
-    return Gesture(kind="tap", target=(540.0, 1200.0), samples=[
-        TouchSample(t=0.00, x=540, y=1200, pressure=0.3, size=0.1, major=0.2,
+def _tap_gesture(x=540, y=1200):
+    return Gesture(kind="tap", target=(float(x), float(y)), samples=[
+        TouchSample(t=0.00, x=x, y=y, pressure=0.3, size=0.1, major=0.2,
                     minor=0.16, orientation=0.0, tip=True),
-        TouchSample(t=0.02, x=540, y=1200, pressure=0.8, size=0.15, major=0.4,
+        TouchSample(t=0.02, x=x, y=y, pressure=0.8, size=0.15, major=0.4,
                     minor=0.32, orientation=0.0, tip=True),
-        TouchSample(t=0.10, x=540, y=1200, pressure=0.0, size=0.0, major=0.0,
+        TouchSample(t=0.10, x=x, y=y, pressure=0.0, size=0.0, major=0.0,
                     minor=0.0, orientation=0.0, tip=False),
     ])
 
@@ -161,6 +161,24 @@ def test_close_eofs_the_stream_and_terminates():
     assert adb.proc.terminated is True
 
 
+def test_transport_status_exposes_cached_transform_and_last_delivered_endpoint():
+    adb = FakeAdb()
+    backend = UhidBackend(adb, _cfg())
+    backend.open(PanelGeometry(width_px=1080, height_px=2400, dpi=420.0))
+    backend.emit(_tap_gesture())
+
+    status = backend.transport_status()
+    assert status["rotation"] == 0  # FakeAdb has no live rotation probe; backend caches fallback
+    assert (status["panel_width_px"], status["panel_height_px"]) == (1080, 2400)
+    assert status["axis_touch_major_max"] > 0 and status["axis_pressure_max"] > 0
+    assert (status["last_display_x"], status["last_display_y"]) == (540.0, 1200.0)
+    assert (status["last_native_x"], status["last_native_y"]) == (540, 1200)
+    backend.close()
+    # The backend clears the live transform for a later open, but the terminal
+    # report must retain the transform that produced the last tap.
+    assert backend.transport_status()["rotation"] == 0
+
+
 # ── persistent-shell recovery: ADB reconnect must renew UHID before a gesture ──
 
 def test_reconnect_generation_renews_the_stream_before_the_next_gesture():
@@ -177,7 +195,7 @@ def test_reconnect_generation_renews_the_stream_before_the_next_gesture():
     backend.open(PanelGeometry(width_px=1080, height_px=2400, dpi=420.0))
 
     adb.connection_generation += 1  # `adb disconnect` / a new connection happened
-    backend.emit(_tap_gesture())
+    backend.emit(_tap_gesture(1200, 540))
 
     assert adb.popen_cmds == ["hid -", "hid -"]
     assert first.stdin.closed and first.terminated
@@ -260,11 +278,13 @@ def test_close_attempts_stdin_close_even_if_flush_broke():
 # ── rotation: display-space samples must be mapped to native panel px ─────────
 
 class FakeAdbRot(FakeAdb):
-    def __init__(self, rot):
-        super().__init__()
+    def __init__(self, rot, procs=None):
+        super().__init__(procs)
         self._rot = rot
+        self.rotation_queries = 0
 
     def get_rotation(self):
+        self.rotation_queries += 1
         return self._rot
 
 
@@ -291,6 +311,86 @@ def test_rot270_display_center_maps_to_native_center():
 
 def test_rot0_is_identity():
     assert _emit_single(0, 300, 900) == (300, 900)
+
+
+def test_rotation_is_read_once_per_open_and_reused_for_all_gestures():
+    adb = FakeAdbRot(3)
+    backend = UhidBackend(adb, _cfg())
+    backend.open(PanelGeometry(width_px=1080, height_px=2400, dpi=420.0))
+
+    backend.emit(_tap_gesture())
+    backend.emit(_tap_gesture())
+
+    assert adb.rotation_queries == 1
+
+
+def test_status_reports_the_last_endpoint_in_both_spaces_under_rotation():
+    adb = FakeAdbRot(3)
+    backend = UhidBackend(adb, _cfg())
+    backend.open(PanelGeometry(width_px=1080, height_px=2400, dpi=420.0))
+    backend.emit(_tap_gesture(1200, 540))
+
+    status = backend.transport_status()
+    assert (status["last_display_x"], status["last_display_y"]) == (1200.0, 540.0)
+    # ROTATION_270 maps display (x,y) to native (y, native_h - 1 - x).
+    assert (status["last_native_x"], status["last_native_y"]) == (540, 1199)
+
+
+def test_rotation_is_refreshed_after_a_true_close_then_open_session():
+    adb = FakeAdbRot(3)
+    backend = UhidBackend(adb, _cfg())
+    panel = PanelGeometry(width_px=1080, height_px=2400, dpi=420.0)
+    backend.open(panel)
+    backend.emit(_tap_gesture())
+    backend.close()
+    # Model the closed session's terminal diagnostics; a successfully registered
+    # new session must not attach them to its new rotation/panel metadata.
+    backend._last_failure = "old session failure"
+    backend._last_proc_status["stderr_tail"] = "old session stderr"
+    adb._rot = 1
+
+    backend.open(panel)
+
+    assert adb.rotation_queries == 2
+    status = backend.transport_status()
+    assert status["rotation"] == 1
+    assert status["failure"] is None and status["stderr_tail"] == ""
+    assert status["last_display_x"] is None and status["last_display_y"] is None
+    assert status["last_native_x"] is None and status["last_native_y"] is None
+
+
+def test_failed_true_reopen_retains_prior_endpoint_and_transform_evidence():
+    first = FakeProc(pid=101)
+    failed = FakeProc(stdin=FakeStdin(fail_after=0), pid=102)
+    adb = FakeAdbRot(3, [first, failed])
+    backend = UhidBackend(adb, _cfg())
+    panel = PanelGeometry(width_px=1080, height_px=2400, dpi=420.0)
+    backend.open(panel)
+    backend.emit(_tap_gesture(1200, 540))
+    backend.close()
+    adb._rot = 1
+
+    with pytest.raises(UhidTransportError):
+        backend.open(panel)
+
+    status = backend.transport_status()
+    assert status["rotation"] == 3
+    assert (status["last_display_x"], status["last_display_y"]) == (1200.0, 540.0)
+    assert (status["last_native_x"], status["last_native_y"]) == (540, 1199)
+    assert "UHID stream lost" in status["failure"]
+
+
+def test_stream_recovery_keeps_the_session_rotation_cache():
+    first = FakeProc(pid=101)
+    second = FakeProc(pid=102)
+    adb = FakeAdbRot(3, [first, second])
+    backend = UhidBackend(adb, _cfg())
+    backend.open(PanelGeometry(width_px=1080, height_px=2400, dpi=420.0))
+
+    adb.connection_generation += 1
+    backend.emit(_tap_gesture())
+
+    assert adb.rotation_queries == 1
 
 
 def test_missing_get_rotation_falls_back_to_identity():

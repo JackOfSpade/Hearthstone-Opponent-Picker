@@ -12,6 +12,9 @@ Confirm, 205 px from the reconnect dialog's *Cancel*, and on top of the deck lis
 "My Collection" plate.
 """
 
+from dataclasses import replace
+import json
+import math
 from random import Random
 
 import pytest
@@ -19,7 +22,7 @@ import pytest
 from hop.engine import Engine
 from hop.hearthstone import GameLayout, Point
 from hop.geometry import PanelGeometry
-from hop.perception.screens import ScreenState
+from hop.perception.screens import Classification, ScreenState
 from hop.verify import Halt
 
 from conftest import FakeAdb, FakeBackend, FakeClassifier, gray_frame
@@ -40,6 +43,7 @@ class _RecordingDebug:
     def __init__(self):
         self.unknowns = []
         self.records = []
+        self.terminal_frames = []
 
     def record(self, kind, **detail):
         self.records.append((kind, detail))
@@ -52,6 +56,7 @@ class _RecordingDebug:
         return None
 
     def terminal_screen(self, reason, frame=None, **ctx):
+        self.terminal_frames.append(frame)
         self.records.append(("terminal_screen", {"reason": reason, **ctx}))
 
 
@@ -62,6 +67,523 @@ def _engine(cfg, states, *, debug=None):
                  sleep=lambda s: None, clock=lambda: 0.0, rng=Random(3),
                  layout=GameLayout(), capturer=_AlternatingCapturer())
     return eng, backend
+
+
+class _CountingCapturer:
+    def __init__(self):
+        self.calls = 0
+        self.frames = []
+
+    def capture(self):
+        self.calls += 1
+        frame = gray_frame(80, 40, 60)
+        self.frames.append(frame)
+        return frame
+
+
+def test_reject_uses_one_bounded_open_loop_play_clickthrough(cfg):
+    """The usual rejected mulligan never classifies the individual end screens.
+
+    The only capture is the semantic boundary after the full fixed-location burst
+    and its queue cooldown.  This locks the safety property that the burst ends
+    before the engine is permitted to touch a future mulligan.
+    """
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    capturer = _CountingCapturer()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.QUEUE]), reader=None, debug=debug,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=capturer)
+
+    eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    assert capturer.calls == 1
+    assert eng._deferred_screen is not None
+    assert eng._deferred_screen[0].state == ScreenState.QUEUE
+
+    taps = [(d["what"], d["point"]) for kind, d in debug.records if kind == "tap"]
+    gear_pt = tuple(round(v) for v in eng.layout.gear_button.to_px(eng.panel)[:2])
+    concede_pt = tuple(round(v) for v in eng.layout.concede_button.to_px(eng.panel)[:2])
+    concede_now_pt = tuple(round(v) for v in eng.layout.concede_now_button.to_px(eng.panel)[:2])
+    play_pt = tuple(round(v) for v in eng.layout.play_button.to_px(eng.panel)[:2])
+    assert taps.count(("gear", gear_pt)) == 1
+    assert taps.count(("concede", concede_pt)) == cfg.vision.concede_tap_attempts
+    assert taps.count(("concede_now", concede_now_pt)) == 1
+    assert taps.count(("post_concede_play", play_pt)) == cfg.timing.post_concede_click_count
+    assert len(taps) == 2 + cfg.vision.concede_tap_attempts + cfg.timing.post_concede_click_count
+    assert not {what for what, _pt in taps} & {"end_dismiss", "mulligan_confirm", "pass"}
+
+    sleeps = [d for kind, d in debug.records if kind == "sleep"]
+    click_gaps = [d for d in sleeps if d["reason"] == "post_concede_click_cadence"]
+    assert len(click_gaps) == cfg.timing.post_concede_click_count - 1
+    assert all(cfg.timing.post_concede_click_interval_s <= d["seconds"]
+               <= cfg.timing.post_concede_click_interval_max_s for d in click_gaps)
+    assert sum(d["seconds"] for d in click_gaps) <= (
+        (cfg.timing.post_concede_click_count - 1)
+        * cfg.timing.post_concede_click_interval_max_s
+    ) < cfg.timing.play_to_mulligan_observed_min_s
+    # The two known UI transitions are deliberate half-second opening pauses:
+    # gear -> Game Menu, then Concede -> Black Market confirmation.  They must
+    # stay short and occur before the tap that depends on each newly opened UI.
+    gear = next(i for i, (kind, d) in enumerate(debug.records)
+                if kind == "tap" and d["what"] == "gear")
+    gear_wait, gear_wait_detail = next(
+        (i, d) for i, (kind, d) in enumerate(debug.records)
+        if kind == "sleep" and d["reason"] == "gear_menu_cooldown")
+    first_concede = next(i for i, (kind, d) in enumerate(debug.records)
+                         if kind == "tap" and d["what"] == "concede")
+    last_concede = max(i for i, (kind, d) in enumerate(debug.records)
+                       if kind == "tap" and d["what"] == "concede")
+    concede_now = next(i for i, (kind, d) in enumerate(debug.records)
+                       if kind == "tap" and d["what"] == "concede_now")
+    start_wait, start_wait_detail = next(
+        (i, d) for i, (kind, d) in enumerate(debug.records)
+        if kind == "sleep" and d["reason"] == "post_concede_start_cooldown")
+    first_burst = next(i for i, (kind, d) in enumerate(debug.records)
+                       if kind == "tap" and d["what"] == "post_concede_play")
+    assert gear < gear_wait < first_concede
+    assert gear_wait_detail["seconds"] == 0.5
+    assert last_concede < start_wait < concede_now < first_burst
+    assert start_wait_detail["seconds"] == 0.5
+    assert not [d for kind, d in debug.records
+                if kind == "sleep" and d.get("what") == "concede_now"]
+    # The last burst event precedes the queue cooldown and the sole capture.
+    last_burst = max(i for i, (kind, d) in enumerate(debug.records)
+                     if kind == "tap" and d["what"] == "post_concede_play")
+    queue_wait = next(i for i, (kind, d) in enumerate(debug.records)
+                      if kind == "sleep" and d["reason"] == "post_concede_queue_cooldown")
+    capture = next(i for i, (kind, _d) in enumerate(debug.records) if kind == "capture")
+    assert last_burst < queue_wait < capture
+
+
+@pytest.mark.parametrize("boundary, recovery_tap", [
+    (ScreenState.CONCEDE_WARNING, "concede_now_recovery"),
+    (ScreenState.CONCEDE_MENU, "concede_recovery"),
+])
+def test_post_concede_warning_or_menu_gets_one_bounded_recovery(cfg, boundary, recovery_tap):
+    """The named boundary is the sole authority for one safe retry, never recursion."""
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    capturer = _CountingCapturer()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([boundary, ScreenState.QUEUE]), reader=None, debug=debug,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=capturer)
+
+    result = eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    assert result.state == ScreenState.QUEUE
+    assert capturer.calls == 2
+    taps = [d["what"] for kind, d in debug.records if kind == "tap"]
+    assert taps.count(recovery_tap) == 1
+    assert sum(what.endswith("recovery") for what in taps) == (
+        1 if boundary == ScreenState.CONCEDE_WARNING else 2)
+    normal_count = 2 + cfg.vision.concede_tap_attempts + cfg.timing.post_concede_click_count
+    assert len(backend.gestures) == normal_count + (
+        1 + cfg.timing.post_concede_click_count
+        if boundary == ScreenState.CONCEDE_WARNING else 2 + cfg.timing.post_concede_click_count)
+    boundaries = [d for kind, d in debug.records if kind == "post_concede_boundary"]
+    assert [(d["attempt"], d["state"]) for d in boundaries] == [
+        (0, boundary.value), (1, ScreenState.QUEUE.value)]
+    bursts = [d for kind, d in debug.records if kind == "post_concede_burst_complete"]
+    assert [(d["attempt"], d["recovery"]) for d in bursts] == [(0, "normal"),
+                                                                    (1, "warning" if boundary == ScreenState.CONCEDE_WARNING else "menu")]
+
+
+@pytest.mark.parametrize("second_boundary", [ScreenState.CONCEDE_WARNING, ScreenState.CONCEDE_MENU])
+def test_post_concede_recovery_terminal_keeps_frame_and_attempt_context(cfg, second_boundary):
+    debug = _RecordingDebug()
+    capturer = _CountingCapturer()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.CONCEDE_WARNING, second_boundary]),
+                 reader=None, debug=debug, sleep=lambda _s: None, clock=lambda: 0.0,
+                 rng=Random(3), layout=GameLayout(), capturer=capturer)
+
+    with pytest.raises(Halt, match=f"unexpected '{second_boundary.value}'"):
+        eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    assert capturer.calls == 2  # one boundary per bounded attempt, no evidence recapture
+    evidence = [d for kind, d in debug.records if kind == "terminal_screen"]
+    assert len(evidence) == 1
+    assert evidence[0]["state"] == second_boundary.value
+    assert evidence[0]["attempt"] == 1
+    assert evidence[0]["recovery"] == "warning"
+    assert evidence[0]["initial_state"] == ScreenState.CONCEDE_WARNING.value
+    assert evidence[0]["source"] == ScreenState.MULLIGAN.value
+    assert evidence[0]["concede_now_taps"] == 2
+    assert "queue" in evidence[0]["accepted_states"]
+    assert len(debug.terminal_frames) == 1
+    assert debug.terminal_frames[0] is capturer.frames[-1]
+
+
+def test_generic_dispatch_never_blind_taps_an_early_concede_warning(cfg):
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+
+    with pytest.raises(Halt, match="outside the owned post-concede trace"):
+        eng._dispatch(Classification(ScreenState.CONCEDE_WARNING, 1.0), gray_frame(80, 40))
+
+    assert backend.gestures == []
+
+
+def test_post_concede_terminal_context_attributes_an_in_game_source(cfg):
+    debug = _RecordingDebug()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.IN_GAME]), reader=None, debug=debug,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+
+    with pytest.raises(Halt, match="unexpected 'in_game'"):
+        eng._post_concede_clickthrough(source=ScreenState.IN_GAME)
+
+    terminal = next(d for kind, d in debug.records if kind == "terminal_screen")
+    assert terminal["source"] == ScreenState.IN_GAME.value
+
+
+def test_post_concede_terminal_records_classifier_and_timing_evidence(cfg):
+    """A future report can distinguish a real full-scan board from a scope hit."""
+    debug = _RecordingDebug()
+
+    class AnchoredBoardClassifier:
+        has_templates = True
+
+        @staticmethod
+        def classify(_frame):
+            return Classification(ScreenState.IN_GAME, 0.774, (1187, 214))
+
+        @staticmethod
+        def classify_expected(_frame, _expected):
+            return Classification(ScreenState.IN_GAME, 0.774, (1187, 214))
+
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 AnchoredBoardClassifier(), reader=None, debug=debug,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+
+    with pytest.raises(Halt, match="unexpected 'in_game'"):
+        eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    boundary = next(d for kind, d in debug.records if kind == "post_concede_boundary")
+    terminal = next(d for kind, d in debug.records if kind == "terminal_screen")
+    for detail in (boundary, terminal):
+        assert detail["classification_scan"] == "full_fallback"
+        assert detail["anchor_at"] == [1187, 214]
+        assert detail["mulligan_floor_s"] == cfg.timing.play_to_mulligan_observed_min_s
+        assert detail["mulligan_deadline_exceeded"] is False
+
+
+def test_reject_books_the_finished_game_but_owns_the_queued_successor(cfg):
+    """`_book_game` closes the concede before the burst's new Play ownership is set."""
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.QUEUE]), reader=None,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    from hop.hearthstone import MulliganRead
+    from hop.hero_classes import HeroClass
+
+    eng._execute_reject(MulliganRead(HeroClass.MAGE, False, 3, 1.0, "MAGE", "test"))
+
+    assert eng.stats.games == 1 and eng.stats.concedes == 1
+    assert eng._own_game is True
+
+
+def test_reject_does_not_claim_a_successor_until_the_boundary_names_one(cfg):
+    """A returned Play screen is named, but it has not yet queued the next game."""
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.PLAY_SCREEN]), reader=None,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    from hop.hearthstone import MulliganRead
+    from hop.hero_classes import HeroClass
+
+    eng._execute_reject(MulliganRead(HeroClass.MAGE, False, 3, 1.0, "MAGE", "test"))
+
+    assert eng.stats.games == 1 and eng.stats.concedes == 1
+    assert eng._own_game is False
+
+
+def test_post_burst_mulligan_boundary_uses_the_class_gate_and_books_only_the_old_game(cfg):
+    """A very fast successor can already be on mulligan at the one burst boundary.
+
+    Its class must be read from that deferred frame before any new game is counted
+    or rejected; the just-conceded game remains booked exactly once.
+    """
+    from dataclasses import replace
+    from hop.hearthstone import MulliganRead
+    from hop.hero_classes import HeroClass
+
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.MAGE,)))
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    eng._read_mulligan = lambda *_a: MulliganRead(
+        HeroClass.MAGE, False, 3, 1.0, "MAGE", "test")
+
+    eng._execute_reject(MulliganRead(HeroClass.WARRIOR, False, 3, 1.0, "WARRIOR", "test"))
+    stats = eng.run(max_iterations=3)
+
+    assert stats.target_found is True
+    assert stats.games == 1 and stats.concedes == 1
+    assert stats.class_distribution == {"Mage": 1}
+
+
+def test_reject_unknown_boundary_books_once_then_watches_hands_off_until_class(cfg):
+    """An unanchored quiet boundary is an in-progress search, not a failed concede.
+
+    The old game is booked exactly once. The following UNKNOWN watch frame has no
+    wait or tap, and the readable mulligan frame continues with ordinary logic.
+    """
+    debug = _RecordingDebug()
+    backend = FakeBackend()
+    from hop.hearthstone import MulliganRead
+    from hop.hero_classes import HeroClass
+
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.MAGE,)))
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.UNKNOWN, ScreenState.UNKNOWN,
+                                 ScreenState.MULLIGAN]), reader=None, debug=debug,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    eng._read_mulligan = lambda *_a: MulliganRead(
+        HeroClass.MAGE, False, 3, 1.0, "MAGE", "test")
+
+    eng._execute_reject(MulliganRead(HeroClass.WARRIOR, False, 3, 1.0, "WARRIOR", "test"))
+
+    burst_gestures = 2 + cfg.vision.concede_tap_attempts + cfg.timing.post_concede_click_count
+    assert eng.stats.games == 1 and eng.stats.concedes == 1
+    assert eng._own_game is False
+    assert eng._awaiting_match_class is True
+    assert len(backend.gestures) == burst_gestures
+    sleeps_before_watch = len([r for r in debug.records if r[0] == "sleep"])
+
+    stats = eng.run(max_iterations=3)
+
+    assert stats.target_found is True
+    assert stats.games == 1 and stats.concedes == 1
+    assert stats.class_distribution == {"Mage": 1}
+    assert eng.capturer.calls == 3  # quiet boundary, UNKNOWN watch, resolved mulligan
+    assert len(backend.gestures) == burst_gestures
+    assert len([r for r in debug.records if r[0] == "sleep"]) == sleeps_before_watch
+    assert [where for where, _frame, _ctx in debug.unknowns] == []
+
+
+def test_unknown_boundary_is_not_deferred_after_match_watch_is_interrupted(cfg):
+    """A watch interruption must force a fresh capture, never replay old UNKNOWN."""
+    debug = _RecordingDebug()
+    capturer = _CountingCapturer()
+    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.UNKNOWN, ScreenState.ERROR_DIALOG,
+                                 ScreenState.PLAY_SCREEN, ScreenState.QUEUE]),
+                 reader=None, debug=debug, sleep=lambda _s: None, clock=lambda: 0.0,
+                 rng=Random(3), layout=GameLayout(), capturer=capturer)
+
+    boundary = eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+    assert boundary.state == ScreenState.UNKNOWN
+    assert eng._awaiting_match_class is True
+    assert eng._deferred_screen is None
+
+    stats = eng.run(max_iterations=2)
+
+    assert stats.stop_reason == "max_iterations"
+    # Boundary UNKNOWN, fresh ERROR watch observation, fresh PLAY observation, and
+    # Play's semantic boundary. If old UNKNOWN had been deferred, iteration two
+    # would halt before the fresh Play capture.
+    assert capturer.calls == 4
+    assert eng._deferred_screen is not None
+    assert eng._deferred_screen[0].state == ScreenState.QUEUE
+
+
+def test_named_end_boundary_is_deferred_without_a_second_burst(cfg):
+    backend = FakeBackend()
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([ScreenState.VICTORY]), reader=None,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    from hop.hearthstone import MulliganRead
+    from hop.hero_classes import HeroClass
+
+    eng._execute_reject(MulliganRead(HeroClass.MAGE, False, 3, 1.0, "MAGE", "test"))
+
+    assert eng.stats.games == 1 and eng.stats.concedes == 1
+    assert eng._deferred_screen is not None
+    assert eng._deferred_screen[0].state == ScreenState.VICTORY
+    assert len(backend.gestures) == (
+        2 + cfg.vision.concede_tap_attempts
+        + cfg.timing.post_concede_click_count
+    )
+
+
+def test_post_concede_tap_starts_stop_at_the_hard_elapsed_budget(cfg):
+    """Slow gesture emission may shorten the burst, never extend its tap-start window."""
+    clock = [0.0]
+
+    class SlowBackend(FakeBackend):
+        def emit(self, gesture):
+            super().emit(gesture)
+            clock[0] += 0.45
+
+    timing = replace(cfg.timing, post_concede_click_count=4,
+                     post_concede_click_interval_s=0.75,
+                     post_concede_click_interval_max_s=0.75,
+                     post_concede_burst_max_s=2.4)
+    eng = Engine(replace(cfg, timing=timing), FakeAdb(), SlowBackend(),
+                 PanelGeometry(80, 40, 400.0), FakeClassifier([ScreenState.QUEUE]),
+                 reader=None, sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+                 clock=lambda: clock[0], rng=Random(3), layout=GameLayout(),
+                 capturer=_CountingCapturer())
+
+    eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    # The gear/Concede/Concede Now emissions happen before the measured window; inside it,
+    # 0.45s emits plus one 0.75s gap allow exactly two starts before 2.4s.
+    burst = [g for g in eng.backend.gestures]
+    assert len(burst) == 2 + cfg.vision.concede_tap_attempts + 2
+
+
+def test_open_loop_tap_checks_a_stop_immediately_before_emitting(cfg):
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    eng.request_stop()
+    from hop.engine import StopRequested
+
+    with pytest.raises(StopRequested):
+        eng._tap_open_loop(eng.layout.play_button, committing=False, what="post_concede_play")
+    assert backend.gestures == []
+
+
+def test_open_loop_tap_does_not_emit_when_stop_races_during_synthesis(cfg):
+    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    real_synth = eng._synth_non_repeating_tap
+
+    def synth_then_stop(*args, **kwargs):
+        gesture = real_synth(*args, **kwargs)
+        eng.request_stop()
+        return gesture
+
+    eng._synth_non_repeating_tap = synth_then_stop
+    from hop.engine import StopRequested
+
+    with pytest.raises(StopRequested):
+        eng._tap_open_loop(eng.layout.play_button, committing=False, what="post_concede_play")
+    assert backend.gestures == []
+
+
+def test_tap_journal_keeps_nominal_and_actual_endpoint_provenance(cfg):
+    debug = _RecordingDebug()
+    eng, _backend = _engine(cfg, [ScreenState.QUEUE], debug=debug)
+
+    eng._tap_open_loop(eng.layout.play_button, committing=False, what="endpoint_probe")
+
+    detail = next(d for kind, d in debug.records if kind == "tap")
+    assert detail["point"] == detail["nominal_point"]  # compatibility + explicit meaning
+    assert len(detail["actual_endpoint"]) == 2
+    assert detail["radius_px"] > 0
+    assert detail["target_radius_px"] > 0
+    assert detail["duration_s"] > 0
+    assert math.dist(detail["nominal_point"], detail["actual_endpoint"]) <= detail["radius_px"]
+    json.dumps(detail)  # journal fields are JSON-safe without a DebugLog coercion pass
+
+
+@pytest.mark.parametrize("state", [
+    ScreenState.CONCEDE_MENU, ScreenState.IN_GAME,
+    ScreenState.RECONNECT_DIALOG, ScreenState.RECONNECTING, ScreenState.MENU,
+])
+def test_post_concede_rejects_every_unnamed_boundary_without_deferring(cfg, state):
+    """Only explicit successor/end states may book or resume the main loop."""
+    timing = replace(cfg.timing, post_concede_click_count=1,
+                     post_concede_burst_max_s=1.0)
+    eng = Engine(replace(cfg, timing=timing), FakeAdb(), FakeBackend(),
+                 PanelGeometry(80, 40, 400.0), FakeClassifier([state]), reader=None,
+                 sleep=lambda _s: None, clock=lambda: 0.0, rng=Random(3),
+                 layout=GameLayout(), capturer=_CountingCapturer())
+    with pytest.raises(Halt, match="unexpected"):
+        eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+    assert eng._deferred_screen is None
+
+
+def test_post_concede_observes_before_the_fastest_successor_mulligan_can_appear(cfg):
+    """The direct exit must not blind-wait past the fastest measured Play->Mulligan.
+
+    The reported failure was not an ``IN_GAME`` state that should be accepted: a
+    new match had already gone from its unseen mulligan to the board before the
+    one post-burst capture.  Model the reported 2.247 s Wi-Fi capture and
+    0.528 s classification here.  A boundary completed before the retained
+    30.270 s floor is still QUEUE; one completed after it is the unsafe,
+    unclassified board from the report.
+
+    This pins the whole blind interval -- burst *and* quiet wait *and* capture
+    latency -- rather than only the burst's tap-start deadline.
+    """
+    clock = [0.0]
+    capture_s = 2.247  # report: final boundary screencap, Pixel 7a over Wi-Fi
+    classify_s = 0.528  # report: final boundary NCC classification
+    emit_s = 0.45
+    first_play_at = []
+    play_taps = []
+    capture_started = []
+    boundary_elapsed = []
+    floor_s = cfg.timing.play_to_mulligan_observed_min_s
+
+    class TimedCapturer:
+        def capture(self):
+            capture_started.append(clock[0])
+            clock[0] += capture_s
+            return gray_frame(80, 40, 60)
+
+    class SlowBackend(FakeBackend):
+        def emit(self, gesture):
+            super().emit(gesture)
+            clock[0] += emit_s
+
+    class FastSuccessorClassifier:
+        has_templates = True
+
+        def _boundary(self):
+            clock[0] += classify_s
+            elapsed = clock[0] - first_play_at[0]
+            boundary_elapsed.append(elapsed)
+            # The boundary read gets one of the last safe queue frames only if it
+            # completes before the fastest measured successor mulligan can pass.
+            state = ScreenState.QUEUE if elapsed < floor_s else ScreenState.IN_GAME
+            return Classification(state, 0.95)
+
+        def classify(self, _frame):
+            return self._boundary()
+
+        def classify_expected(self, _frame, _expected):
+            return self._boundary()
+
+    eng = Engine(cfg, FakeAdb(), SlowBackend(), PanelGeometry(80, 40, 400.0),
+                 FastSuccessorClassifier(), reader=None,
+                 sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+                 clock=lambda: clock[0], rng=Random(3), layout=GameLayout(),
+                 capturer=TimedCapturer())
+    # Drive a slow but still in-budget burst, like the reported 20 s sequence.
+    eng._burst_interval = lambda: cfg.timing.post_concede_click_interval_max_s
+    tap_open_loop = eng._tap_open_loop
+
+    def record_open_loop(point, *, committing, what):
+        if what == "post_concede_play":
+            play_taps.append(clock[0])
+            if not first_play_at:
+                first_play_at.append(clock[0])
+        tap_open_loop(point, committing=committing, what=what)
+
+    eng._tap_open_loop = record_open_loop
+    boundary = eng._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+
+    assert boundary.state == ScreenState.QUEUE
+    assert first_play_at and play_taps and capture_started
+    assert boundary_elapsed
+    # No open-loop Play tap, nor the final semantic observation, may arrive once
+    # the retained fast-mulligan floor has passed.
+    assert max(play_taps) - first_play_at[0] < floor_s
+    assert max(play_taps) - first_play_at[0] >= cfg.timing.post_concede_queue_cooldown_s
+    # Once the burst has already spent that due time, the boundary capture must
+    # start directly after its final input emission -- no second blind cooldown.
+    assert capture_started[0] - max(play_taps) == pytest.approx(emit_s)
+    assert boundary_elapsed[0] < floor_s
 
 
 # ── the concede must never reach Quit ────────────────────────────────────────
@@ -121,23 +643,18 @@ def test_concede_retries_a_dropped_tap_then_succeeds(cfg):
     menu must stay up for that entire wait to force one retry; then the next look leaves.
     """
     debug = _RecordingDebug()
-    n = cfg.vision.screen_wait_attempts
-    states = ([ScreenState.IN_GAME]
-              + [ScreenState.CONCEDE_MENU] * (1 + n)   # gear-open look + the whole first wait
-              + [ScreenState.VICTORY])                 # the retap's wait sees the board dissolve
+    states = [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU, ScreenState.VICTORY]
     eng, backend = _engine(cfg, states, debug=debug)
     assert eng._concede() is True
-    # gear + first (dropped) concede + the retap that took == 3
+    # fixed open-loop gear + Concede; one phase-boundary capture proves success
     assert len(backend.gestures) == 3
-    ignored = [d for kind, d in debug.records if kind == "concede_tap_ignored"]
-    assert len(ignored) == 1                                 # exactly one retry, then success
     concede = eng.layout.concede_button.to_px(eng.panel)
     concede_pt = (round(concede[0]), round(concede[1]))
     taps = [d["point"] for kind, d in debug.records if kind == "tap" and d["what"] == "concede"]
-    assert taps == [concede_pt, concede_pt]                  # both taps on Concede, never below
+    assert taps == [concede_pt, concede_pt]
 
 
-def test_concede_requires_the_game_menu_before_the_committing_tap(cfg):
+def test_concede_open_loop_pair_is_bounded_when_destination_never_arrives(cfg):
     """`full_transition` after the gear does not mean the Game Menu opened.
 
     `_compatible()` admits `top_banner` and `partial` for an expected
@@ -147,13 +664,12 @@ def test_concede_requires_the_game_menu_before_the_committing_tap(cfg):
     eng, backend = _engine(cfg, [ScreenState.IN_GAME])   # gear never opened the menu
     with pytest.raises(Halt) as e:
         eng._concede()
-    assert "did not open the Game Menu" in str(e.value)
-    assert len(backend.gestures) == 1       # the gear, and nothing after it
+    assert "did not dismiss" in str(e.value)
+    assert len(backend.gestures) >= 2
 
 
 def test_concede_returns_once_the_menu_is_gone(cfg):
-    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU,
-                                 ScreenState.VICTORY])
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.VICTORY])
     assert eng._concede() is True            # menu opened, then the board dissolved
     assert len(backend.gestures) == 2
 
@@ -161,8 +677,7 @@ def test_concede_returns_once_the_menu_is_gone(cfg):
 def test_concede_does_not_accept_unknown_as_proof_the_menu_left(cfg):
     """An unreadable frame is not an observation that we left the menu."""
     debug = _RecordingDebug()
-    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.CONCEDE_MENU,
-                                 ScreenState.UNKNOWN], debug=debug)
+    eng, backend = _engine(cfg, [ScreenState.IN_GAME, ScreenState.UNKNOWN], debug=debug)
     with pytest.raises(Halt):
         eng._concede()
     assert len(backend.gestures) == 2
@@ -222,6 +737,8 @@ def test_end_screens_are_dismissed_until_a_home_screen(cfg):
     eng, backend = _engine(cfg, [ScreenState.VICTORY, ScreenState.REWARDS,
                                  ScreenState.DECK_SELECT])
     eng._clear_end_screens()
+    # Exceptional closed-loop recovery still uses one fixed dismiss per named
+    # end screen; the ordinary reject path above bypasses this loop entirely.
     assert len(backend.gestures) == 2
 
 
@@ -297,7 +814,7 @@ def test_end_dismiss_exhausts_its_own_retry_budget_then_fails_closed(cfg):
                  layout=GameLayout(), capturer=_EndDismissStuckUntilNthTap(backend, 999))
     with pytest.raises(Halt) as e:
         eng._clear_end_screens()
-    assert "not registering (a dropped committing tap" in str(e.value)
+    assert "semantic destination" in str(e.value)
     assert len(backend.gestures) == cfg.vision.end_dismiss_tap_attempts
     ignored = [d for kind, d in debug.records if kind == "end_dismiss_tap_ignored"]
     assert len(ignored) == cfg.vision.end_dismiss_tap_attempts - 1
@@ -316,7 +833,7 @@ def test_end_dismiss_static_retry_respects_the_outer_stack_tap_budget(cfg):
     with pytest.raises(Halt) as e:
         eng._clear_end_screens(max_taps=2)
 
-    assert "did not advance" in str(e.value)
+    assert "did not clear after 2 dismiss taps" in str(e.value)
     assert len(backend.gestures) == 2
     ignored = [d for kind, d in debug.records if kind == "end_dismiss_tap_ignored"]
     assert len(ignored) == 1
@@ -335,7 +852,7 @@ def test_end_dismiss_never_retries_when_the_post_failure_look_is_not_the_same_sc
     assert len(backend.gestures) == 1
 
 
-def test_only_a_no_change_halt_is_retried_for_end_dismiss(cfg):
+def test_end_dismiss_does_not_run_pixel_verification(cfg):
     """A changed-but-wrong screen is not evidence for another fixed-point tap."""
     eng, backend = _engine(cfg, [ScreenState.VICTORY])
 
@@ -343,10 +860,9 @@ def test_only_a_no_change_halt_is_retried_for_end_dismiss(cfg):
         raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
 
     eng.verifier.verify = wrong_change
-    with pytest.raises(Halt) as e:
+    with pytest.raises(Halt):
         eng._clear_end_screens()
-    assert e.value.kind == Halt.WRONG_CHANGE
-    assert len(backend.gestures) == 1
+    assert len(backend.gestures) == cfg.vision.end_dismiss_tap_attempts
 
 
 def test_exhausting_the_tap_budget_halts_rather_than_returning_quietly(cfg):
@@ -354,7 +870,7 @@ def test_exhausting_the_tap_budget_halts_rather_than_returning_quietly(cfg):
     eng, backend = _engine(cfg, [ScreenState.VICTORY])
     with pytest.raises(Halt) as e:
         eng._clear_end_screens(max_taps=2)
-    assert "did not clear" in str(e.value)
+    assert "did not clear after 2 dismiss taps" in str(e.value)
     assert len(backend.gestures) == 2
 
 
@@ -400,9 +916,7 @@ def test_a_board_at_the_top_of_the_loop_is_polled_then_abandoned(cfg):
     n = cfg.vision.in_game_wait_attempts
     states = (
         [ScreenState.IN_GAME] * (n + 1)    # n patient polls, then the one that acts
-        + [ScreenState.IN_GAME]            # _concede() classifies before it taps
-        + [ScreenState.CONCEDE_MENU]       # ...the gear opened the menu
-        + [ScreenState.DEFEAT]             # ...and Concede left it
+            + [ScreenState.DEFEAT]             # fixed pair -> named end state
         + [ScreenState.DEFEAT,             # _clear_end_screens: dismiss...
            ScreenState.PLAY_SCREEN]        # ...and home
     )
@@ -418,7 +932,7 @@ def test_a_board_at_the_top_of_the_loop_is_polled_then_abandoned(cfg):
     eng._dispatch(cls, frame)
     assert eng.stats.games == 1
     assert eng.stats.concedes == 1
-    assert [g.kind for g in backend.gestures] == ["tap", "tap", "tap"]   # gear, concede, dismiss
+    assert [g.kind for g in backend.gestures] == ["tap", "tap", "tap", "tap"]
     assert eng._own_game is False
 
 

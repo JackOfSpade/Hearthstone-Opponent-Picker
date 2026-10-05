@@ -154,7 +154,7 @@ def _is_stuck_halt(message: str) -> bool:
 #: The "could not read mulligan (class=<raw>, cards=<n>)" halt carries BOTH signals the
 #: mulligan read needs, so which one failed is decidable from the message alone.
 _MULLIGAN_READ_HALT_RE = re.compile(
-    r"could not read mulligan(?: \d+x in a row)? \(class=(?P<cls>.*), cards=(?P<cards>-?\d+)\)")
+    r"could not read mulligan \(class=(?P<cls>.*), cards=(?P<cards>-?\d+)\)")
 
 
 def _diagnose_mulligan_read_halt(message: str) -> str:
@@ -162,12 +162,9 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
 
     The read needs two signals: the opponent's CLASS (OCR of the bottom-left nameplate)
     and our CARD count (the green keep-glow strips). The halt message carries both, so
-    which failed is decidable here instead of by opening the kept frame. A single
-    unreadable game no longer halts (hop concedes + requeues it); this halt fires only
-    after ``vision.mulligan_unreadable_halt_streak`` such games IN A ROW, i.e. a
-    *systematic* reader break. The decisive follow-up datum is the ``mulligan_unreadable``
-    journal event's ``region_gray`` (see the journal summary). Returns "" for any other
-    halt.
+    which failed is decidable here instead of by opening the kept frame. A blank
+    class no longer reaches this halt: the match watch keeps capturing without input
+    until a class is readable. Returns "" for any other halt.
     """
     m = _MULLIGAN_READ_HALT_RE.search(message or "")
     if not m:
@@ -180,18 +177,10 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
         cards = -1
     cards_ok = cards in (3, 4)
     if blank and cards_ok:
-        return ("the opponent-CLASS OCR read BLANK (class='') while the cards counted fine "
-                f"(cards={cards}). hop no longer halts a hunt on ONE unreadable game -- it "
-                "re-reads (vision.mulligan_read_attempts), then concedes + requeues the game; "
-                "reaching THIS halt means the class was unreadable "
-                "vision.mulligan_unreadable_halt_streak games IN A ROW, i.e. the reader is "
-                "systematically broken, not one slow nameplate. Decide which from the "
-                "`mulligan_unreadable` journal event's `region_gray`: a LOW std (near-uniform) "
-                "means the opponent nameplate had not drawn in (a render/timing transient -- "
-                "raise the streak or mulligan_read_attempts); a HIGH std means the text WAS "
-                "present and the OCR or the opponent_class_region alignment is at fault -- open "
-                "the saved anomaly frame. (An 'Opponent Still Choosing...' banner does NOT cause "
-                "this: a real still-choosing frame OCRs the class fine, verified on disk.)")
+        return ("the opponent-CLASS OCR was blank (class='') while cards counted fine "
+                f"(cards={cards}). Current runs do not halt or concede here: they keep the "
+                "hands-off match watch active until the nameplate resolves. This halt is from "
+                "an older run or an unexpected code path.")
     if cards_ok:   # class present but did not snap to a known class
         base = (f"the class text ({cls_raw}) did not resolve to a known class though the "
                 f"cards counted fine (cards={cards}) -- a GARBLED nameplate read, not a blank one.")
@@ -216,7 +205,8 @@ def _diagnose_mulligan_read_halt(message: str) -> str:
                 "vision.ocr_max_edit_distance rather than the still-choosing transient.")
     return (f"the CARD count was off (cards={cards}, expected 3 or 4) -- the green keep-glow "
             "strip detection miscounted, so this is a card-count/glow failure, not an "
-            "opponent-class read. Check the glow thresholds against a kept frame.")
+            "opponent-class read. Inspect the saved colour frame and glow-run telemetry in "
+            "the Mulligan card-count evidence section (new runs retain both automatically).")
 
 
 #: Every bounded-retry committing-tap site (`_concede`, `_tap_play`, ...) that exhausts its
@@ -289,23 +279,97 @@ def _norm_class(s) -> str:
     return "".join(ch for ch in str(s).upper() if ch.isalnum())
 
 
+def _is_pending_mulligan_read(detail: dict) -> bool:
+    """Whether a ``mulligan_read`` is observation-only under the watch contract.
+
+    New engine records write ``pending=True`` while the named mulligan's class
+    plate has not appeared. These frames remain useful latency/OCR diagnostics,
+    but are not games: they cannot create an opponent, coin result, or reject
+    pairing. A missing field deliberately remains *not pending* so journals from
+    before this contract retain their existing report semantics.
+    """
+    return detail.get("pending") is True
+
+
+def _mulligan_turn(detail: dict) -> bool | None:
+    """Return the observed coin/turn, or ``None`` when the card count could not tell.
+
+    Newer journals make this distinction explicit: a class can be readable and actionable
+    while the keep-glow card count is not, so ``turn_known=False`` and ``second=None``.  Do
+    not turn that into ``False`` ("going first") in a report.  Older journal lines did not
+    carry ``turn_known``; preserve their historical bool interpretation so old reports do
+    not change merely because the renderer was upgraded.
+    """
+    if detail.get("turn_known") is False:
+        return None
+    second = detail.get("second")
+    if isinstance(second, bool):
+        return second
+    # An explicit null is the new unknown-turn encoding even if a transitional writer
+    # omitted turn_known.  Missing second on a legacy line retains its old falsey result.
+    if "second" in detail:
+        return None
+    return False
+
+
+def _turn_label(second: bool | None) -> str:
+    """Human label for a tri-state mulligan turn without miscalling an unknown as first."""
+    if second is None:
+        return "turn unreadable"
+    return "going 2nd" if second else "going 1st"
+
+
+def _mulligan_decision(detail: dict) -> str:
+    """Journalled decision for a new mulligan read, or ``""`` for legacy records."""
+    decision = detail.get("decision")
+    return str(decision) if decision in ("keep", "reject", "unusable") else ""
+
+
+def _is_actionable_mulligan_read(detail: dict) -> bool:
+    """Whether a resolved read can be paired with a target/reject decision.
+
+    A current engine can reject a known non-target even when its coin/card count is
+    unreadable: the class can be disallowed regardless of the coin, or the criteria can
+    simply not use the coin.  Its explicit ``decision=reject`` is stronger evidence than
+    the old ``cards in (3, 4)`` proxy.  Legacy records retain the old proxy so a report
+    does not reinterpret their semantics.
+    """
+    decision = _mulligan_decision(detail)
+    if decision:
+        return decision in ("keep", "reject")
+    return detail.get("cards", 3) in (3, 4)
+
+
 #: Human labels for the three ways :meth:`hop.config.Criteria.accepts` rejects a matchup.
 _REJECT_LABELS = {
     "went_first": "went 1st (require_second is set, so only going-2nd games are kept)",
+    "turn_unreadable": ("turn/card count unreadable while require_second is set; the report "
+                        "cannot independently verify this reject"),
     "not_targeted": "opponent class not in the target list",
     "avoided": "opponent class is on the avoid list",
 }
 
 
-def _reject_reason(opponent: str, we_go_second: bool, require_second: bool,
+def _reject_reason(opponent: str, we_go_second: bool | None, require_second: bool,
                    targets: list, avoid: list) -> str:
     """Why a *conceded* matchup was rejected, mirroring :meth:`hop.config.Criteria.accepts`
-    precedence EXACTLY (require_second first and class-independent; then target list; then
-    avoid list). Returns a key in :data:`_REJECT_LABELS`, or ``"misfire"`` when ``accepts``
-    would in fact have KEPT the matchup -- i.e. a reject fired on a game the criteria say to
-    keep, a real bug, flagged as loudly as the target_found misfire check. Only meaningful for
-    a game that genuinely rejected (the caller anchors on ``reject_plan``), so the three real
-    reasons are exhaustive and ``"misfire"`` is reached only on a true keep/reject inversion."""
+    precedence EXACTLY for known turns (require_second first and class-independent; then target
+    list; then avoid list). A missing turn is special: a class that would fail even with the
+    favorable coin (for example, Death Knight when only Priest is wanted) is deterministically
+    rejectable, so identify that class reason rather than claiming the unknown turn was decisive.
+    Returns a key in :data:`_REJECT_LABELS`, or ``"misfire"`` when ``accepts`` would in fact have
+    KEPT the matchup -- i.e. a reject fired on a game the criteria say to keep, a real bug,
+    flagged as loudly as the target_found misfire check. Only meaningful for a game that genuinely
+    rejected (the caller anchors on ``reject_plan``), so ``"misfire"`` is reached only on a true
+    keep/reject inversion."""
+    if require_second and we_go_second is None:
+        # Favorable-coin check for a malformed hand: an excluded/avoided class cannot become a
+        # target by being second, so the engine may safely reject it and the report can prove why.
+        if targets:
+            return "misfire" if _norm_class(opponent) in {_norm_class(t) for t in targets} else "not_targeted"
+        if avoid and _norm_class(opponent) in {_norm_class(a) for a in avoid}:
+            return "avoided"
+        return "turn_unreadable"
     if require_second and not we_go_second:
         return "went_first"
     if targets:
@@ -337,9 +401,6 @@ _DELIBERATE_HALTS: tuple[tuple[tuple[str, ...], str], ...] = (
      "a live game was in progress that THIS hunt did not queue, so hop refused to concede it (it "
      "may be YOUR game -- possibly the target it just alerted you to). Finish the game, or stop "
      "and restart the hunt from the deck's Play screen."),
-    (("matchmaking never matched", "still queueing"),
-     "matchmaking stayed in the queue past the poll bound (vision.queue_wait_attempts) -- a "
-     "soft-lock, not a hop fault. Check the phone's connection and restart the hunt."),
     (("failed to reconnect", "came back online"),
      "Hearthstone could not reconnect within the attempt cap (vision.reconnect_attempt_cap). "
      "External: the phone's network or the account needs attention, not a hop fault."),
@@ -579,6 +640,346 @@ def _live_transport_status_line(status) -> str:
     return "; ".join(bits)
 
 
+_POST_CONCEDE_TAPS = {
+    "concede": ("Concede", "normal"),
+    "concede_recovery": ("Concede", "recovery"),
+    "concede_now": ("Concede Now", "normal"),
+    "concede_now_recovery": ("Concede Now", "recovery"),
+    "post_concede_play": ("Play", "burst"),
+}
+
+
+def _point_text(value) -> str:
+    """Render a small endpoint payload without assuming one engine schema.
+
+    The post-concede evidence is deliberately additive: old journals only have a
+    nominal ``tap.point`` while newer ones may carry requested/display/native
+    endpoints.  This helper keeps the report useful across both shapes and never
+    lets malformed diagnostic payloads sink a report.
+    """
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return f"({float(value[0]):.0f},{float(value[1]):.0f})"
+        except (TypeError, ValueError):
+            return ""
+    if isinstance(value, dict):
+        for x, y in (("x", "y"), ("display_x", "display_y"),
+                     ("native_x", "native_y")):
+            if x in value and y in value:
+                try:
+                    return f"({float(value[x]):.0f},{float(value[y]):.0f})"
+                except (TypeError, ValueError):
+                    return ""
+    return ""
+
+
+def _matching_post_concede_terminal(events: list[dict], boundary_index: int,
+                                    boundary: dict) -> dict | None:
+    """Return only the terminal anomaly written directly for this boundary.
+
+    ``_post_concede_boundary_halt`` records its named boundary and immediately
+    saves its terminal frame.  A later terminal anomaly can belong to an entirely
+    different control path, so scanning the rest of the journal would attach the
+    wrong image or transport snapshot to this report narrative.
+    """
+    if boundary_index + 1 >= len(events):
+        return None
+    event = events[boundary_index + 1]
+    if not isinstance(event, dict) or event.get("kind") != "anomaly":
+        return None
+    detail = event.get("detail")
+    if not isinstance(detail, dict) or not detail.get("terminal"):
+        return None
+    reason = str(detail.get("reason") or "").lower()
+    shared = [key for key in ("state", "attempt", "recovery")
+              if key in detail and key in boundary]
+    context_matches = bool(shared) and all(detail[key] == boundary[key] for key in shared)
+    context_conflicts = any(detail[key] != boundary[key] for key in shared)
+    if ("post-concede" not in reason and not context_matches) or context_conflicts:
+        return None
+    return detail
+
+
+def _post_concede_lines(events: list[dict]) -> list[str]:
+    """Summarize an unexpected post-concede boundary without extra device work.
+
+    A normal bounded burst has no report line.  When its one boundary capture sees
+    an unsafe state, however, the raw sequence is otherwise scattered across 20+
+    tap records.  Reconstruct the last such trace from both the old
+    ``post_concede_unexpected_boundary`` event and the newer generic
+    ``post_concede_boundary`` contract.  The evidence says only that a write was
+    accepted by the host input stream -- never that Hearthstone acknowledged it.
+    """
+    current: dict | None = None
+    failures: list[dict] = []
+
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("kind")
+        detail = event.get("detail")
+        d = detail if isinstance(detail, dict) else {}
+        t = event.get("t")
+        stamp = float(t) if isinstance(t, (int, float)) else None
+
+        if kind == "tap":
+            what = str(d.get("what") or "")
+            if what == "gear":
+                # A direct reject always opens this compact trace from its named
+                # mulligan/board source.  A later gear supersedes an older completed
+                # trace, which is what a report about the *latest* halt needs.
+                current = {"taps": [], "sleeps": {}, "started": stamp}
+            if what in _POST_CONCEDE_TAPS:
+                if current is None:
+                    current = {"taps": [], "sleeps": {}, "started": stamp}
+                label, phase = _POST_CONCEDE_TAPS[what]
+                current["taps"].append({"what": what, "label": label, "phase": phase,
+                                        "point": d.get("point"), "t": stamp, "detail": d})
+
+        if current is not None and kind == "sleep":
+            reason = str(d.get("reason") or "")
+            if reason in ("post_concede_start_cooldown", "post_concede_click_cadence",
+                          "post_concede_queue_cooldown"):
+                seconds = d.get("seconds")
+                if isinstance(seconds, (int, float)):
+                    current["sleeps"].setdefault(reason, []).append(float(seconds))
+
+        if current is not None and kind == "post_concede_burst_complete":
+            current.setdefault("bursts", []).append(d)
+
+        if kind not in ("post_concede_unexpected_boundary", "post_concede_boundary"):
+            continue
+
+        # ``post_concede_boundary`` is deliberately logged before deciding whether
+        # its named warning/menu state needs the one bounded recovery. It is not a
+        # failure by itself. Only the legacy/named terminal event (or an explicitly
+        # terminal future boundary contract) earns a report narrative.
+        terminal = (kind == "post_concede_unexpected_boundary" or d.get("terminal") is True)
+        if not terminal:
+            continue
+        trace = current if current is not None else {"taps": [], "sleeps": {}, "bursts": [],
+                                                      "started": None}
+        # Freeze the trace at this terminal record. A generic recovery boundary can
+        # precede more taps/bursts; shallow-copying its lists would retroactively
+        # make an older trace look like the final one.
+        trace = {"taps": list(trace.get("taps", [])),
+                 "sleeps": {key: list(values) for key, values in trace.get("sleeps", {}).items()},
+                 "bursts": list(trace.get("bursts", [])), "started": trace.get("started")}
+        trace["boundary"] = d
+        trace["boundary_index"] = index
+        trace["boundary_t"] = stamp
+        failures.append(trace)
+
+    if not failures:
+        return []
+
+    trace = failures[-1]
+    boundary = trace["boundary"]
+    state = str(boundary.get("state") or boundary.get("boundary_state") or "?")
+    confidence = boundary.get("confidence")
+    source = str(boundary.get("source") or boundary.get("source_state") or "mulligan")
+    state_text = state + (f" (confidence {float(confidence):.3f})"
+                          if isinstance(confidence, (int, float)) else "")
+
+    taps = trace.get("taps") or []
+    parts = []
+    for label in ("Concede", "Concede Now", "Play"):
+        hits = [tap for tap in taps if tap.get("label") == label]
+        count_key = "concede_taps" if label == "Concede" else (
+            "concede_now_taps" if label == "Concede Now" else None)
+        authoritative = boundary.get(count_key) if count_key else None
+        if not hits and not isinstance(authoritative, int):
+            continue
+        points = [p for p in (_point_text(hit.get("point")) for hit in hits) if p]
+        point = points[0] if points and len(set(points)) == 1 else ""
+        count = authoritative if isinstance(authoritative, int) else len(hits)
+        recovery_count = sum(tap.get("phase") == "recovery" for tap in hits)
+        suffix = f" ({recovery_count} recovery)" if recovery_count else ""
+        parts.append(f"{label} {count}" + (f" at {point}" if point else "") + suffix)
+
+    bursts = [b for b in trace.get("bursts", []) if isinstance(b, dict)]
+    burst_parts = []
+    for burst in bursts:
+        configured = burst.get("configured")
+        emitted = burst.get("emitted")
+        elapsed = burst.get("elapsed_s")
+        maximum = burst.get("max_s")
+        if not (isinstance(configured, int) or isinstance(emitted, int)):
+            continue
+        burst_text = (f"Play {emitted if isinstance(emitted, int) else '?'}/"
+                      f"{configured if isinstance(configured, int) else '?'}")
+        if isinstance(elapsed, (int, float)):
+            burst_text += f" in {float(elapsed):.2f}s"
+        if isinstance(maximum, (int, float)):
+            burst_text += f" (limit {float(maximum):.2f}s)"
+        attempt = burst.get("attempt")
+        recovery = burst.get("recovery")
+        if isinstance(attempt, int):
+            burst_text += f" [attempt {attempt}, {recovery or 'normal'}]"
+        burst_parts.append(burst_text)
+    if burst_parts:
+        # Completion records are authoritative for every burst attempt.  They also
+        # keep a partial/timed-out Play run legible when raw tap logging was cut off.
+        parts = [p for p in parts if not p.startswith("Play ")]
+        parts.extend(burst_parts)
+
+    sleeps = trace.get("sleeps") or {}
+    wait_parts = []
+    labels = (("post_concede_start_cooldown", "start wait"),
+              ("post_concede_click_cadence", "burst gaps"),
+              ("post_concede_queue_cooldown", "quiet wait"))
+    for key, label in labels:
+        values = sleeps.get(key) or []
+        if values:
+            wait_parts.append(f"{label} {sum(values):.2f}s")
+
+    attempt = boundary.get("attempt")
+    recovery = boundary.get("recovery")
+    initial = boundary.get("initial_state")
+    attempt_text = ""
+    if isinstance(attempt, int):
+        attempt_text = f"; attempt {attempt} ({recovery or 'normal'})"
+        if initial:
+            attempt_text += f" after initial {initial}"
+    line = (f"- post-concede boundary: source {source} -> {state_text}{attempt_text}; "
+            + (", ".join(parts) if parts else "tap trace unavailable"))
+    if wait_parts:
+        line += "; " + ", ".join(wait_parts)
+    line += "."
+    out = [line]
+
+    # The boundary is deliberately the *only* semantic read after the open-loop
+    # Play burst.  The engine records this invariant explicitly rather than making
+    # the report reverse-engineer it from a particular timing configuration: the
+    # sealed floor is an observed Play->Mulligan minimum, not merely a timeout.
+    # Old journals have neither field and remain reportable without speculation.
+    mulligan_floor = boundary.get("mulligan_floor_s")
+    deadline_exceeded = boundary.get("mulligan_deadline_exceeded")
+    boundary_elapsed = boundary.get("elapsed_s")
+    if isinstance(mulligan_floor, (int, float)):
+        elapsed_text = (f"boundary {float(boundary_elapsed):.2f}s after first Play"
+                        if isinstance(boundary_elapsed, (int, float))
+                        else "boundary elapsed unavailable")
+        status_text = ("exceeded" if deadline_exceeded is True else
+                       "within" if deadline_exceeded is False else "unclassified against")
+        out.append("- post-concede successor timing: " + elapsed_text + "; calibrated "
+                   f"earliest Play->Mulligan arrival {float(mulligan_floor):.2f}s "
+                   f"({status_text} floor).")
+    if deadline_exceeded is True:
+        # This does not assert that every burst tap hit the next mulligan -- the
+        # journal has no screen reads inside the deliberately bounded burst. It
+        # states the stronger fact the new fields establish: a successor mulligan
+        # could have existed before the sole boundary read, so the terminal board
+        # cannot be treated as an OCR/criteria decision.
+        out.append("- likely post-concede cause: successor mulligan may have been missed: "
+                   "the sole boundary read came after the calibrated earliest "
+                   "Play->Mulligan arrival. The terminal screen is therefore not evidence "
+                   "that hop selected or accepted that opponent class.")
+
+    concede_times = [tap.get("t") for tap in taps if tap.get("label") == "Concede"
+                     and isinstance(tap.get("t"), (int, float))]
+    now_times = [tap.get("t") for tap in taps if tap.get("label") == "Concede Now"
+                 and isinstance(tap.get("t"), (int, float))]
+    if concede_times and now_times:
+        # Pair each confirmation with its own immediately preceding Concede. A
+        # recovery can happen much later, so subtracting the global min/max would
+        # hide a second too-fast confirmation behind the first normal-path tap.
+        gaps = [now - max(concede for concede in concede_times if concede <= now)
+                for now in now_times if any(concede <= now for concede in concede_times)]
+        gap = min(gaps) if gaps else None
+        if gap is not None and gap < 0.25:
+            out.append("- likely post-concede cause: Concede Now followed the last Concede "
+                       f"after {gap * 1000:.0f}ms. The confirmation may not have rendered yet, "
+                       "so this is a likely confirmation/render race rather than a queue delay.")
+
+    # A tap's ``actual_endpoint`` is synthesized *before* emitting it.  It proves
+    # the precise display coordinate that the gesture layer chose, not successful
+    # delivery to the app.  Prefer the final Play tap, then the final fixed tap.
+    endpoint_bits = []
+    endpoint_tap = next((tap for tap in reversed(taps)
+                         if tap.get("label") == "Play"), taps[-1] if taps else None)
+    if endpoint_tap:
+        d = endpoint_tap.get("detail") or {}
+        nominal = _point_text(d.get("nominal_point") or endpoint_tap.get("point"))
+        synthesized = _point_text(d.get("actual_endpoint"))
+        if nominal:
+            endpoint_bits.append(f"nominal display {nominal}")
+        if synthesized:
+            endpoint_bits.append(f"synthesized display endpoint {synthesized}")
+    if endpoint_bits:
+        out.append("- post-concede tap registration: " + "; ".join(endpoint_bits) + ".")
+
+    # A non-accepted boundary state necessarily came from ScreenClassifier's full
+    # fallback, whereas an accepted successor was returned by the scoped scan. The
+    # winning anchor location distinguishes a real board/control glyph from a
+    # suspicious match behind an overlay without claiming that it proves app input.
+    scan = boundary.get("classification_scan")
+    anchor_at = _point_text(boundary.get("anchor_at"))
+    scan_text = {
+        "scoped": "scoped scan (an expected successor matched)",
+        # ``full_fallback`` is the production spelling.  Keep ``full`` readable
+        # too, in case an early development journal used the shorter label.
+        "full_fallback": "full fallback scan (the boundary scope did not accept the result)",
+        "full": "full fallback scan (the boundary scope did not accept the result)",
+    }.get(scan)
+    if scan_text or anchor_at:
+        evidence = [scan_text] if scan_text else []
+        if anchor_at:
+            evidence.append(f"winning {state} anchor at {anchor_at}")
+        out.append("- post-concede classifier evidence: " + "; ".join(evidence) + ".")
+
+    terminal_anomaly = _matching_post_concede_terminal(
+        events, trace["boundary_index"], boundary)
+    transport = boundary.get("transport") or boundary.get("transport_after")
+    if not isinstance(transport, dict) and terminal_anomaly:
+        transport = terminal_anomaly.get("transport")
+    status = _live_transport_status_line(transport)
+    if status:
+        out.append("- post-concede transport: " + status + ".")
+    if isinstance(transport, dict):
+        cached_display = _point_text({"display_x": transport.get("last_display_x"),
+                                      "display_y": transport.get("last_display_y")})
+        cached_native = _point_text({"native_x": transport.get("last_native_x"),
+                                     "native_y": transport.get("last_native_y")})
+        last_write = transport.get("last_write_at")
+        cache_bits = []
+        if cached_display:
+            cache_bits.append(f"cached display endpoint {cached_display}")
+        if cached_native:
+            cache_bits.append(f"cached native endpoint {cached_native}")
+        if isinstance(last_write, (int, float)):
+            cache_bits.append(f"last host write {float(last_write):.3f}")
+        if cache_bits:
+            proof = ("; host/stream write acceptance only, not Hearthstone/app acknowledgment"
+                     if cached_display and isinstance(last_write, (int, float)) else "")
+            out.append("- post-concede transport endpoint: " + "; ".join(cache_bits) + proof + ".")
+        geometry_bits = []
+        if transport.get("rotation") is not None:
+            geometry_bits.append(f"rotation {transport['rotation']}")
+        panel_w, panel_h = transport.get("panel_width_px"), transport.get("panel_height_px")
+        if isinstance(panel_w, (int, float)) and isinstance(panel_h, (int, float)):
+            geometry_bits.append(f"panel {panel_w:.0f}x{panel_h:.0f}")
+        axes = []
+        for name, label in (("axis_touch_major_max", "major"),
+                            ("axis_touch_minor_max", "minor"),
+                            ("axis_pressure_max", "pressure"),
+                            ("axis_orientation_max", "orientation")):
+            value = transport.get(name)
+            if isinstance(value, (int, float)):
+                axes.append(f"{label}={value:.0f}")
+        if axes:
+            geometry_bits.append("axes " + ", ".join(axes))
+        if geometry_bits:
+            out.append("- post-concede transport geometry: " + "; ".join(geometry_bits) + ".")
+
+    if terminal_anomaly:
+        number = terminal_anomaly.get("index")
+        if isinstance(number, int) and number > 0:
+            out.append(f"- post-concede terminal evidence: anomaly_{number}_before.png "
+                       "(and an after frame when recorded).")
+    return out
+
+
 def summarize_journal(journal_text: str) -> str:
     """A human summary of a run journal: counts, the class distribution, and the tail.
 
@@ -600,15 +1001,8 @@ def summarize_journal(journal_text: str) -> str:
 
     kinds: dict[str, int] = {}
     classes: dict[str, int] = {}
-    reread_recovered = 0   # first read unusable, re-read resolved a class
-    reread_failed = 0      # re-read still unreadable (this is what precedes a halt)
-    unreadable_first = 0   # first reads that came back "?" (OCR whiffed)
-    # Games the class NEVER read (given up on after every re-read). Each entry is the engine's
-    # `mulligan_unreadable` detail: whether it recovered (conceded + requeued) or halted, and
-    # the class-region pixel stats that say WHY it was blank -- the datum older reports lacked.
-    unreadable_games: list[dict] = []
     # Reads that RESOLVED to a class but at a confidence low enough to be a silent misread. The
-    # engine acts on these as if certain (they never reach the re-read path), so the report must
+    # engine acts on these as if certain, so the report must
     # flag them or "opponents seen" reads as ground truth when it may be a garbled two-word label
     # snapped to a valid-but-wrong class -- the Demon-Hunter-read-as-Hunter bug.
     low_conf_reads: list[dict] = []
@@ -622,6 +1016,15 @@ def summarize_journal(journal_text: str) -> str:
     tap_costs: list[tuple[str, float, float]] = []   # (what, think_s, perception_s)
     seg_think = 0.0
     seg_perception = 0.0
+    # The queue/nameplate watch can last arbitrarily long and is deliberately
+    # capture-only. Keep its I/O visible, but never roll it into the eventual gear
+    # or concede reaction segment. Lifecycle events appeared with the watch; old
+    # journals simply retain the pre-contract per-tap segmentation.
+    match_watch_perception = 0.0
+    match_watch_starts = 0
+    match_watch_resolved = 0
+    match_watch_interrupted = 0
+    match_watch_active = False
     anomalies: list[str] = []
     sleeps: dict[str, float] = {}
     longest_sleeps: list[tuple[float, str]] = []
@@ -658,16 +1061,16 @@ def summarize_journal(journal_text: str) -> str:
     reject_reasons: dict[str, int] = {}
     reject_misfires: list[str] = []   # conceded a matchup the criteria say to KEEP -> a real bug
     last_read_opp = ""                # opponent of the most recent resolved (non-"?") mulligan_read
-    last_read_second = False
+    last_read_second: bool | None = None
     have_read = False                 # a resolved read is available to pair with a reject_plan
     # Trailing run of the last classified state, so a halt can be shown to have followed a BOUNDED
-    # wait (deck_select polled N times, queue polled N times) -- the shape that tells a deliberate
+    # wait (for example, deck_select polled N times) -- the shape that tells a deliberate
     # fail-closed guard (polls its budget, then stops) from a crash (bails mid-action). Distinct
     # from unknown_run_len, which counts only the trailing UNKNOWN looks.
     terminal_state = ""
     terminal_state_run = 0
     tf_opponent = ""
-    tf_second = False
+    tf_second: bool | None = None
     closest = ""
     false_halt_note = ""   # "waited for X to leave; X is gone, destination just unnamed"
     verified_then_halt = ""  # the last tap verified OK, then we halted "stuck": a false halt
@@ -678,6 +1081,7 @@ def summarize_journal(journal_text: str) -> str:
     # pass_turn beat is turn-gated (a no-op when End Turn is greyed on the opponent's turn).
     went_second = 0
     went_first = 0
+    turn_unreadable = 0
     coin_counted_game = False   # coin already tallied for the current game (once-per-game)
     concede_points: dict[str, int] = {}
     pass_turn_taps = 0
@@ -744,22 +1148,20 @@ def summarize_journal(journal_text: str) -> str:
             prev_t = float(t)
             prev_kind = k
         if k == "mulligan_read":
-            # "?" is a failed OCR, not a class -- counting it as an "opponent seen"
-            # made a recovered run read like a total failure. Count only real classes;
-            # track the whiff-then-recover story (reread=True) on its own line so the
-            # report answers "did class detection work?" instead of implying it didn't.
+            # Pending watch frames retain their event count/timestamps above (so
+            # capture cadence and OCR latency remain diagnosable), but are not a
+            # game and must not reset/tally the once-per-game coin guard or pair a
+            # later reject with stale data. Missing ``pending`` is legacy-resolved.
+            if _is_pending_mulligan_read(d):
+                continue
+            # "?" is a pending OCR, not an opponent class. Count only real classes.
             opp = d.get("opponent")
             is_reread = bool(d.get("reread"))
-            # Count a class only on a card-USABLE read, mirroring the engine's MulliganRead.usable
-            # (a real class AND cards in {3,4}) and its once-per-game class_distribution tally. A
-            # whiff-then-recover game journals the same class TWICE -- the unusable first read
-            # (class OK, cards miscounted to 0) and the recovering re-read -- and without this gate
-            # both were counted, printing "Mage×2" for one game and contradicting the engine's own
-            # count shown elsewhere in the report. There is at most one usable read per game (the
-            # first usable one ends the re-read loop), so this is exactly one count per game, and
-            # zero when none ever resolves (the engine halts before counting it too). A legacy
-            # journal line lacking `cards` is treated as usable, so older reports are unchanged.
-            if opp and opp != "?" and d.get("cards", 3) in (3, 4):
+            # A current engine can make a class-only decision when the card count is bad but
+            # `require_second` is off.  Its explicit decision is authoritative; pre-decision
+            # journals retain the old valid-card proxy so history is not reinterpreted.
+            actionable = bool(opp and opp != "?" and _is_actionable_mulligan_read(d))
+            if actionable:
                 classes[opp] = classes.get(opp, 0) + 1
                 conf = d.get("conf")
                 if isinstance(conf, (int, float)) and conf < LOW_CONF_FLAG:
@@ -768,38 +1170,50 @@ def summarize_journal(journal_text: str) -> str:
                     low_conf_reads.append({"opp": opp, "conf": float(conf),
                                            "raw": (d.get("class_raw") or "").strip(),
                                            "reread": is_reread})
-                if is_reread:
-                    reread_recovered += 1
-                # the resolved read a following reject_plan pairs its class + coin to (updated on
-                # the reread too, so a whiff-then-recover game rejects against the RESOLVED class)
-                last_read_opp, last_read_second, have_read = opp, bool(d.get("second")), True
-            elif opp == "?":
-                if is_reread:
-                    reread_failed += 1
-                else:
-                    unreadable_first += 1
-            # The coin is derived purely from the card count (we_go_second = cards>=4), so its
-            # truth lives in a read whose count is USABLE -- normally the first read, but when the
-            # first read's cards whiffed (num_cards not in {3,4} -> second forced False) a going-2nd
-            # game would mis-tally as 1st unless the recovering re-read supplies the coin. So tally
-            # the first valid-card read of each game (once-per-game guard, reset on each first
-            # read). Not gated on the class -- the coin reads even when the class OCR whiffs. A
-            # legacy line lacking `cards` is trusted as before.
+                # A readable class is the only kind of mulligan that can pair with
+                # a following reject plan.
+                last_read_opp, last_read_second, have_read = opp, _mulligan_turn(d), True
+            # The coin is derived purely from the card count (we_go_second = cards>=4).  A
+            # malformed hand now records its turn as unknown rather than false, so it must not
+            # inflate the going-first bucket.  A legacy line lacking `cards` stays trusted.
             if not is_reread:
                 coin_counted_game = False
-            cards_val = d.get("cards")
-            if not coin_counted_game and "second" in d and (cards_val is None or cards_val in (3, 4)):
-                if d.get("second"):
+            turn = _mulligan_turn(d)
+            decision = _mulligan_decision(d)
+            legacy_usable = d.get("cards") is None or d.get("cards") in (3, 4)
+            decision_resolved = decision in ("keep", "reject")
+            if not coin_counted_game and actionable and (decision_resolved or legacy_usable):
+                if turn is None:
+                    turn_unreadable += 1
+                elif turn:
                     went_second += 1
                 else:
                     went_first += 1
                 coin_counted_game = True
-        if k == "mulligan_unreadable":
-            # A game hop gave up reading the class for. Keep the whole detail: the summary
-            # reports how many recovered vs the one that halted, and reads out the last one's
-            # region_gray (the blank-vs-garbled datum) so the cause is in the report, not just
-            # the message.
-            unreadable_games.append(d)
+        if k == "match_watch_start":
+            # The capture/classify that first named QUEUE/VS preceded this dispatch,
+            # so drain the segment here as well as all later watch observations.
+            match_watch_perception += seg_perception
+            seg_perception = 0.0
+            match_watch_starts += 1
+            match_watch_active = True
+        if k == "match_watch_resolved":
+            # The resolved mulligan's capture/classify is still an observation; the
+            # following action starts a fresh reaction segment.
+            if match_watch_active:
+                match_watch_perception += seg_perception
+                seg_perception = 0.0
+                match_watch_active = False
+            match_watch_resolved += 1
+        if k == "match_watch_interrupted":
+            # A named modal/reconnect/error takes control back from the watch. Its
+            # preceding queue scans remain search observation, not reaction time for
+            # the interruption's next tap.
+            if match_watch_active:
+                match_watch_perception += seg_perception
+                seg_perception = 0.0
+                match_watch_active = False
+            match_watch_interrupted += 1
         if k == "reject_plan":
             # Where the reject grammar chose to bail. Chosen at RANDOM, independent of the
             # coin (journey.choose_concede_point) -- so a lopsided split here is just RNG,
@@ -815,7 +1229,7 @@ def summarize_journal(journal_text: str) -> str:
                                    crit_require_second, crit_targets, crit_avoid)
                 if r == "misfire":
                     reject_misfires.append(
-                        f"{last_read_opp} (going {'2nd' if last_read_second else '1st'})")
+                        f"{last_read_opp} ({_turn_label(last_read_second)})")
                 else:
                     reject_reasons[r] = reject_reasons.get(r, 0) + 1
                 have_read = False   # consume, so the next reject pairs with the next game's read
@@ -1065,7 +1479,16 @@ def summarize_journal(journal_text: str) -> str:
             crit_seen = True
         if k == "target_found":
             tf_opponent = str(d.get("opponent") or "?")
-            tf_second = bool(d.get("second"))
+            tf_second = _mulligan_turn(d)
+
+    # A user stop during an unusually long queue has no resolution event. Its
+    # observation latency is still real and must remain visible, just not attached
+    # to some unrelated future tap.
+    if match_watch_active:
+        match_watch_perception += seg_perception
+        seg_perception = 0.0
+
+    post_concede_lines = _post_concede_lines(events)
 
     out = [f"- events: {len(events)}"]
     if criteria:
@@ -1077,10 +1500,13 @@ def summarize_journal(journal_text: str) -> str:
         # read as correct. The common confusion this answers: an EMPTY class filter means ANY
         # class is a target, so a stop on a class you didn't tick is correct, not a bug.
         _norm = _norm_class   # shared with the reject-reason recompute (see _reject_reason)
-        coin = "going 2nd" if tf_second else "going 1st"
+        coin = _turn_label(tf_second)
         ok, why = True, []
-        if crit_require_second and not tf_second:
-            ok = False; why.append("require-going-2nd was set but this matchup went 1st")
+        if crit_require_second:
+            if tf_second is None:
+                ok = False; why.append("require-going-2nd was set but the turn/card count was unreadable")
+            elif not tf_second:
+                ok = False; why.append("require-going-2nd was set but this matchup went 1st")
         if crit_targets:
             if _norm(tf_opponent) in {_norm(t) for t in crit_targets}:
                 why.append(f"{tf_opponent} is in the target list")
@@ -1093,7 +1519,7 @@ def summarize_journal(journal_text: str) -> str:
                 why.append(f"{tf_opponent} is not on the avoid list (any other class is a target)")
         else:
             why.append("no class filter is set, so ANY class is a target")
-        if crit_require_second and tf_second:
+        if crit_require_second and tf_second is True:
             why.append("and the going-2nd requirement was met")
         verdict = ("matches the criteria — working as configured, NOT a misfire" if ok
                    else "does NOT match the criteria — a real MISFIRE; check evaluate_matchup/accepts")
@@ -1149,13 +1575,16 @@ def summarize_journal(journal_text: str) -> str:
                 + (f" (raw {r['raw']!r})" if r['raw'] else "") for r in low_conf_reads]
         out.append("- low-confidence class reads -- VERIFY (a garbled two-word label can snap to "
                    "a valid-but-wrong class): " + "; ".join(bits))
-    if went_first or went_second or concede_points:
+    if went_first or went_second or turn_unreadable or concede_points:
         # The coin/turn story, so "does it only concede on my turn / wait till turn 2 going
         # second?" is answered from the report instead of by hand-tracing. Concede is via the
         # gear menu and fires on EITHER turn; only the pass_turn *beat* is turn-gated (a no-op
         # when End Turn is greyed on the opponent's turn). A no-op End Turn going second is
         # therefore expected, not a stuck tap, and the concede still follows it.
         bits = [f"coin: {went_second} went 2nd / {went_first} went 1st"]
+        if turn_unreadable:
+            bits.append(f"{turn_unreadable} turn unreadable (the class was resolved, but the "
+                        "keep-glow card count could not establish the coin)")
         if concede_points:
             bits.append("concede points " + ", ".join(
                 f"{p}×{n}" for p, n in sorted(concede_points.items(), key=lambda kv: -kv[1]))
@@ -1185,48 +1614,13 @@ def summarize_journal(journal_text: str) -> str:
         else:
             out.append(f"- rejects vs criteria: {total} conceded, all correct per the criteria -- "
                        + "; ".join(parts) + ".")
-    if reread_recovered or reread_failed or unreadable_first:
-        # The whiff-then-recover story. A first-read miss that a re-read resolves is
-        # normal perception fallibility, NOT a fault -- say so, so a recovered run
-        # isn't mistaken for a broken one. A re-read that itself failed is the line
-        # that precedes a "could not read mulligan" halt; call it out.
-        parts = []
-        if reread_recovered:
-            parts.append(f"{reread_recovered} recovered by a re-read (first OCR whiffed, "
-                         "class resolved on the retry -- expected, not a fault)")
-        if unreadable_first and not reread_recovered and not reread_failed:
-            parts.append(f"{unreadable_first} first read(s) came back '?'")
-        if reread_failed:
-            parts.append(f"{reread_failed} still unreadable after the re-read (this is what precedes a halt)")
-        out.append("- mulligan reads: " + "; ".join(parts))
-    if unreadable_games:
-        # Games the class never read. Each RECOVERED (conceded + requeued) except possibly
-        # the last, which halts iff its streak hit the cap. Read out the last one's region_gray
-        # -- the datum that says whether the region was blank (nameplate not drawn: low std) or
-        # full of text the OCR still missed (region/OCR fault: high std) -- so the cause is in
-        # the report itself, no saved-frame archaeology needed.
-        halted = [g for g in unreadable_games if not g.get("recovering", True)]
-        recovered = len(unreadable_games) - len(halted)
-        last = unreadable_games[-1]
-        rg = last.get("region_gray") or {}
-        rg_txt = (f"class-region gray mean={rg.get('mean')} std={rg.get('std')} "
-                  f"(min={rg.get('min')} max={rg.get('max')})") if rg else "class-region stats unavailable"
-        interp = ""
-        std = rg.get("std")
-        if isinstance(std, (int, float)):
-            interp = ("  low std => the opponent nameplate had not drawn in (a render transient)"
-                      if std < 12 else
-                      "  high std => the nameplate text WAS present; suspect the OCR or the "
-                      "opponent_class_region alignment, not a slow render")
-        parts = []
-        if recovered:
-            parts.append(f"{recovered} recovered (conceded + requeued -- hunt kept running)")
-        if halted:
-            parts.append(f"{len(halted)} hit the halt streak (cap={halted[-1].get('cap')})")
-        out.append(f"- class NEVER read: {'; '.join(parts)}. last: {rg_txt}.{interp} "
-                   "(saved as an anomaly frame; see mulligan_unreadable in the journal)")
     if anomalies:
         out.append("- anomalies: " + "; ".join(anomalies[-5:]))
+    # A failed open-loop exit is the rare case where the report must make the
+    # exact fixed-coordinate trace legible without asking the reader to count
+    # two dozen raw tap records.  This is journal-only reconstruction: it adds no
+    # capture, delay, or healthy-path I/O.
+    out.extend(post_concede_lines)
     if dropped_taps:
         # Taps the client silently ignored, re-sent until honoured. A cluster of these is the
         # wireless link dropping INPUT (not just frames) -- the same failure a terminal
@@ -1266,6 +1660,18 @@ def summarize_journal(journal_text: str) -> str:
         # credit is NOT firing (a regression); a large number means it is.
         out.append(f"- think absorbed into latency: {think_credited:.1f}s not stacked on "
                    "top of screencap+classify (would otherwise be added to the reaction)")
+    if match_watch_starts:
+        status_parts = []
+        if match_watch_resolved:
+            status_parts.append(f"{match_watch_resolved} resolved")
+        if match_watch_interrupted:
+            status_parts.append(f"{match_watch_interrupted} interrupted")
+        if match_watch_active:
+            status_parts.append("still observing at run end")
+        status = ", ".join(status_parts) or "still observing at run end"
+        out.append(f"- match-search observation: {match_watch_perception:.1f}s "
+                   f"screencap/classify across {match_watch_starts} watch(es), {status}; "
+                   "excluded from per-tap reaction")
     if tap_costs:
         # Answers "why is <action> so slow?" directly: for the costliest taps, how much of
         # the wall-clock to reach+fire them was humanized THINKING vs perception (screencap
@@ -1367,8 +1773,8 @@ def summarize_journal(journal_text: str) -> str:
         # Name the terminal halt as a DELIBERATE fail-closed stop (not a malfunction) and say what
         # to do -- the single line that answers "is this a bug?" for the whole guard family, so a
         # reader doesn't have to know the engine to tell a designed stop from a crash. When the
-        # halt followed a run of the same screen (deck_select polled N times, queue polled N
-        # times), include that bounded-wait shape: a designed guard polls its budget then stops,
+        # halt followed a run of the same screen (for example, deck_select polled N times),
+        # include that bounded-wait shape: a designed guard polls its budget then stops,
         # where a crash bails mid-action, so "looked N×, then failed closed" is itself the tell.
         prefix = "- halt is a DELIBERATE fail-closed stop, not a malfunction: "
         if terminal_state and terminal_state_run >= 2:
@@ -1458,6 +1864,230 @@ def _ocr_unknown_frames(unknowns_dir: Path, names: list[str], *,
     return out
 
 
+def mulligan_card_count_evidence(journal_text: str) -> dict | None:
+    """Extract the newest structured mulligan card-count failure from a journal.
+
+    The old ``mulligan_read`` line could say only ``cards=0``.  That tells us *which*
+    perception signal failed, but not whether the colour plane vanished, the green strips
+    were absent, candidate card spans missed the width/brightness gates, or the hand-coherence
+    guard correctly rejected a partial hand.  New engines attach a bounded diagnostic dict to
+    their saved anomaly as ``mulligan_card_count``.  Keep the parser deliberately tolerant of
+    the short-lived standalone event spellings as well: reporting must never be the fragile part
+    of an exceptional halt.
+
+    The immediately preceding mulligan read supplies class/OCR context without duplicating it in
+    the diagnostic payload.  The returned values are all journal-safe primitives.
+    """
+    latest_read: dict = {}
+    found: dict | None = None
+    for line in journal_text.splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("kind")
+        detail = event.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        if kind == "mulligan_read":
+            latest_read = dict(detail)
+            continue
+
+        diagnostic = None
+        if kind == "anomaly":
+            diagnostic = detail.get("mulligan_card_count")
+        elif kind in ("mulligan_card_count", "mulligan_card_count_failure",
+                      "mulligan_card_count_unreadable"):
+            diagnostic = detail.get("diagnostics", detail.get("mulligan_card_count", detail))
+
+        if isinstance(diagnostic, dict):
+            index = detail.get("index")
+            decision = _mulligan_decision(detail) or _mulligan_decision(latest_read)
+            require_second = detail.get("require_second")
+            found = {
+                "diagnostics": diagnostic,
+                "read": dict(latest_read),
+                "anomaly_index": index if isinstance(index, int) and index > 0 else None,
+                "reason": str(detail.get("reason") or ""),
+                "decision": decision,
+                "require_second": require_second if isinstance(require_second, bool) else None,
+            }
+        elif (kind == "anomaly" and diagnostic is True and found is not None):
+            # Transitional writers may emit the metrics in a separate event followed by the
+            # anomaly that saved the PNG.  Marry the latter's index to the newest metrics.
+            index = detail.get("index")
+            if isinstance(index, int) and index > 0:
+                found["anomaly_index"] = index
+            if detail.get("reason"):
+                found["reason"] = str(detail["reason"])
+    return found
+
+
+def mulligan_card_count_evidence_frame(evidence: dict | None) -> str | None:
+    """Filename of the bounded colour frame associated with card-count evidence."""
+    if not evidence:
+        return None
+    index = evidence.get("anomaly_index")
+    if not isinstance(index, int) or index <= 0:
+        return None
+    return f"anomaly_{index}_before.png"
+
+
+def _span_text(value) -> str:
+    """Compact x-span rendering for JSON ``[start, end]`` values."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        start, end = value
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            return f"{start:g}\N{EN DASH}{end:g}"
+    return "?"
+
+
+def _number_text(value) -> str:
+    """Compact safe numeric rendering for a diagnostic field."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    return "?" if value is None else str(value)
+
+
+_MULLIGAN_CARD_REJECTIONS = {
+    "no_rgb": "no RGB colour plane was available, so green glow cannot be measured",
+    "frame_too_narrow": "the capture was below the safe minimum width",
+    "empty_card_row": "the calibrated card-row crop was empty",
+    "insufficient_glow_strips": "fewer than two qualifying green glow strips were found",
+    "no_candidate_interiors": "no span passed both the card-width and brightness gates",
+    "incoherent_hand": "candidate cards failed the contiguous/centred whole-hand guard",
+    "implausible_card_total": "the coherent candidate total was not three or four",
+    "ok": "the detector accepted the hand",
+}
+
+
+def format_mulligan_card_count_evidence(evidence: dict, *, frame_exists: bool) -> str:
+    """Render structured glow/card-count telemetry as a compact report section.
+
+    This is intentionally text-first: the important pass/fail measurements survive clipboard
+    paste, while the retained *colour* PNG can be attached if visual threshold tuning is still
+    needed.  It accepts a partially populated dict so journals from an interrupted write remain
+    reportable.
+    """
+    diagnostics = evidence.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return ""
+    read = evidence.get("read")
+    read = read if isinstance(read, dict) else {}
+    frame = diagnostics.get("frame")
+    frame = frame if isinstance(frame, dict) else {}
+    row = diagnostics.get("card_row")
+    row = row if isinstance(row, dict) else {}
+    thresholds = diagnostics.get("thresholds")
+    thresholds = thresholds if isinstance(thresholds, dict) else {}
+    out = [
+        "Hop retained this mulligan's colour frame and detector measurements because its "
+        "keep-glow card count was unreadable. The run may have halted or safely made a "
+        "class-only decision; the metrics below survive paste. Attach the PNG too if glow "
+        "thresholds need tuning.",
+        "",
+    ]
+
+    frame_name = mulligan_card_count_evidence_frame(evidence)
+    if frame_name:
+        if frame_exists:
+            out.append(f"- exact colour frame: `{frame_name}` (attach this PNG with the report)")
+        else:
+            out.append(f"- exact frame was journalled as `{frame_name}`, but is no longer on disk "
+                       "(anomaly retention may have pruned it)")
+    else:
+        out.append("- exact frame: unavailable (legacy/incomplete diagnostic record)")
+
+    opponent = read.get("opponent")
+    if opponent and opponent != "?":
+        raw = read.get("class_raw")
+        detail = f"opponent {opponent}"
+        if raw:
+            detail += f" (raw {raw!r})"
+        cards = read.get("cards")
+        if cards is not None:
+            detail += f"; reported cards={_number_text(cards)}"
+        detail += f"; {_turn_label(_mulligan_turn(read))}"
+        out.append(f"- mulligan read: {detail}")
+
+    decision = evidence.get("decision") or _mulligan_decision(read)
+    require_second = evidence.get("require_second")
+    if decision:
+        decision_text = f"- engine decision: {decision}"
+        if isinstance(require_second, bool):
+            decision_text += f"; require_second={str(require_second).lower()}"
+        if decision in ("keep", "reject") and _mulligan_turn(read) is None:
+            decision_text += " (class-only; no turn was invented)"
+        elif decision == "unusable":
+            decision_text += " (fail-closed: a valid turn was needed)"
+        out.append(decision_text)
+
+    w, h = frame.get("width"), frame.get("height")
+    if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+        colour = "RGB present" if frame.get("has_rgb") is True else "NO RGB"
+        out.append(f"- capture: {_number_text(w)}×{_number_text(h)}; {colour}")
+    if row:
+        keys = ("x", "y", "width", "height")
+        if all(k in row for k in keys):
+            out.append("- card-row crop: " + ", ".join(
+                f"{k}={_number_text(row[k])}" for k in keys))
+
+    rejection = str(diagnostics.get("rejection") or "unknown")
+    verdict = _MULLIGAN_CARD_REJECTIONS.get(rejection, rejection.replace("_", " "))
+    coherent = diagnostics.get("coherent")
+    coherent_note = "" if coherent is None else f"; coherent={str(bool(coherent)).lower()}"
+    out.append(f"- detector verdict: {verdict} (`{rejection}`){coherent_note}")
+
+    runs = diagnostics.get("glow_runs")
+    if isinstance(runs, list):
+        spans = ", ".join(_span_text(span) for span in runs[:12]) or "none"
+        more = " (truncated)" if diagnostics.get("glow_runs_truncated") else ""
+        count = diagnostics.get("glow_run_count")
+        out.append(f"- qualifying green strips, card-row-relative x "
+                   f"({_number_text(count)}): {spans}{more}")
+
+    candidates = diagnostics.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        bits = []
+        for c in candidates[:8]:
+            if not isinstance(c, dict):
+                continue
+            span = _span_text([c.get("start"), c.get("end")])
+            width = _number_text(c.get("width_px"))
+            mean = _number_text(c.get("mean_rgb"))
+            width_ok = "pass" if c.get("width_ok") else "fail"
+            bright_ok = "pass" if c.get("brightness_ok") else "fail"
+            chosen = "selected" if c.get("selected") else "rejected"
+            bits.append(f"{span} ({width}px, width {width_ok}; mean RGB {mean}, "
+                        f"brightness {bright_ok}; {chosen})")
+        if bits:
+            more = " (truncated)" if diagnostics.get("candidates_truncated") else ""
+            out.append("- inter-strip candidates: " + "; ".join(bits) + more)
+
+    interiors = diagnostics.get("candidate_interiors")
+    if isinstance(interiors, list):
+        spans = ", ".join(_span_text(span) for span in interiors[:12]) or "none"
+        out.append(f"- candidates passing both gates (absolute x): {spans}")
+
+    if thresholds:
+        glow = (f"G > R/B + {_number_text(thresholds.get('glow_green_bias'))}; "
+                f"G > {_number_text(thresholds.get('glow_min_green'))}; "
+                f"column >= {_number_text(thresholds.get('glow_column_min_rows'))} rows; "
+                f"strip >= {_number_text(thresholds.get('glow_min_strip_width_px'))}px")
+        card = (f"card width {_number_text(thresholds.get('expected_width_px'))} "
+                f"± {_number_text(thresholds.get('width_tolerance_px'))}px; "
+                f"mean RGB >= {_number_text(thresholds.get('min_mean_rgb'))}; "
+                f"minimum frame width {_number_text(thresholds.get('min_frame_width'))}px")
+        out.append(f"- active thresholds: {glow}; {card}")
+    return "\n".join(out)
+
+
 def terminal_evidence_frame(journal_text: str) -> str | None:
     """Return the saved frame name for the final named-but-stuck screen, if any.
 
@@ -1523,9 +2153,9 @@ def _recent_run_outcome(journal_text: str) -> str:
     crit_targets: list = []
     crit_avoid: list = []
     crit_require_second = False
-    last_read: tuple[str, bool] | None = None
-    last_reject: tuple[str, bool, str, int] | None = None
-    target: tuple[str, bool] | None = None
+    last_read: tuple[str, bool | None] | None = None
+    last_reject: tuple[str, bool | None, str, int] | None = None
+    target: tuple[str, bool | None] | None = None
     terminal: tuple[str, int] | None = None
 
     for index, event in enumerate(events):
@@ -1541,12 +2171,16 @@ def _recent_run_outcome(journal_text: str) -> str:
             crit_require_second = bool(detail.get("require_second"))
             crit_seen = True
         elif kind == "mulligan_read":
+            # A watch observation must not become the latest game for a following
+            # reject decision. Legacy records that lack the flag retain their old
+            # behavior; see `_is_pending_mulligan_read`.
+            if _is_pending_mulligan_read(detail):
+                continue
             opponent = detail.get("opponent")
-            cards = detail.get("cards", 3)
-            # Match the engine/summary's usable-read rule: a valid class plus a 3- or
-            # 4-card mulligan.  Legacy lines without `cards` stay usable.
-            if opponent and opponent != "?" and cards in (3, 4):
-                last_read = (str(opponent), bool(detail.get("second")))
+            # A new `decision` makes a class-only read actionable when the coin is
+            # intentionally irrelevant.  Legacy records still require 3/4 cards.
+            if opponent and opponent != "?" and _is_actionable_mulligan_read(detail):
+                last_read = (str(opponent), _mulligan_turn(detail))
         elif kind == "reject_plan" and last_read is not None:
             opponent, second = last_read
             reason = (_reject_reason(opponent, second, crit_require_second,
@@ -1555,7 +2189,7 @@ def _recent_run_outcome(journal_text: str) -> str:
             last_reject = (opponent, second, reason, index)
             last_read = None       # one reject consumes one game/read pairing
         elif kind == "target_found":
-            target = (str(detail.get("opponent") or "?"), bool(detail.get("second")))
+            target = (str(detail.get("opponent") or "?"), _mulligan_turn(detail))
         elif kind in ("halt", "stop") and detail.get("message"):
             terminal = (str(detail["message"]), index)
 
@@ -1567,17 +2201,23 @@ def _recent_run_outcome(journal_text: str) -> str:
 
     if target is not None:
         opponent, second = target
-        decision = f"TARGET FOUND {opponent} (going {'2nd' if second else '1st'})"
+        decision = f"TARGET FOUND {opponent} ({_turn_label(second)})"
         if crit_seen:
-            keep = (_reject_reason(opponent, second, crit_require_second,
-                                   crit_targets, crit_avoid) == "misfire")
-            decision += (" — matched the recorded criteria" if keep
-                         else " — DOES NOT match the recorded criteria (MISFIRE)")
+            verdict = _reject_reason(opponent, second, crit_require_second,
+                                     crit_targets, crit_avoid)
+            if verdict == "misfire":
+                decision += " — matched the recorded criteria"
+            elif verdict == "turn_unreadable":
+                decision += " — turn unreadable, so require_second cannot be independently verified"
+            else:
+                decision += " — DOES NOT match the recorded criteria (MISFIRE)"
     elif last_reject is not None:
         opponent, second, reason, reject_index = last_reject
-        decision = f"REJECTED {opponent} (going {'2nd' if second else '1st'})"
+        decision = f"REJECTED {opponent} ({_turn_label(second)})"
         if reason == "misfire":
             decision += " — criteria say KEEP (MISFIRE)"
+        elif reason == "turn_unreadable":
+            decision += " — turn unreadable; cannot independently verify the reject reason"
         elif reason:
             decision += f" correctly: {_REJECT_LABELS[reason]}"
         else:
@@ -2105,8 +2745,24 @@ def collect(description: str, paths: ReportPaths, *, version: str,
         if journal_text:
             summary = summarize_journal(journal_text)
             sections.append(Section(f"Latest run summary ({run_dir.name})", summary))
+            card_count = mulligan_card_count_evidence(journal_text)
+            card_count_frame = mulligan_card_count_evidence_frame(card_count)
+            if card_count:
+                sections.append(Section(
+                    "Mulligan card-count evidence",
+                    format_mulligan_card_count_evidence(
+                        card_count,
+                        frame_exists=bool(
+                            card_count_frame and (run_dir / card_count_frame).is_file()
+                        ),
+                    ),
+                ))
             terminal_frame = terminal_evidence_frame(journal_text)
-            if terminal_frame and (run_dir / terminal_frame).is_file():
+            # A cards=0 halt has its own colour-specific evidence section above.  Calling it a
+            # generic "named screen did not clear" would be both duplicate and wrong: the
+            # mulligan was named correctly; only its RGB keep-glow geometry was unreadable.
+            if (terminal_frame and terminal_frame != card_count_frame
+                    and (run_dir / terminal_frame).is_file()):
                 try:
                     ocr = ocr_probe(run_dir, [terminal_frame]) or {}
                 except Exception:

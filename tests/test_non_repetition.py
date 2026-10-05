@@ -87,12 +87,13 @@ def test_the_gate_really_does_saturate_without_resampling(cfg):
 # ── the pre-emit gate ────────────────────────────────────────────────────────
 
 class _AlternatingCapturer:
-    def __init__(self):
+    def __init__(self, width=80, height=40):
         self.n = 0
+        self.frames = (gray_frame(width, height, 20), gray_frame(width, height, 220))
 
     def capture(self):
         self.n += 1
-        return gray_frame(80, 40, 20 if self.n % 2 else 220)
+        return self.frames[(self.n - 1) % 2]
 
 
 def _engine(cfg, states, *, limiter=None, capturer=None):
@@ -150,7 +151,8 @@ def test_a_live_length_hunt_never_halts_on_non_repetition(cfg):
     locationless memory was dense enough that eight fresh tap draws all collided."""
     layout = GameLayout()
     seq = _game_sequence(layout)
-    eng, backend = _engine(cfg, [ScreenState.PLAY_SCREEN])
+    eng, backend = _engine(cfg, [ScreenState.PLAY_SCREEN],
+                           capturer=_AlternatingCapturer(PANEL.width_px, PANEL.height_px))
     eng.panel = PANEL
     for i in range(160):        # the failing report stopped at 154 actions
         eng._tap(seq[i % len(seq)], committing=False, decision_type="commit",

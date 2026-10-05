@@ -1,31 +1,29 @@
 """The opponent-picker hunt loop.
 
 Ties every layer together into the state machine that hunts for your target
-matchup. The anti-barcode design is realized here as the interaction of Layer 5
-(journey grammar + caps) with the timing layer: we *detect* the matchup at the
-mulligan (class OCR + card count) but *decide when to concede* on a human-like
-schedule, never insta-conceding.
+matchup. It detects the matchup at the mulligan (class OCR + card count): a
+target stops all input for the user, while a rejected, positively named
+mulligan follows the calibrated direct-concede and bounded click-through path.
 
 Flow per game:
 
     classify screen
       PLAY_SCREEN    -> tap Play (queue). This is the loop's home state: the
                         deck-detail screen Hearthstone returns to after a game.
-      QUEUE          -> wait (tapping while searching CANCELS the queue)
+      QUEUE/VS_SPLASH -> hands-off capture watch until the opponent class is readable
       MENU           -> HALT (main menu; the user must open Play and pick a deck)
-      VS_SPLASH      -> wait for the board
       MULLIGAN       -> read class + card-count
                           target?  -> ALERT + stop touching the game (you play)
-                          reject?  -> run the plausible-exit journey, then requeue
+                          reject?  -> direct named-mulligan concede, one bounded
+                                      Play-location click-through, then requeue
       VICTORY/DEFEAT/REWARDS -> dismiss -> back to PLAY_SCREEN -> requeue
       CONCEDE_MENU   -> tap Concede
       UNKNOWN        -> HALT + alert (fail closed; never blind-tap)
 
-Every tap goes through :meth:`_tap`, which sequences: stateful think time (L4) ->
-cap check (L5) -> capture-before -> synthesize gesture (L3) -> emit through the
-persistent transport (L1) -> capture-after -> verify + coherence (L6) -> advance
-HumanState (L5). Real sleeps and captures are injected so the decision logic is
-testable off-device.
+Fixed Pixel-7a controls use :meth:`_tap_fixed`: stateful think time, motor/limiter
+accounting, then one calibrated semantic phase check.  Small or exceptional controls
+still use :meth:`_tap` with before/after pixel verification.  Real sleeps and captures
+are injected so the decision logic is testable off-device.
 """
 
 from __future__ import annotations
@@ -35,9 +33,15 @@ from dataclasses import dataclass, field
 from random import Random
 
 from .adb import AdbError
-from .config import Config
+from .config import Config, MAX_UI_OPEN_DELAY_S, validate_config
 from .geometry import PanelGeometry
-from .hearthstone import GameLayout, MulliganRead, Point, read_mulligan
+from .hearthstone import (
+    GameLayout,
+    MulliganRead,
+    Point,
+    mulligan_card_count_diagnostics,
+    read_mulligan,
+)
 from .hero_classes import DISPLAY_NAMES, nearest_class
 from .humanize import journey, motor, timing
 from .humanize.contact import ContactModel
@@ -72,6 +76,7 @@ _PHASE_LABELS = {
     ScreenState.VS_SPLASH: "match starting…",
     ScreenState.COLLECTION: "backing out of Collection",
     ScreenState.INCOMPLETE_DECK: "incomplete-deck dialog",
+    ScreenState.CONCEDE_WARNING: "early-concede warning",
     ScreenState.MULLIGAN: "reading opponent (mulligan)",
     ScreenState.IN_GAME: "in game",
 }
@@ -101,6 +106,11 @@ _TRANSPORT_STATUS_FIELDS = (
     "connection_generation", "stream_generation", "reopen_count",
     "last_reopen_reason", "last_reopen_ok",
     "last_command", "last_write_at", "stderr_tail", "failure",
+    # Cached session geometry only: this is evidence for a coordinate diagnosis,
+    # never a live per-tap ADB probe.
+    "rotation", "panel_width_px", "panel_height_px", "axis_touch_major_max",
+    "axis_touch_minor_max", "axis_pressure_max", "axis_orientation_max",
+    "last_display_x", "last_display_y", "last_native_x", "last_native_y",
 )
 _TRANSPORT_STATUS_TEXT_LIMIT = 800
 
@@ -173,8 +183,23 @@ class RunStats:
 
 
 def evaluate_matchup(read: MulliganRead, cfg: Config) -> str:
-    """Pure decision: 'keep' (target), 'reject', or 'unusable' (can't read)."""
-    if not read.usable:
+    """Pure decision: ``keep``, ``reject``, or ``unusable``.
+
+    The opponent class is always essential.  The card count answers only one
+    criterion -- ``require_second`` -- so making it a universal prerequisite
+    needlessly stopped a known non-target on a transient green-glow miss.  If
+    the class itself cannot ever pass the criteria, reject it regardless of the
+    unknown coin.  If it could pass, require a valid turn only when the criteria
+    actually use one.  A class-only target is merely alerted (no card input),
+    and the direct reject path deliberately leaves the hand untouched.
+    """
+    if read.opponent_class is None:
+        return "unusable"
+    # Ask whether the class could be kept under the favourable coin result.
+    # A false answer makes rejection deterministic even for require_second=True.
+    if not cfg.criteria.accepts(read.opponent_class, True):
+        return "reject"
+    if cfg.criteria.require_second and read.num_cards not in (3, 4):
         return "unusable"
     return "keep" if cfg.criteria.accepts(read.opponent_class, read.we_go_second) else "reject"
 
@@ -244,6 +269,9 @@ class Engine:
         layout: GameLayout | None = None,
         capturer=None,
     ):
+        # Config may arrive from ``dataclasses.replace`` rather than TOML, so make
+        # the burst's hard timing proof before constructing any motor/transport state.
+        validate_config(cfg)
         self.cfg = cfg
         self.adb = adb
         self.backend = backend
@@ -277,25 +305,33 @@ class Engine:
         #: classification latency spent perceiving it is credited against the next tap's
         #: think time (see `_tap`) rather than stacked on top. None until the first look.
         self._perceived_at: float | None = None
+        #: Duration of the most recent successful screen read.  Polling is a cadence,
+        #: not an additional pause on top of a slow wireless screencap, so wait helpers
+        #: use this to sleep only the unspent part of their target cadence.
+        self._last_capture_s = 0.0
+        #: Fixed-coordinate buttons defer proof to the next named screen.  Counts are
+        #: deliberately keyed by button/site so a persistent source screen can retry a
+        #: bounded number of times without ever tapping through UNKNOWN.
+        self._fixed_tap_attempts: dict[str, int] = {}
         #: Scoped prior for the NEXT top-loop classify: the set of screens the branch we
         #: just ran expects to see next (e.g. QUEUE sets {queue, mulligan}). Consumed and
         #: reset to None every iteration, so a branch that sets nothing => full classify.
         #: A wrong guess only costs the full scan back (see classify_expected).
         self._expected_next = None
+        #: A deliberate phase-boundary classification performed by a fixed action.
+        #: The main loop consumes it instead of immediately taking the same screenshot again.
+        self._deferred_screen: tuple[Classification, Frame] | None = None
         self._reconnect_attempts = 0
         #: consecutive top-level dispatches that saw a live board
         self._in_game_polls = 0
-        #: consecutive top-level dispatches that saw the matchmaking queue
-        self._queue_polls = 0
+        #: Once matchmaking has been seen, the next game is deliberately watched
+        #: hands-off until its mulligan has a readable opponent class.  A slow queue
+        #: is not a fault on this phone: capture latency is its cadence, and no
+        #: timeout may turn a still-searching game into a stop.
+        self._awaiting_match_class = False
         #: consecutive top-level dispatches that saw the deck LIST (waiting, never tapping,
         #: for the user to re-select their deck after an error dropped us there)
         self._deck_select_polls = 0
-        #: consecutive GAMES whose opponent class never read (blank/garbled through every
-        #: re-read). One such game is a transient we recover from (concede + requeue, like a
-        #: human who can't ID the matchup); a *run* of them means the reader is systematically
-        #: broken and must fail closed for a human. Reset by any usable read. Mirrors the
-        #: `_reconnect_attempts` bounded-recovery pattern. See `_handle_mulligan`.
-        self._unreadable_mulligans = 0
         #: did THIS hunt queue the game currently in progress? Only a game we started
         #: may be conceded from the board - a board we found ourselves in is the user's.
         self._own_game = False
@@ -317,9 +353,9 @@ class Engine:
 
     def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep, but honour a stop request within ~one slice rather than after the
-        full delay. A single hunt iteration can wait through a 12 s requeue delay or a
-        match-start poll; without this, pressing Stop is not noticed until that wait
-        ends, so "immediate stop" felt like it hung. Raising unwinds any wait loop or
+        full delay. A single hunt iteration can wait through a calibrated semantic
+        cooldown or recovery poll; without this, pressing Stop is not noticed until that
+        wait ends, so "immediate stop" felt like it hung. Raising unwinds any wait loop or
         dispatch handler straight to :meth:`run`, which stops cleanly.
 
         Sliced by arithmetic, never by the clock, so it still terminates under the
@@ -354,14 +390,59 @@ class Engine:
     # ── the tap primitive (L3 -> L1 -> L6) ────────────────────────────────────
 
     def _capture(self) -> Frame:
-        self.adb.ensure_connected()
+        # Do not put a get-state round trip in front of every screencap.  On the Pixel
+        # it was an unjournalled extra wireless operation on the hot path, and a dead
+        # link is already handled safely by `_capture_resilient`'s bounded reconnect.
+        # Record the *start* of the successful perception interval: its latency is part
+        # of the reaction a user/app sees, rather than another delay stacked on top.
+        started = self.clock()
         frame = self._capture_resilient()
-        # When we last looked at the screen: the reference the next tap credits its
-        # perception latency against (see `_tap`). Capture-*done*, not -start, so the
-        # capture I/O itself is not credited -- deliberately conservative, biasing the
-        # reaction slightly longer (never inhumanly fast).
-        self._perceived_at = self.clock()
+        finished = self.clock()
+        if (frame.width, frame.height) != (self.panel.width_px, self.panel.height_px):
+            if self.debug:
+                self.debug.anomaly("captured frame no longer matches calibrated panel",
+                                   before=frame, frame_size=(frame.width, frame.height),
+                                   panel_size=(self.panel.width_px, self.panel.height_px))
+            raise Halt("display size/orientation changed; refusing fixed-coordinate tap",
+                       Halt.SIZE_MISMATCH)
+        self._last_capture_s = max(0.0, finished - started)
+        self._perceived_at = started
         return frame
+
+    def _paced_poll_sleep(self, anchor_s: float, reason: str, **detail) -> None:
+        """Spend only the part of a polling cadence not already spent capturing.
+
+        A Pixel 7a Wi-Fi screencap is normally about two seconds.  Adding a sampled
+        one-second poll sleep after every one made the *effective* cadence three
+        seconds, without buying another observation or any input safety.  Faster
+        devices still receive the ordinary humanized remainder.
+        """
+        requested = timing.human_delay(self.rng, anchor_s, self.cfg.timing)
+        capture_s = self._last_capture_s
+        remaining = max(0.0, requested - capture_s)
+        self._sleep_for(remaining, reason, requested_s=round(requested, 3),
+                        capture_s=round(capture_s, 3), **detail)
+
+    def _semantic_cooldown(self, anchor_s: float, reason: str, **detail) -> None:
+        """One randomized, calibrated wait before a semantic boundary check."""
+        seconds = timing.human_cooldown(self.rng, anchor_s, self.cfg.timing)
+        self._sleep_for(seconds, reason, anchor_s=anchor_s,
+                        verification="semantic_deferred", **detail)
+
+    def _ui_open_delay(self, seconds: float, reason: str, **detail) -> None:
+        """Wait an exact, short allowance for a user-visible control to render.
+
+        This is deliberately separate from :meth:`_semantic_cooldown`: a menu or
+        confirmation popup needs a small predictable render allowance, rather than
+        a randomized state-resolution wait.  The configured value is validated at
+        engine construction and checked here as a defensive boundary as well.
+        """
+        seconds = float(seconds)
+        if not 0 < seconds <= MAX_UI_OPEN_DELAY_S:
+            raise ValueError(
+                f"UI-opening delay must be within (0, {MAX_UI_OPEN_DELAY_S:g}] seconds")
+        self._sleep_for(seconds, reason, artificial=True,
+                        max_s=MAX_UI_OPEN_DELAY_S, **detail)
 
     def _capture_resilient(self) -> Frame:
         """One good frame, tolerating a *transient* capture failure instead of dying on it.
@@ -500,6 +581,120 @@ class Engine:
                 transport_before=before, transport_after=after,
             )
 
+    def _tap_fixed(
+        self,
+        point: Point,
+        *,
+        committing: bool,
+        decision_type: str,
+        what: str,
+        visual_complexity: float = 0.2,
+        novelty: float = 0.0,
+    ) -> None:
+        """Emit a known fixed button without generic pixel verification.
+
+        The caller may use this only from a positively classified source state and
+        must name a later semantic classification that proves success.  It preserves
+        the same motor trajectory, limiter bookkeeping, HumanState trajectory and
+        latency-aware think sample as :meth:`_tap`, but avoids two redundant wireless
+        screencaps for controls whose next named state already supplies that proof.
+        """
+        think = timing.think_time(
+            self.rng, decision_type, self.cfg.timing, self.state,
+            visual_complexity=visual_complexity, novelty=novelty,
+        )
+        latency = (0.0 if self._perceived_at is None
+                   else max(0.0, self.clock() - self._perceived_at))
+        # A fixed action is already preceded by a named phase/capture whose measured
+        # latency is human-scale.  Unlike pixel-verified taps, do not stack another
+        # irreducible reaction floor after that latency.
+        wait = timing.credit_latency(think, latency, 0.0)
+        self._sleep_for(wait, "tap_think", what=what, decision_type=decision_type,
+                        committing=committing, think_s=round(think, 3),
+                        credited_s=round(think - wait, 3),
+                        latency_s=round(latency, 3), verification="semantic_deferred")
+
+        tx, ty, radius = point.to_px(self.panel)
+        gesture = self._synth_non_repeating_tap(tx, ty, radius)
+        # The in-contact endpoint includes the bounded micro-slip, so report its
+        # true geometric envelope rather than claiming it is constrained by the
+        # nominal target disc alone. Motor synthesis draws slip below 1.5x its
+        # configured scale, so this is a hard inclusive telemetry bound.
+        endpoint_radius = radius * 0.9 + 1.5 * self.cfg.motor.tap_micro_slip_px
+        if self.debug:
+            self.debug.record("tap", what=what, point=(round(tx), round(ty)),
+                              nominal_point=(round(tx), round(ty)),
+                              actual_endpoint=tuple(round(v) for v in gesture.endpoint()),
+                              radius_px=round(endpoint_radius, 3),
+                              target_radius_px=round(radius, 3),
+                              duration_s=round(gesture.duration, 4),
+                              expected="semantic_next_state", scoped=False,
+                              verification="semantic_deferred",
+                              latency_s=round(latency, 3))
+        self._emit_gesture(gesture, what=what)
+        self.limiter.register_action(committing)
+        self.limiter.remember_trajectory(gesture)
+
+        # Draw and account for the same settle component so HumanState remains a
+        # faithful trajectory.  Do not sleep it separately: the mandatory next
+        # semantic screencap is already longer than this Pixel's ~0.6 s settle.
+        settle = timing.human_delay(self.rng, 0.6, self.cfg.timing)
+        self.state.tick(self.rng, dt=think + settle,
+                        action=("commit" if committing else decision_type))
+        if self.debug:
+            self.debug.record("tap_timing", what=what, think_s=round(think, 3),
+                              settle_s=round(settle, 3),
+                              verification="semantic_deferred",
+                              settle_paced_by="next_semantic_capture")
+
+    def _tap_open_loop(self, point: Point, *, committing: bool, what: str) -> None:
+        """Emit one tap in a bounded, already-authorized fixed-coordinate burst.
+
+        The reject fast path has no useful visual observation between these taps: the
+        post-concede stack consumes the same Play location, and extra taps while the
+        next game searches are inert.  Deliberation happened before opening the
+        burst; its configured cooldown cadence is the only app-facing wait here.
+        In particular, this must never capture or classify.
+        """
+        # A Stop can race a completed cadence sleep.  Check again at the last
+        # possible point, before even synthesizing an input that could be emitted.
+        if self._stop:
+            raise StopRequested()
+        tx, ty, radius = point.to_px(self.panel)
+        gesture = self._synth_non_repeating_tap(tx, ty, radius)
+        endpoint_radius = radius * 0.9 + 1.5 * self.cfg.motor.tap_micro_slip_px
+        if self.debug:
+            self.debug.record("tap", what=what, point=(round(tx), round(ty)),
+                              nominal_point=(round(tx), round(ty)),
+                              actual_endpoint=tuple(round(v) for v in gesture.endpoint()),
+                              radius_px=round(endpoint_radius, 3),
+                              target_radius_px=round(radius, 3),
+                              duration_s=round(gesture.duration, 4),
+                              expected="open_loop_burst", scoped=False,
+                              verification="burst")
+        # Synthesis itself can take long enough for a Stop to race in.  Recheck at
+        # the last possible boundary before the gesture reaches the transport.
+        if self._stop:
+            raise StopRequested()
+        self._emit_gesture(gesture, what=what)
+        self.limiter.register_action(committing)
+        self.limiter.remember_trajectory(gesture)
+        # A burst still advances the latent interaction trajectory.  Its real elapsed
+        # time is accounted by the cadence sleeps surrounding it; zero here avoids
+        # pretending an extra invisible delay occurred.
+        self.state.tick(self.rng, dt=0.0, action="commit" if committing else "burst")
+
+    def _fixed_attempt(self, key: str, limit: int) -> int:
+        """Reserve a bounded semantic retry; never reserve an extra blind tap."""
+        used = self._fixed_tap_attempts.get(key, 0)
+        if used >= max(1, limit):
+            raise Halt(f"{key} did not reach its semantic destination after {used} tap(s)")
+        self._fixed_tap_attempts[key] = used + 1
+        return used + 1
+
+    def _clear_fixed_attempt(self, key: str) -> None:
+        self._fixed_tap_attempts.pop(key, None)
+
     def _tap(
         self,
         point: Point,
@@ -541,7 +736,8 @@ class Engine:
         wait = timing.credit_latency(think, latency, floor)
         self._sleep_for(wait, "tap_think", what=what or "?",
                         decision_type=decision_type, committing=committing,
-                        think_s=round(think, 3), credited_s=round(think - wait, 3))
+                        think_s=round(think, 3), credited_s=round(think - wait, 3),
+                        latency_s=round(latency, 3), verification="pixel")
 
         tx, ty, radius = point.to_px(self.panel)
         before = self._capture()
@@ -635,10 +831,8 @@ class Engine:
         if self.deduper.advanced(after):
             return after                       # already moved; nothing to wait for
         for _ in range(max(0, self.cfg.vision.motion_wait_attempts)):
-            self._sleep_for(
-                timing.human_delay(self.rng, self.cfg.vision.screen_wait_poll_s,
-                                   self.cfg.timing),
-                "await_screen_motion")
+            self._paced_poll_sleep(self.cfg.vision.screen_wait_poll_s,
+                                   "await_screen_motion")
             frame = self._capture()
             if self.deduper.advanced(frame):
                 if self.debug:
@@ -731,12 +925,12 @@ class Engine:
         for _ in range(attempts - 1):
             if cls.state != ScreenState.UNKNOWN:
                 break
-            self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
-                            "unknown_settle")
+            self._semantic_cooldown(self.cfg.vision.screen_wait_poll_s,
+                                    "unknown_settle")
             cls, frame = self._classify(expected)
         return cls, frame
 
-    # ── waiting by looking, never by sleeping ────────────────────────────────
+    # ── bounded semantic waits and screen reads ──────────────────────────────
 
     def _record_unknown(self, frame: Frame | None, *, where: str, **context) -> None:
         """Keep the pixels of a screen we could not name. See :mod:`hop.debuglog`.
@@ -791,13 +985,35 @@ class Engine:
                 return True, cls, frame
             if self.clock() >= deadline:
                 break
-            self._sleep_for(timing.human_delay(self.rng, poll_s, self.cfg.timing),
-                            "wait_until_poll", what=what, state=cls.state.value)
+            self._paced_poll_sleep(poll_s, "wait_until_poll", what=what,
+                                   state=cls.state.value)
             cls, frame = self._classify(expected)
         satisfied = predicate(cls, frame)
         if not satisfied and self.debug:
             self.debug.record("wait_timeout", what=what, state=cls.state.value)
         return satisfied, cls, frame
+
+    def _wait_semantic(self, predicate, *, what: str, cooldown_s: float,
+                       attempts: int, expected=None) -> tuple[bool, Classification, Frame]:
+        """Wait in full calibrated intervals, then make one named-state check.
+
+        This deliberately replaces screenshot-driven one-second polling on the
+        fixed phone.  A persistent source state is useful retry evidence; UNKNOWN
+        is not, and receives another full interval rather than a tight capture loop.
+        """
+        cls = None
+        frame = None
+        for check in range(max(1, attempts)):
+            self._semantic_cooldown(cooldown_s, f"{what}_cooldown",
+                                    check=check + 1, of=max(1, attempts))
+            cls, frame = self._classify(expected)
+            if predicate(cls, frame):
+                return True, cls, frame
+        assert cls is not None and frame is not None
+        if self.debug:
+            self.debug.record("wait_timeout", what=what, state=cls.state.value,
+                              verification="semantic_deferred")
+        return False, cls, frame
 
     def _wait_until_screen_leaves(self, state: ScreenState, *, where: str, stuck: str,
                                   arrivals=(), attempts: int | None = None,
@@ -869,17 +1085,28 @@ class Engine:
                 now = self.clock()
                 self.limiter.register_time(now - last)
                 last = now
-                # Consume-once: the previous iteration's branch may have left a scoped
-                # prior for this look; clear it first so a branch that sets nothing this
-                # time falls back to a full classify next time.
-                expected, self._expected_next = self._expected_next, None
-                cls, frame = self._classify_settled(expected)
+                # While searching (or while the mulligan nameplate is still drawing),
+                # one immediate scoped capture is the entire heartbeat.  In particular,
+                # do not use _classify_settled here: an UNKNOWN animation is simply the
+                # next watch observation, not a reason to add an artificial sleep.
+                if self._awaiting_match_class:
+                    cls, frame = self._classify({ScreenState.QUEUE, ScreenState.VS_SPLASH,
+                                                 ScreenState.MULLIGAN})
+                else:
+                    # Consume-once: the previous iteration's branch may have left a scoped
+                    # prior for this look; clear it first so a branch that sets nothing this
+                    # time falls back to a full classify next time.
+                    expected, self._expected_next = self._expected_next, None
+                    if self._deferred_screen is not None:
+                        cls, frame = self._deferred_screen
+                        self._deferred_screen = None
+                    else:
+                        cls, frame = self._classify_settled(expected)
                 self.phase = _phase_label(cls.state)
                 self._dispatch(cls, frame)
-                # inter-action spacing (never burst)
-                self._sleep_for(
-                    timing.between_actions(self.rng, self.cfg.timing, self.state),
-                    "loop_between_actions", state=cls.state.value)
+                # The next loop begins with a wireless screencap (~2 s on the fixed
+                # Pixel 7a).  A second unconditional inter-action sleep used to stack
+                # on top of both branch-specific pacing and that capture.
                 if self.stats.target_found:
                     # The hunt's designed SUCCESS exit: a target matchup appeared, we alerted
                     # (_alert_target) and stop touching the game so the user plays it. Record
@@ -921,45 +1148,28 @@ class Engine:
         return self.stats
 
     def _tap_play(self) -> None:
-        """Tap the deck's Play button, retrying a tap this client silently dropped.
+        """Tap Play once and defer proof to the calibrated named-state boundary.
 
-        Play is a BUTTON tap on an otherwise static screen, unlike Concede: there is no
-        ambient board animation to mask a miss, so a dropped Play tap shows LITERALLY
-        ZERO pixel change on every post-tap look -- `_tap`'s own multi-poll
-        `_await_screen_motion` and its one evidence-based correction both agree nothing
-        moved (``Halt.NO_CHANGE``). That is exactly the failure `_replace_card` already
-        retries against (this client drops button taps too, not just card taps) -- and
-        until now Play was the one
-        committing tap in the whole loop with NO retry budget, so one dropped Play tap
-        failed the entire hunt closed before a single game was even queued.
-
-        ``allow_correction=False`` disables `_tap`'s OWN inner correction: this loop
-        already supplies the evidence-based retry, so a second one inside `_tap` would
-        only double the settle+capture latency per attempt without changing the
-        outcome. Unlike a mulligan card, there is no "keep it and carry on" here -- Play
-        is how every game in the hunt starts, so exhausting the budget still fails
-        closed, with a message naming this as a dropped tap, not a bad coordinate.
+        A persistent positively named Play screen is the only condition that may
+        consume its bounded retry budget on a later dispatch. No per-tap pixel
+        verification or short timeout is inserted ahead of the Play-to-mulligan
+        cooldown, and the resulting boundary frame is reused by the main loop.
         """
         attempts = max(1, self.cfg.vision.play_tap_attempts)
-        for attempt in range(attempts):
-            try:
-                self._tap(self.layout.play_button, committing=False, decision_type="commit",
-                          expected_change="full_transition", novelty=0.1,
-                          allow_correction=False, what="play")
-                return
-            except Halt as e:
-                if e.kind != Halt.NO_CHANGE:
-                    raise
-                if attempt + 1 == attempts:
-                    raise Halt(
-                        f"Play did not queue a game after {attempts} tap(s); the screen "
-                        "never moved, so the tap is not registering (a dropped "
-                        "committing tap, not a wrong coordinate) -- Play's own "
-                        "coordinate was the only one ever tapped.")
-                if self.debug:
-                    self.debug.record("play_tap_ignored", attempt=attempt + 1, of=attempts)
-                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
-                                "play_retry", attempt=attempt + 1)
+        attempt = self._fixed_attempt("play", attempts)
+        if attempt > 1 and self.debug:
+            self.debug.record("play_tap_ignored", attempt=attempt - 1, of=attempts,
+                              verification="semantic_source_persisted")
+        self._tap_fixed(self.layout.play_button, committing=False, decision_type="commit",
+                        novelty=0.1, what="play")
+        self._semantic_cooldown(self.cfg.timing.play_to_mulligan_cooldown_s,
+                                "play_cooldown", attempt=attempt)
+        cls, frame = self._classify(
+            {ScreenState.PLAY_SCREEN, ScreenState.QUEUE, ScreenState.VS_SPLASH,
+             ScreenState.MULLIGAN, ScreenState.ERROR_DIALOG})
+        # This is a phase boundary, not a generic pixel verification.  It is consumed
+        # by the next loop iteration so we never recapture merely to dispatch it.
+        self._deferred_screen = (cls, frame)
 
     def _tap_dispatch_button(self, point: Point, *, expected_change: str, what: str,
                              label: str) -> None:
@@ -971,31 +1181,38 @@ class Engine:
         ``allow_correction=False`` is right here too.
         """
         attempts = max(1, self.cfg.vision.dispatch_tap_attempts)
-        for attempt in range(attempts):
-            try:
-                self._tap(point, committing=False, decision_type="commit",
-                          expected_change=expected_change, allow_correction=False, what=what)
-                return
-            except Halt as e:
-                if e.kind != Halt.NO_CHANGE:
-                    raise
-                if attempt + 1 == attempts:
-                    raise Halt(
-                        f"{label} did not register after {attempts} tap(s); the screen "
-                        "never moved, so the tap is not registering (a dropped "
-                        f"committing tap, not a wrong coordinate) -- {label}'s own "
-                        "coordinate was the only one ever tapped.")
-                if self.debug:
-                    self.debug.record(f"{what}_tap_ignored", attempt=attempt + 1, of=attempts)
-                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
-                                f"{what}_retry", attempt=attempt + 1)
+        attempt = self._fixed_attempt(what, attempts)
+        if attempt > 1 and self.debug:
+            self.debug.record(f"{what}_tap_ignored", attempt=attempt - 1, of=attempts,
+                              verification="semantic_source_persisted")
+        self._tap_fixed(point, committing=False, decision_type="commit", what=what)
 
     def _dispatch(self, cls: Classification, frame: Frame) -> None:
         st = cls.state
+        # The match watch has exactly three benign observations: queue, VS, and an
+        # as-yet unreadable mulligan.  Anything else is an interruption or arrival
+        # and must resume the ordinary, named-state dispatcher.  Do this before the
+        # normal retry/accounting reset below so a modal cannot inherit watch state.
+        if self._awaiting_match_class:
+            if st in (ScreenState.QUEUE, ScreenState.VS_SPLASH, ScreenState.UNKNOWN):
+                return
+            # MULLIGAN is handled below by the class gate; every other named state
+            # is an interruption and therefore ends the hands-off match watch.
+            if st != ScreenState.MULLIGAN:
+                self._end_match_watch(outcome="interrupted", state=st.value)
+        # A changed, positively classified state is the semantic proof for its fixed
+        # predecessor.  Conversely, a source that persists is the only condition that
+        # permits the bounded retry below.
+        if st != ScreenState.PLAY_SCREEN:
+            self._clear_fixed_attempt("play")
+        if st != ScreenState.ERROR_DIALOG:
+            self._clear_fixed_attempt("error_ok")
+        if st != ScreenState.COLLECTION:
+            self._clear_fixed_attempt("collection_back")
+        if st != ScreenState.CONCEDE_MENU:
+            self._clear_fixed_attempt("concede")
         if st != ScreenState.IN_GAME:
             self._in_game_polls = 0
-        if st != ScreenState.QUEUE:
-            self._queue_polls = 0
         if st != ScreenState.DECK_SELECT:
             # left the deck list (the user re-selected, or we never landed there): the pause
             # counter resets so the next drop-back starts a fresh wait budget and the hunt
@@ -1003,8 +1220,8 @@ class Engine:
             self._deck_select_polls = 0
         if st == ScreenState.ERROR_DIALOG:
             # "There was an error starting your game." - a transient network blip.
-            # Dismiss and let the loop requeue; no long backoff is warranted, the
-            # journey's own requeue delay supplies the human pacing.
+            # Dismiss and let the loop requeue; its calibrated Play boundary supplies
+            # the pacing rather than an extra arbitrary delay here.
             if self.debug:
                 self.debug.record("error_dialog_dismissed")
             self._tap_dispatch_button(self.layout.error_ok, expected_change="full_transition",
@@ -1026,9 +1243,9 @@ class Engine:
             # whole hunt on a transient blip (which forced a full restart), it PAUSES: alert
             # once, then wait -- re-looking, never tapping -- and let the loop resume by
             # itself the moment the user is back on a deck's Play screen (the reset above
-            # clears this counter and the play branch queues again, stats intact). Bounded
-            # like the queue wait: if nobody re-selects within the budget, fail closed
-            # exactly as before, so a walked-away session still stops cleanly.
+            # clears this counter and the play branch queues again, stats intact). This
+            # separate human-intervention pause remains bounded: if nobody re-selects
+            # within the budget, fail closed so a walked-away session stops cleanly.
             self._deck_select_polls += 1
             if self._deck_select_polls > max(1, self.cfg.vision.deck_select_wait_attempts):
                 raise Halt("dropped back to the deck list and nobody re-selected a deck; hop "
@@ -1059,21 +1276,10 @@ class Engine:
             # the transition lags). Scope it; the floor still catches an error dialog.
             self._expected_next = {ScreenState.PLAY_SCREEN, ScreenState.QUEUE}
         elif st == ScreenState.QUEUE:
-            # Searching for an opponent - tapping here CANCELS the queue, so the only
-            # safe move is to wait. That made this the loop's one reachable infinite
-            # spin: a matchmaking soft-lock holds a static screen, and no cap could ever
-            # fire because every cap used to be checked inside `_tap`. Bound it.
-            self._queue_polls += 1
-            if self._queue_polls > max(1, self.cfg.vision.queue_wait_attempts):
-                raise Halt(f"still queueing after {self._queue_polls} polls; "
-                           "matchmaking never matched")
-            self._sleep_for(timing.human_delay(self.rng, 1.5, self.cfg.timing),
-                            "queue_wait")
-            # The dominant heartbeat: up to `queue_wait_attempts` polls, each a full
-            # ~3.8 s classify today. Next look is still-queue or the mulligan we matched
-            # into (this client fades queue->black->mulligan); the floor still catches a
-            # disconnect/error that struck while we waited -- the classic long-queue risk.
-            self._expected_next = {ScreenState.QUEUE, ScreenState.MULLIGAN}
+            # Queue controls can cancel search.  Once it is positively named, capture
+            # and scoped classification are the sole cadence until a class resolves;
+            # a slow search is allowed to run indefinitely until Stop is requested.
+            self._begin_match_watch(source="queue")
         elif st == ScreenState.COLLECTION:
             # hop is never meant to be here; a stray navigation got us in. Back out to
             # the deck list (a home screen) rather than halt. See ScreenState.COLLECTION.
@@ -1085,18 +1291,25 @@ class Engine:
             raise Halt("at the Hearthstone main menu; open Play and select a deck first "
                        "(the hunt loop queues from that deck's Play screen)")
         elif st == ScreenState.VS_SPLASH:
-            self._sleep_for(timing.human_delay(self.rng, 1.2, self.cfg.timing),
-                            "vs_splash_wait")
+            self._begin_match_watch(source="vs_splash")
         elif st == ScreenState.MULLIGAN:
-            self._handle_mulligan(frame)
+            self._gate_mulligan_class(frame)
         elif st in (ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
                     ScreenState.RANK_PROGRESS, ScreenState.QUEST_POPUP):
             self._clear_end_screens()
+        elif st == ScreenState.CONCEDE_WARNING:
+            # A Black Market warning is only safe to tap when `_post_concede_clickthrough`
+            # already owns the just-rejected game.  A generic dispatch could be observing a
+            # user's in-progress board, so never turn this named modal into a blind action.
+            raise Halt("early-concede warning outside the owned post-concede trace")
         elif st == ScreenState.CONCEDE_MENU:
             # commit, not reject: the decision to concede was already made; tapping the
             # Concede button is executing it, not deliberating it again (see _concede).
-            self._tap(self.layout.concede_button, committing=True, decision_type="commit",
-                      expected_change="full_transition", what="concede")
+            attempt = self._fixed_attempt("concede", self.cfg.vision.concede_tap_attempts)
+            self._tap_fixed(self.layout.concede_button, committing=True, decision_type="commit",
+                            what="concede")
+            self._semantic_cooldown(self.cfg.timing.concede_resolve_cooldown_s,
+                                    "concede_cooldown", attempt=attempt)
         elif st == ScreenState.IN_GAME:
             self._handle_in_game()
         else:  # UNKNOWN -> fail closed
@@ -1142,7 +1355,7 @@ class Engine:
             timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
                               visual_complexity=0.6),
             "unread_game_concede_think")
-        conceded = self._concede()
+        conceded = self._concede(known_state=ScreenState.IN_GAME)
         self._clear_end_screens()
         self._book_game(conceded)
 
@@ -1225,15 +1438,16 @@ class Engine:
         self._own_game = False
         self._in_game_polls = 0
 
-        # randomized requeue delay (humans don't requeue instantly)
-        self._sleep_for(timing.human_delay(self.rng, 12.0, self.cfg.timing),
-                        "requeue_delay")
+        # The direct reject path has already performed its post-concede queue boundary;
+        # other paths reuse their next semantic read rather than adding a stale requeue sleep.
+        if self.debug:
+            self.debug.record("requeue_deferred", paced_by="next_semantic_capture")
 
     def _reconnect(self) -> None:
         """Tap Reconnect once, then wait out the asynchronous reconnect.
 
-        Hearthstone shuts down idle connections, and this loop's own anti-barcode
-        pacing is what makes us idle - so this is expected traffic, not an anomaly.
+        Hearthstone can shut down idle connections during the loop's calibrated waits,
+        so this is expected traffic rather than an anomaly.
 
         Three things make this different from every other tap:
 
@@ -1306,112 +1520,111 @@ class Engine:
                             "reconnect_poll")
         raise Halt("stuck on 'Reconnecting...'; Hearthstone never came back online")
 
-    def _handle_mulligan(self, frame: Frame) -> None:
+    def _begin_match_watch(self, *, source: str) -> None:
+        """Enter the capture-only search/nameplate observation interval once.
+
+        The paired journal events deliberately bound timing-report attribution: the
+        long search's captures are matchmaking observation, never reaction time for
+        the eventual action after a class appears.
+        """
+        if self._awaiting_match_class:
+            return
+        self._awaiting_match_class = True
+        if self.debug:
+            self.debug.record("match_watch_start", source=source)
+
+    def _end_match_watch(self, *, outcome: str, state: str | None = None) -> None:
+        """Close a started match-watch interval once, for report attribution."""
+        if not self._awaiting_match_class:
+            return
+        self._awaiting_match_class = False
+        if self.debug:
+            detail = {"outcome": outcome}
+            if state is not None:
+                detail["state"] = state
+            self.debug.record(f"match_watch_{outcome}", **detail)
+
+    def _gate_mulligan_class(self, frame: Frame) -> None:
+        """Read the class once from this exact named-mulligan frame.
+
+        The nameplate can arrive after the rest of the mulligan.  Until it does,
+        this is still matchmaking observation: do not count, concede, or re-read
+        inside the iteration.  The next outer iteration supplies the next capture.
+        """
         t0 = self.clock()
         read = self._read_mulligan(frame, self.layout, self.reader, self.cfg.vision)
-        ocr_ms = round((self.clock() - t0) * 1000.0)   # tesseract is the other perception cost
-        self.state.observe_confidence(read.class_confidence)
-        self.stats.last_opponent = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
-        if self.debug:
-            # class_raw on the FIRST read too (previously only re-reads carried it): a read that
-            # resolves to a WRONG class at low confidence -- a garbled two-word label snapping to
-            # its tail word, the reported "Demon Hunter read as Hunter" -- never triggers the
-            # re-read path (that fires only on an UNUSABLE read), so without the raw here the
-            # report could only show the snapped class and a bare confidence, with no way to see
-            # that the OCR string was "<stray glyph> HUNTER". The raw is the datum that names the
-            # failure. Pure observability.
-            self.debug.record("mulligan_read", opponent=self.stats.last_opponent,
-                              second=read.we_go_second, cards=read.num_cards,
-                              conf=round(read.class_confidence, 3), method=read.method,
-                              class_raw=read.class_raw, ms=ocr_ms)
+        ocr_ms = round((self.clock() - t0) * 1000.0)
+        self._handle_mulligan(frame, initial_read=read, initial_ocr_ms=ocr_ms)
 
+    def _handle_mulligan(self, frame: Frame, *, initial_read: MulliganRead | None = None,
+                         initial_ocr_ms: int | None = None) -> None:
+        """Decide a named mulligan only after its opponent class is readable.
+
+        ``initial_read`` lets the match-watch hand the exact frame's one OCR result
+        into normal decision logic without taking a second capture or OCR pass.
+        """
+        if initial_read is None:
+            t0 = self.clock()
+            read = self._read_mulligan(frame, self.layout, self.reader, self.cfg.vision)
+            ocr_ms = round((self.clock() - t0) * 1000.0)
+        else:
+            read = initial_read
+            ocr_ms = 0 if initial_ocr_ms is None else initial_ocr_ms
+        observed_name = (DISPLAY_NAMES.get(read.opponent_class, "?")
+                         if read.opponent_class else "?")
+        # Decide before journalling so a future report can distinguish a true
+        # unreadable mulligan from the intentional class-only path.  A 0-card
+        # read means ``we_go_second=False`` only as an implementation default;
+        # never publish that as a real "going 1st" observation.
         decision = evaluate_matchup(read, self.cfg)
+        turn_known = read.num_cards in (3, 4)
+        observed_second = read.we_go_second if turn_known else None
+        if self.debug:
+            # Journal contract: ``pending=True`` means this is an observation-only
+            # match-watch frame, not a game decision. It retains OCR timing and
+            # diagnostics, but report consumers must not tally or pair it. Old lines
+            # without this field predate the watch and retain their old semantics.
+            self.debug.record("mulligan_read", opponent=observed_name,
+                              second=observed_second, turn_known=turn_known,
+                              decision=decision, cards=read.num_cards,
+                              conf=round(read.class_confidence, 3), method=read.method,
+                              class_raw=read.class_raw, ms=ocr_ms,
+                              pending=read.opponent_class is None)
+
+        # A blank/garbled class is not a rejected matchup.  It is a not-yet-ready
+        # nameplate: preserve this exact frame's one read, then let the outer watch
+        # capture again with no artificial delay.  Crucially, nothing below may book
+        # statistics or send a concede until a class exists.
+        if read.opponent_class is None:
+            self._begin_match_watch(source="blank_mulligan")
+            if self.debug:
+                self.debug.record("mulligan_class_pending", class_raw=read.class_raw,
+                                  cards=read.num_cards, conf=round(read.class_confidence, 3))
+            return
+        if self._awaiting_match_class:
+            self._end_match_watch(outcome="resolved", state="mulligan")
+        # A pending blank nameplate is not a perception result we will act on.
+        # Only the resolved matchup may affect the next action's humanization.
+        self.state.observe_confidence(read.class_confidence)
+
+        if not turn_known:
+            self._record_unreadable_mulligan_card_count(frame, read, decision)
         if decision == "unusable":
-            # The classifier has already confirmed the mulligan is up, so a blank/garbled
-            # read is a transient -- most likely the opponent's nameplate still drawing in --
-            # not a lost screen. (NOT the "Opponent Still Choosing..." banner: that is a
-            # POST-confirm phenomenon -- it replaces our "Starting Hand" anchor while we WAIT
-            # for the opponent after WE confirm, see `_confirm_mulligan` -- whereas this read
-            # happens BEFORE confirming; and a real still-choosing frame OCRs the class fine,
-            # verified on disk.) Re-read a few times before failing closed; a single re-read
-            # alone halted a healthy hunt on one slow-rendering nameplate. The extra RNG draws
-            # and looks happen ONLY on this recover-or-halt path, never on a clean first read.
-            for attempt in range(1, max(1, self.cfg.vision.mulligan_read_attempts)):
-                self._sleep_for(timing.human_delay(self.rng, 0.8, self.cfg.timing),
-                                "mulligan_reread")
-                frame = self._capture()
-                read = self._read_mulligan(frame, self.layout, self.reader, self.cfg.vision)
-                decision = evaluate_matchup(read, self.cfg)
-                if self.debug:
-                    # Journal each re-read's own result. Only the first read was logged, so a
-                    # frame a re-read *recovered* (the common case: first OCR whiffs to
-                    # opponent "?"/conf 0.0, a re-read resolves the real class) left the report
-                    # showing pure failure -- "opponents seen: ?×1" -- while the engine had
-                    # quietly gone on to concede the correct matchup. `reread`/`attempt` let
-                    # the summary tell "whiffed then recovered" (and how patient it had to be)
-                    # from a clean first read, and `class_raw` distinguishes a blank class
-                    # (still-choosing) from a garbled one. Pure observability: no
-                    # observe_confidence (that would perturb HumanState and the timing
-                    # stream), no control-flow change.
-                    self.debug.record(
-                        "mulligan_read", reread=True, attempt=attempt,
-                        opponent=DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?",
-                        second=read.we_go_second, cards=read.num_cards,
-                        conf=round(read.class_confidence, 3), method=read.method,
-                        class_raw=read.class_raw)
-                if decision != "unusable":
-                    break
-            if decision == "unusable" and read.opponent_class is None:
-                # The CLASS never read, this game. Halting the whole unattended hunt on one
-                # unreadable nameplate is out of step with every other transient here (a
-                # dropped tap, a reconnect, a stray Collection screen all RECOVER), and the
-                # recovery is available: the cards counted fine, so the reject journey
-                # (concede + requeue) can run without the class -- exactly what a human hunting
-                # specific classes does when they can't tell what they're facing. So recover,
-                # and only fail closed when it happens `mulligan_unreadable_halt_streak` GAMES
-                # in a row -- an ACUTE reader break (a shifted region, a UI change breaking every
-                # read), not a one-off. (A break correlated to ONE class's word evades the streak
-                # -- good reads between its appearances reset it -- and is instead surfaced by the
-                # report's "class NEVER read" line; auto-halting on a scattered rate would
-                # false-stop a healthy hunt.) The frame + class-region pixel stats are
-                # preserved here because a named-screen halt otherwise saved nothing to diagnose
-                # the blank read from (the pixels are the one datum the report lacked).
-                #
-                # Gated on `opponent_class is None` on purpose: "unusable" ALSO covers a game
-                # whose class read FINE (perhaps a TARGET) but whose CARD count never resolved.
-                # That one must NOT be conceded -- we cannot tell the hand (coin, how many to
-                # replace) and might be throwing away the very matchup the hunt exists to catch,
-                # so it keeps the old fail-closed Halt below. Only a blank/garbled CLASS recovers.
-                self._unreadable_mulligans += 1
-                cap = max(1, self.cfg.vision.mulligan_unreadable_halt_streak)
-                self._record_unreadable_mulligan(frame, read, self._unreadable_mulligans, cap)
-                if self._unreadable_mulligans >= cap:
-                    raise Halt(f"could not read mulligan {self._unreadable_mulligans}x in a row "
-                               f"(class={read.class_raw!r}, cards={read.num_cards}); the "
-                               "opponent-class reader looks systematically broken")
-                # else fall through: `decision` stays 'unusable', the stats below record a "?"
-                # game, and `_execute_reject` concedes + requeues. The hunt lives on.
-            elif decision == "unusable":
-                # Class read but the CARD count never resolved: fail closed as before (do not
-                # concede a possible target on a hand we cannot count).
-                raise Halt(f"could not read mulligan (class={read.class_raw!r}, "
-                           f"cards={read.num_cards})")
+            # The class is known, but the criteria require a coin/turn result
+            # that this frame cannot establish.  Do not concede a possible target.
+            raise Halt(f"could not read mulligan (class={read.class_raw!r}, "
+                       f"cards={read.num_cards})")
 
         # session stats (once per game, on the resolved read): the observed class
         # distribution and the coin split the dashboard charts.
-        if decision != "unusable":
-            # A usable read clears the consecutive-unreadable streak (the reader recovered).
-            # Not reset on the recover-as-reject path above, so a *run* of blanks still trips
-            # the cap. Stats-only: no RNG draw, no HumanState tick -- the timing stream is
-            # unchanged on every path that already worked.
-            self._unreadable_mulligans = 0
-        name = DISPLAY_NAMES.get(read.opponent_class, "?") if read.opponent_class else "?"
-        self.stats.last_opponent = name
-        self.stats.class_distribution[name] = self.stats.class_distribution.get(name, 0) + 1
-        if read.we_go_second:
-            self.stats.going_second += 1
-        else:
-            self.stats.going_first += 1
+        self.stats.last_opponent = observed_name
+        self.stats.class_distribution[observed_name] = (
+            self.stats.class_distribution.get(observed_name, 0) + 1)
+        if turn_known:
+            if read.we_go_second:
+                self.stats.going_second += 1
+            else:
+                self.stats.going_first += 1
 
         # A read the engine ACTS ON but only barely resolved (see _LOW_CONFIDENCE_KEEP): keep its
         # pixels + raw text so a silent misread -- a garbled two-word label snapping to a
@@ -1427,57 +1640,56 @@ class Engine:
             return
         self._execute_reject(read)
 
-    def _record_unreadable_mulligan(self, frame: Frame, read: MulliganRead,
-                                    streak: int, cap: int) -> None:
-        """Preserve everything needed to diagnose a blank/garbled opponent-class read.
+    def _record_unreadable_mulligan_card_count(
+        self,
+        frame: Frame,
+        read: MulliganRead,
+        decision: str,
+    ) -> None:
+        """Retain colour evidence when the green-glow card counter cannot read.
 
-        A "could not read mulligan" halt used to save NOTHING -- the mulligan is a *named*
-        screen, so :meth:`DebugLog.unknown_screen` (the only frame hop keeps on purpose)
-        never fired, and the report was left with just ``class=''`` and no way to tell a
-        region that was blank (nameplate not drawn -> wait) from one full of contrast the
-        OCR still whiffed (region/preprocess bug). So journal the class-region PIXEL STATS
-        (the decisive datum) and save the frame as an anomaly (bounded, in-run). Pure
-        observability: no RNG draw, no HumanState tick.
+        This is intentionally separate from an unknown-screen capture: the
+        mulligan anchor *did* identify the screen, while the RGB-only keep-glow
+        signal failed.  The screenshot and its structured strip/interior data
+        let the bug-report harness distinguish a transient incomplete deal from
+        a threshold, geometry, or marked-hand failure.  A class-only decision is
+        safe when the criteria do not use the coin *or* the class is already
+        deterministically rejected; otherwise the same evidence accompanies the
+        retained fail-closed halt.
         """
         if self.debug is None:
             return
-        stats = _region_gray_stats(frame, self.layout.opponent_class_region)
-        # `nearest_class` (no cutoff) names the PROBABLE class of a garbled -- not blank --
-        # read, so a report reads "closest to Death Knight (dist 1)" instead of raw text. Only
-        # meaningful when SOMETHING was read; a blank read has no nearest (leave it None).
-        near_name, near_dist = "", None
-        raw = (read.class_raw or "").strip()
-        if raw:
-            try:
-                near, near_dist = nearest_class(raw)
-                near_name = DISPLAY_NAMES.get(near, "") if near else ""
-            except Exception:
-                near_dist = None
-        recovering = streak < cap
-        self.debug.record("mulligan_unreadable", class_raw=read.class_raw,
-                          cards=read.num_cards, second=read.we_go_second,
-                          streak=streak, cap=cap, recovering=recovering,
-                          nearest=near_name, nearest_dist=near_dist,
-                          region_gray=stats)
-        # Save the frame so the exact pixels are recoverable. anomaly() prunes to the newest
-        # few, so a healthy-then-recovered hunt never accretes frames without bound.
         try:
-            self.debug.anomaly("mulligan opponent-class unreadable", before=frame,
-                               class_raw=read.class_raw, cards=read.num_cards,
-                               streak=streak, cap=cap, region_gray=stats)
+            evidence = mulligan_card_count_diagnostics(frame, self.layout, self.cfg.vision)
         except Exception:
-            pass
+            # Logging must never turn a recoverable observation into a crash.
+            evidence = {"rejection": "diagnostics_failed"}
+        context = {
+            "opponent": DISPLAY_NAMES.get(read.opponent_class, "?"),
+            "class_raw": read.class_raw,
+            "cards": read.num_cards,
+            "require_second": self.cfg.criteria.require_second,
+            "decision": decision,
+            "mulligan_card_count": evidence,
+        }
+        self.debug.record("mulligan_card_count_unreadable", **context)
+        anomaly = getattr(self.debug, "anomaly", None)
+        if callable(anomaly):
+            try:
+                # The detector is defined by a green hue.  A grayscale anomaly
+                # would preserve the wrong evidence, so request the bounded RGB
+                # variant introduced specifically for colour-dependent signals.
+                anomaly("mulligan card count unreadable", before=frame,
+                        colour=True, terminal=decision == "unusable", **context)
+            except Exception:
+                pass
 
     def _record_low_confidence_mulligan(self, frame: Frame, read: MulliganRead) -> None:
         """Preserve a RESOLVED-but-shaky opponent-class read (acted on, yet >=2 glyph errors).
 
-        The twin of :meth:`_record_unreadable_mulligan`: that one fires when the class NEVER read
-        (opponent None); this fires when it DID read -- to a real class -- but only barely, the
-        silent-misread case the re-read path never sees (it triggers only on an *unusable* read).
-        Same discipline: journal the class-region PIXEL STATS (blank region vs. contrast-the-OCR-
-        still-mangled) and `nearest_class` (the probable class of a garble), and save the frame
-        (bounded via anomaly()). Pure observability: no RNG draw, no HumanState tick, no
-        control-flow change -- the engine has already acted on `read`.
+        This fires when the class DID read -- to a real class -- but only barely, the
+        silent-misread case. It journals the class-region pixel stats and likely
+        nearest class, then saves the frame (bounded via anomaly()).
         """
         if self.debug is None:
             return
@@ -1502,7 +1714,272 @@ class Engine:
         except Exception:
             pass
 
-    # ── the plausible-exit journey (anti-barcode core) ───────────────────────
+    # ── rejected-mulligan exit ───────────────────────────────────────────────
+
+    def _post_concede_clickthrough(self, *, source: ScreenState) -> Classification:
+        """Run the fixed-phone, open-loop reject exit through the next Play tap.
+
+        This is deliberately a *single bounded action trace*, not a post-game
+        screen classifier.  On this calibrated phone the post-game stack accepts
+        the deck Play location as its advance control; once matchmaking begins,
+        further taps there do not cancel it.  Retained journals put the fastest
+        observed Play-to-Mulligan at 30.270 s.  The 20-tap burst has only 19
+        0.75--0.90 s gaps and a validated hard deadline for *starting* taps. The
+        one semantic capture happens as soon as the boundary is due from the
+        *first* Play tap, before a fast successor can reach its mulligan unseen
+        and before the main loop is allowed to act again.
+
+        ``source`` is named by the caller, so no speculative source screenshot is
+        required.  This is used only for the ordinary rejected-mulligan path;
+        exceptional recovery keeps :meth:`_clear_end_screens`' closed loop.
+        """
+        if source not in (ScreenState.MULLIGAN, ScreenState.IN_GAME):
+            raise Halt(f"cannot start post-concede click-through from {source.value!r}")
+
+        # A previous exceptional branch can have left a source-local retry key.
+        # This is a new named phase, not evidence that another Concede was ignored.
+        self._clear_fixed_attempt("concede")
+        self._clear_fixed_attempt("play")
+        for key in tuple(self._fixed_tap_attempts):
+            if key.startswith("end_dismiss:"):
+                self._clear_fixed_attempt(key)
+
+        self._tap_fixed(self.layout.gear_button, committing=False,
+                        decision_type="commit", what="gear")
+        self._ui_open_delay(self.cfg.timing.gear_menu_cooldown_s,
+                            "gear_menu_cooldown", fast_path=True)
+
+        # A dropped Concede must not leave the Game Menu in place.  Send its known
+        # top-entry coordinate a bounded number of times before the end-stack burst.
+        # Additional taps after a successful concede are harmless upper-screen taps;
+        # no point below Concede (Options/Quit) is ever used.
+        concede_count = max(1, self.cfg.vision.concede_tap_attempts)
+        self._tap_fixed(self.layout.concede_button, committing=True,
+                        decision_type="commit", what="concede")
+        for tap in range(1, concede_count):
+            self._burst_sleep("concede_retry_cadence", tap=tap + 1,
+                              of=concede_count)
+            self._tap_open_loop(self.layout.concede_button, committing=True,
+                                what="concede")
+
+        # Let the game finish rendering the Black Market warning before its one
+        # unconditional normal-path tap.  The small fixed opening allowance avoids
+        # racing a modal that has not drawn yet, without making the interaction feel
+        # artificially slow.
+        self._ui_open_delay(self.cfg.timing.post_concede_start_cooldown_s,
+                            "post_concede_start_cooldown")
+        concede_now_count = 1
+        self._tap_open_loop(self.layout.concede_now_button, committing=True,
+                            what="concede_now")
+
+        cls, frame, emitted, elapsed = self._post_concede_burst_and_boundary(
+            attempt=0, recovery="normal")
+        initial_state: ScreenState | None = None
+        boundary_attempt, boundary_recovery = 0, "normal"
+        if cls.state in (ScreenState.CONCEDE_WARNING, ScreenState.CONCEDE_MENU):
+            # The single boundary capture has proved an overlay is still present.
+            # A warning has a stable, named Concede Now point; the menu is deliberately
+            # ambiguous because an unanchored warning can still expose and match its
+            # Game Menu title.  Both recoveries are bounded once and make no attempt
+            # to act on an arbitrary normal-dispatch screen.
+            initial_state = cls.state
+            if cls.state == ScreenState.CONCEDE_WARNING:
+                concede_now_count += 1
+                self._tap_open_loop(self.layout.concede_now_button, committing=True,
+                                    what="concede_now_recovery")
+                recovery = "warning"
+            else:
+                concede_count += 1
+                self._tap_open_loop(self.layout.concede_button, committing=True,
+                                    what="concede_recovery")
+                self._ui_open_delay(self.cfg.timing.post_concede_start_cooldown_s,
+                                    "post_concede_start_cooldown", recovery="menu")
+                concede_now_count += 1
+                self._tap_open_loop(self.layout.concede_now_button, committing=True,
+                                    what="concede_now_recovery")
+                recovery = "menu"
+            cls, frame, emitted, elapsed = self._post_concede_burst_and_boundary(
+                attempt=1, recovery=recovery)
+            boundary_attempt, boundary_recovery = 1, recovery
+            if cls.state in (ScreenState.CONCEDE_WARNING, ScreenState.CONCEDE_MENU):
+                self._post_concede_boundary_halt(
+                    cls, frame, attempt=1, recovery=recovery, emitted=emitted,
+                    elapsed=elapsed, concede_count=concede_count,
+                    concede_now_count=concede_now_count, source=source,
+                    initial_state=initial_state)
+        if cls.state not in self._post_concede_accepted_states():
+            self._post_concede_boundary_halt(
+                cls, frame, attempt=boundary_attempt, recovery=boundary_recovery, emitted=emitted,
+                elapsed=elapsed, concede_count=concede_count,
+                concede_now_count=concede_now_count, source=source,
+                initial_state=initial_state)
+        # UNKNOWN has already armed the capture-only match watch above.  It must
+        # never be deferred: a later named interruption ends that watch, and a
+        # stale UNKNOWN would otherwise be consumed as if it were a fresh screen
+        # read rather than taking the next required capture.
+        if cls.state == ScreenState.UNKNOWN:
+            self._deferred_screen = None
+        else:
+            # Reuse the named phase boundary in the top loop: one capture, never a
+            # duplicate "what screen are we on?" screenshot immediately after burst.
+            self._deferred_screen = (cls, frame)
+        self._clear_fixed_attempt("concede")
+        return cls
+
+    @staticmethod
+    def _post_concede_accepted_states() -> frozenset[ScreenState]:
+        return frozenset({
+            ScreenState.PLAY_SCREEN, ScreenState.QUEUE, ScreenState.VS_SPLASH,
+            ScreenState.MULLIGAN, ScreenState.ERROR_DIALOG, ScreenState.DECK_SELECT,
+            # An immediate boundary can still see the named end stack.  Deferring
+            # this exact frame lets ordinary dispatch clear it with its own safe,
+            # screen-specific controls; do not keep blindly hitting Play until it
+            # happens to disappear.
+            ScreenState.VICTORY, ScreenState.DEFEAT, ScreenState.REWARDS,
+            ScreenState.RANK_PROGRESS, ScreenState.QUEST_POPUP,
+            ScreenState.UNKNOWN,
+        })
+
+    def _post_concede_burst_and_boundary(self, *, attempt: int,
+                                          recovery: str) -> tuple[Classification, Frame, int, float]:
+        """One bounded no-touch-before-boundary Play burst.
+
+        The only caller is the owned reject exit.  Keeping its burst and boundary in
+        one helper makes the warning/menu recovery auditable: each attempt has the
+        same deadline, boundary due time, and exactly one capture.
+        """
+        click_count = self.cfg.timing.post_concede_click_count
+        started = self.clock()  # immediately before the first Play-location tap
+        deadline = started + self.cfg.timing.post_concede_burst_max_s
+        emitted = 0
+        while emitted < click_count:
+            if self._stop:
+                raise StopRequested()
+            # Input emission itself can be slow.  Never start a further tap after
+            # its calibrated wall-clock budget has expired.
+            if deadline - self.clock() <= 1e-9:
+                break
+            self._tap_open_loop(self.layout.play_button, committing=False,
+                                what="post_concede_play")
+            emitted += 1
+            # There are at most N-1 gaps, and none after the final emitted tap.
+            if emitted >= click_count:
+                break
+            interval = self._burst_interval()
+            if self._stop:
+                raise StopRequested()
+            # Do not start a sleep which cannot lead to another in-budget tap.
+            if deadline - self.clock() <= interval + 1e-9:
+                break
+            self._sleep_for(interval, "post_concede_click_cadence",
+                            min_s=self.cfg.timing.post_concede_click_interval_s,
+                            max_s=self.cfg.timing.post_concede_click_interval_max_s,
+                            tap=emitted, of=click_count - 1)
+            if self._stop:
+                raise StopRequested()
+        if self.debug:
+            self.debug.record("post_concede_burst_complete", emitted=emitted,
+                              configured=click_count,
+                              elapsed_s=round(max(0.0, self.clock() - started), 3),
+                              max_s=self.cfg.timing.post_concede_burst_max_s,
+                              attempt=attempt, recovery=recovery)
+
+        # The old implementation slept a *second*, full queue cooldown after a
+        # nearly-20-second Play burst.  That put its sole capture roughly 53 s
+        # after the first Play tap even though this device can reach a successor
+        # mulligan in 30.270 s.  The successor's class could therefore pass unseen
+        # before the engine stopped tapping.  The cooldown is a due time from the
+        # first Play tap, so it overlaps the burst and only its unspent remainder
+        # is slept.  Do not humanize this remainder upward: crossing the observed
+        # mulligan floor is a safety failure, not a cosmetic pacing choice.
+        elapsed_before_boundary = max(0.0, self.clock() - started)
+        boundary_due = float(self.cfg.timing.post_concede_queue_cooldown_s)
+        remaining = max(0.0, boundary_due - elapsed_before_boundary)
+        if remaining > 0:
+            self._sleep_for(remaining, "post_concede_queue_cooldown",
+                            anchor_s=boundary_due,
+                            elapsed_in_burst_s=round(elapsed_before_boundary, 3),
+                            overlapped=True)
+        accepted = self._post_concede_accepted_states()
+        cls, frame = self._classify(accepted)
+        elapsed = max(0.0, self.clock() - started)
+        # `classify_expected` returns an expected state directly; every other
+        # outcome falls back to a full scan of this exact frame.  The distinction
+        # matters when a terminal boundary is diagnosed from its saved image.
+        scan = "scoped" if cls.state in accepted else "full_fallback"
+        floor = float(self.cfg.timing.play_to_mulligan_observed_min_s)
+        boundary_evidence = {
+            "mulligan_floor_s": round(floor, 3),
+            "mulligan_deadline_exceeded": elapsed >= floor,
+            "classification_scan": scan,
+            "anchor_at": list(cls.at) if cls.at is not None else None,
+        }
+        if self.debug:
+            self.debug.record("post_concede_boundary", state=cls.state.value,
+                              confidence=round(cls.confidence, 3), attempt=attempt,
+                              recovery=recovery, emitted=emitted,
+                              configured=click_count, elapsed_s=round(elapsed, 3),
+                              accepted_states=sorted(st.value for st in accepted),
+                              **boundary_evidence)
+        if cls.state == ScreenState.UNKNOWN:
+            # The post-burst boundary can land in an unanchored queue->match transition.
+            # This is a hands-off search observation, not evidence of a bad reject
+            # journey: arm the raw capture watch and let its next outer iteration
+            # continue through QUEUE/VS/UNKNOWN/blank-MULLIGAN until a class resolves.
+            # Do not defer UNKNOWN into normal dispatch, which correctly fails closed
+            # outside this deliberately no-touch path.
+            self._begin_match_watch(source="post_concede_boundary")
+            self._clear_fixed_attempt("concede")
+        return cls, frame, emitted, elapsed
+
+    def _post_concede_boundary_halt(self, cls: Classification, frame: Frame, *, attempt: int,
+                                    recovery: str, emitted: int, elapsed: float,
+                                    concede_count: int, concede_now_count: int,
+                                    source: ScreenState,
+                                    initial_state: ScreenState | None = None) -> None:
+        """Persist the already-captured terminal boundary, then halt fail-closed."""
+        context = {
+            "state": cls.state.value, "confidence": round(cls.confidence, 3),
+            "attempt": attempt, "recovery": recovery, "emitted": emitted,
+            "configured": self.cfg.timing.post_concede_click_count,
+            "elapsed_s": round(elapsed, 3), "concede_taps": concede_count,
+            "concede_now_taps": concede_now_count,
+            "source": source.value,
+            "accepted_states": sorted(st.value for st in self._post_concede_accepted_states()),
+            "transport": _transport_snapshot(self.backend),
+            # Keep this terminal record self-contained.  The preceding boundary
+            # line has the same fields, but a size-capped report may retain only
+            # this causal context.
+            "mulligan_floor_s": round(float(self.cfg.timing.play_to_mulligan_observed_min_s), 3),
+            "mulligan_deadline_exceeded": elapsed >= float(
+                self.cfg.timing.play_to_mulligan_observed_min_s),
+            "classification_scan": (
+                "scoped" if cls.state in self._post_concede_accepted_states()
+                else "full_fallback"),
+            "anchor_at": list(cls.at) if cls.at is not None else None,
+        }
+        if initial_state is not None:
+            context["initial_state"] = initial_state.value
+        if self.debug:
+            self.debug.record("post_concede_unexpected_boundary", **context)
+            terminal = getattr(self.debug, "terminal_screen", None)
+            if callable(terminal):
+                terminal("unexpected post-concede boundary", frame, **context)
+        raise Halt(f"unexpected {cls.state.value!r} after post-concede click-through")
+
+    def _burst_interval(self) -> float:
+        """Draw one deterministically seeded, hard-bounded burst interval."""
+        low = self.cfg.timing.post_concede_click_interval_s
+        high = self.cfg.timing.post_concede_click_interval_max_s
+        return self.rng.uniform(low, high)
+
+    def _burst_sleep(self, reason: str, **detail) -> None:
+        """Sleep one deterministic bounded interval outside the Play burst."""
+        if self._stop:
+            raise StopRequested()
+        low = self.cfg.timing.post_concede_click_interval_s
+        high = self.cfg.timing.post_concede_click_interval_max_s
+        self._sleep_for(self._burst_interval(), reason, min_s=low, max_s=high, **detail)
 
     def _execute_reject(self, read: MulliganRead) -> None:
         plan = journey.plan_reject(self.rng, read.num_cards)
@@ -1511,27 +1988,21 @@ class Engine:
                               hesitate=plan.hesitate_before_concede,
                               extra_reads=plan.extra_reads,
                               replace_slots=[d.slot for d in plan.mulligan if d.replace])
-        # perform a plausible mulligan: replace the chosen cards, deliberating each
-        for d in plan.mulligan:
-            if d.replace and d.slot < len(read.card_centers_f):
-                self._replace_card(d.slot, read.card_centers_f[d.slot], d.decision_type)
-        self._confirm_mulligan()
+        # The rejected matchup is already a positively named mulligan.  Do not spend
+        # opponent-dependent Confirm/card actions or classify every end screen: the
+        # fixed phone's bounded post-concede click-through reaches Play directly.
+        boundary = self._post_concede_clickthrough(source=ScreenState.MULLIGAN)
+        self._book_game(conceded=True)
+        # `_book_game` closes ownership of the just-finished game. Only a named
+        # queue/VS/mulligan proves the burst actually started its successor; an
+        # UNKNOWN boundary is watched hands-off but leaves ownership false until a
+        # successor is positively named. Play and error boundaries likewise remain
+        # false until their normal dispatch.
+        self._own_game = boundary.state in {
+            ScreenState.QUEUE, ScreenState.VS_SPLASH, ScreenState.MULLIGAN,
+        }
 
-        # play into the game to the chosen concede point (never insta-concede)
-        if plan.concede_point in ("turn1", "turn2"):
-            self._play_beats(plan)
-
-        if plan.hesitate_before_concede:
-            self._sleep_for(
-                timing.think_time(self.rng, "reject", self.cfg.timing, self.state,
-                                  visual_complexity=0.6),
-                "hesitate_before_concede")
-
-        conceded = self._concede()
-        self._clear_end_screens()
-        self._book_game(conceded)
-
-    def _confirm_mulligan(self) -> None:
+    def _confirm_mulligan(self) -> Classification:
         """Tap Confirm, then wait for the mulligan to actually go away.
 
         Confirming is **asynchronous**: the cards fly off and the board draws in over
@@ -1552,21 +2023,11 @@ class Engine:
         proof the mulligan was gone, and ``_play_beats``/``_concede`` then tapped on
         that premise. UNKNOWN is not an observation; it is the absence of one.
 
-        Confirm can ALSO be silently dropped outright, same as any other button (see
-        `_tap_play`). The mulligan's cards are static (no ambient board animation like
-        Concede's), so a genuinely dropped Confirm shows literally zero pixel change and
-        `_tap` itself raises ``Halt.NO_CHANGE`` immediately -- caught below and treated
-        as equally-positive proof of "still stuck" as a fresh classify would give.
-        Retried only while positively still on ``MULLIGAN`` -- never blind, and never
-        while the look came back UNKNOWN (that could be the opponent's rope, not a
-        drop; see below). Unlike Concede, EVERY attempt here must still use the FULL
-        ``mulligan_resolve_attempts``/``mulligan_resolve_timeout_s`` budget: a
-        genuinely slow (not dropped) opponent shows the exact same "still on
-        `MULLIGAN`... no wait, still `UNKNOWN`" trail for a SHORT wait as a dropped tap
-        does over a LONG one, and a smaller per-attempt budget would reintroduce the
-        false "did not dismiss" halt that budget exists to prevent (see
-        ``vision.mulligan_confirm_tap_attempts`` for why the attempt count is smaller
-        here than its siblings, to bound the resulting worst case).
+        Confirm can silently drop, so it is retried only after a full calibrated
+        semantic wait positively names ``MULLIGAN`` again. UNKNOWN is never a retry
+        signal: it may simply be the opponent's unresolved mulligan. The configured
+        resolve budget remains long enough for that opponent-side delay, while each
+        successful named boundary ends the loop without a duplicate capture.
         """
         # the board draws in (in_game); an opponent who concedes in the window lands us on
         # an end banner. mulligan (the from-state) is kept in scope so a cross-fade where
@@ -1577,37 +2038,21 @@ class Engine:
         taps_sent = 0
         for attempt in range(attempts):
             taps_sent = attempt + 1
-            dropped = False
-            try:
-                self._tap(self.layout.mulligan_confirm, committing=False, decision_type="commit",
-                          expected_change=None, allow_correction=False, what="mulligan_confirm")
-            except Halt as e:
-                if e.kind != Halt.NO_CHANGE:
-                    raise
-                dropped = True
-            if not dropped:
-                ok, cls, frame = self._wait_until(
-                    lambda c, _f: c.state not in (ScreenState.MULLIGAN, ScreenState.UNKNOWN),
-                    what="mulligan_confirm",
-                    expected=frozenset({ScreenState.MULLIGAN}) | frozenset(arrivals),
-                    # ...the wait must ALSO outlast the opponent's own mulligan. Until they
-                    # confirm, this client shows an "Opponent Still Choosing..." banner in
-                    # place of our "Starting Hand" anchor -- an anchorless frame that reads
-                    # UNKNOWN. The generic transition budget (~20 s) is far shorter than a
-                    # roping opponent, so it false-halted here even though Confirm worked
-                    # (the tap's own verify_ok fired the frame before). Wait to the
-                    # mulligan rope instead; never taps, so a bigger budget only defers.
-                    attempts=self.cfg.vision.mulligan_resolve_attempts,
-                    timeout_s=self.cfg.vision.mulligan_resolve_timeout_s)
-                if ok:
-                    return
-                # ok=False here means cls.state is EXACTLY MULLIGAN or UNKNOWN (anything
-                # else would have satisfied the predicate above). MULLIGAN persisting
-                # through the WHOLE budget, unmoved, is the dropped-tap signature -- safe
-                # to retap. UNKNOWN persisting is the roping-opponent signature (or a
-                # frame we simply can't name) -- NOT proof the tap dropped, and not safe
-                # to blind-tap into, so it falls through to the fail-closed halt below.
-                dropped = cls.state == ScreenState.MULLIGAN
+            self._tap_fixed(self.layout.mulligan_confirm, committing=False,
+                            decision_type="commit", what="mulligan_confirm")
+            ok, cls, frame = self._wait_semantic(
+                lambda c, _f: c.state not in (ScreenState.MULLIGAN, ScreenState.UNKNOWN),
+                what="mulligan_confirm",
+                expected=frozenset({ScreenState.MULLIGAN}) | frozenset(arrivals),
+                cooldown_s=self.cfg.timing.mulligan_confirm_cooldown_s,
+                attempts=min(self.cfg.vision.mulligan_resolve_attempts,
+                             max(1, round(self.cfg.vision.mulligan_resolve_timeout_s /
+                                          self.cfg.timing.mulligan_confirm_cooldown_s))))
+            if ok:
+                return cls
+            # A named mulligan persisting through the wait is the only safe retry
+            # condition.  UNKNOWN never proves that the button was ignored.
+            dropped = cls.state == ScreenState.MULLIGAN
             if not dropped or attempt + 1 == attempts:
                 break
             if self.debug:
@@ -1726,18 +2171,19 @@ class Engine:
                         raise
                     return  # _concede() re-classifies and will skip a finished game
 
-    def _concede(self) -> bool:
+    def _concede(self, *, known_state: ScreenState | None = None) -> bool:
         """gear -> Concede, then wait for the Game Menu to actually go away.
 
-        **There is no confirm button, and no fixed point below Concede may ever be
-        tapped.** The Game Menu reads Concede / Options / Quit top to bottom. The old
-        code, if the menu was still classified afterwards, tapped a fixed
-        "concede_confirm" point at y=0.56 - which is *dead centre on Quit* (measured
-        against the real concede_menu capture: the 0.9x144 px truncation disc lies
-        almost entirely on the Quit plate). So the recovery path for "the Concede tap
-        was ignored" was "quit Hearthstone" - and this client is known to ignore taps.
-        The recovery is instead to re-tap **Concede's own coordinate** (the TOP entry,
-        y=0.196), bounded, and only while the menu is positively still up (see below).
+        **On the Game Menu, no generic/retry fixed point below Concede may be used.**
+        That menu reads Concede / Options / Quit top to bottom. The old
+        ``concede_confirm`` point at y=0.56 was dead centre on Quit (measured against
+        the real concede-menu capture), so treating a still-visible menu as a request
+        to tap lower could quit Hearthstone. The recovery is instead to re-tap
+        **Concede's own coordinate** (the TOP entry, y=0.196), bounded, and only while
+        the menu is positively still up (see below). This does not prohibit the
+        separately calibrated Black Market ``concede_now_button``: the direct reject
+        trace sends that different-modal coordinate exactly once after its Concede
+        group, never as a Game Menu retry.
 
         Conceding is also **asynchronous**: the board dissolves over a second or
         more, and the menu can still be drawn on the frame right after the tap. So
@@ -1752,35 +2198,35 @@ class Engine:
         screen; say so, and let the caller clear it instead of booking a concede that
         never occurred.
         """
-        cls, _frame = self._classify_settled()
+        # The caller commonly just established this state in a semantic wait or
+        # top-level dispatch.  Reusing that named fact removes a redundant Pixel
+        # screencap; untrusted callers retain the checked fallback.
+        if known_state is None:
+            cls, _frame = self._classify_settled()
+        else:
+            cls = Classification(known_state, 1.0)
         if cls.state in self.END_SCREENS:
             if self.debug:
                 self.debug.record("concede_skipped", reason="game already over",
                                   state=cls.state.value)
             return False
-        if cls.state != ScreenState.IN_GAME:
-            raise Halt(f"asked to concede from {cls.state.value!r}, not a live game")
+        if cls.state not in (ScreenState.IN_GAME, ScreenState.MULLIGAN):
+            raise Halt(f"asked to concede from {cls.state.value!r}, not a live game or mulligan")
 
         # The gear opens a menu that dims the whole board, so this is a
         # full_transition, not a bottom_sheet (measured: thirds 21.5/21.1/3.7).
-        self._tap(self.layout.gear_button, committing=False, decision_type="commit",
-                  expected_change="full_transition", what="gear")
+        self._tap_fixed(self.layout.gear_button, committing=False, decision_type="commit",
+                        what="gear")
         # ...but `full_transition` does not mean "the Game Menu is up". `_compatible`
         # admits `top_banner` and `partial` too, so that assertion really only says
         # "something other than the bottom third moved" - which an opponent's turn
         # animating behind a *dropped* gear tap also satisfies. Then the loop's single
         # most consequential tap, the concede, would fire on an unclassified screen at
         # a coordinate that on the board is not a button at all. Look first.
-        ok, cls, frame = self._wait_until(
-            lambda c, _f: c.state == ScreenState.CONCEDE_MENU, what="gear",
-            # still-board while the menu opens, then the menu itself; the floor still
-            # scans a reconnect dialog that co-draws over the menu (the fatal blind-tap).
-            expected={ScreenState.IN_GAME, ScreenState.CONCEDE_MENU})
-        if not ok:
-            if cls.state == ScreenState.UNKNOWN:
-                self._record_unknown(frame, where="gear", confidence=round(cls.confidence, 3))
-            raise Halt(f"the gear did not open the Game Menu (saw {cls.state.value!r}); "
-                       "refusing to tap Concede on a screen we did not identify")
+        # The known gear->Concede sequence gets a short, fixed menu-render allowance. The next
+        # boundary check below remains the only authority to retry or continue.
+        self._ui_open_delay(self.cfg.timing.gear_menu_cooldown_s,
+                            "gear_menu_cooldown")
 
         # commit, not reject: opening the Game Menu *was* the deliberation. By the time the
         # Concede button is in front of us the choice is made (reject_plan decided it, and
@@ -1801,8 +2247,11 @@ class Engine:
         # is safe ONLY while the menu is POSITIVELY still up:
         #   * The Concede button is the TOP entry of a STATIC menu, so re-tapping its OWN
         #     coordinate (0.5025, 0.196) lands on Concede -- never the Options/Quit entries
-        #     below it. There is still NO fixed point below Concede (the deleted, fatal
-        #     `concede_confirm`); we re-send the same button, nothing lower.
+        #     below it. There is no generic/retry fixed point below Concede *on this
+        #     Game Menu* (the deleted, fatal `concede_confirm`); we re-send the same
+        #     button, nothing lower. The separately calibrated Black Market
+        #     `concede_now_button` is a different modal point, used once only by the
+        #     direct reject trace after its Concede group, never by this retry loop.
         #   * The engine already trusts this exact tap: `_dispatch` re-taps concede every
         #     loop iteration while `concede_menu` persists (an UNBOUNDED implicit retry).
         #     This bounds it and keeps it inside `_concede`.
@@ -1816,30 +2265,55 @@ class Engine:
         # keeps the FULL screen_wait budget before deciding to retap, so a slow-but-HONOURED
         # concede (the menu lingers a poll or two while the board dissolves) leaves within the
         # first wait and never retaps -- the happy path stays RNG/journal byte-identical.
-        arrivals = {ScreenState.IN_GAME, ScreenState.VICTORY, ScreenState.DEFEAT}
+        arrivals = {ScreenState.VICTORY, ScreenState.DEFEAT}
         attempts = max(1, self.cfg.vision.concede_tap_attempts)
         cls = frame = None
         for attempt in range(attempts):
-            self._tap(self.layout.concede_button, committing=True, decision_type="commit",
-                      expected_change="full_transition", what="concede")
-            ok, cls, frame = self._wait_until(
-                lambda c, _f: c.state not in (ScreenState.CONCEDE_MENU, ScreenState.UNKNOWN),
+            self._tap_fixed(self.layout.concede_button, committing=True, decision_type="commit",
+                            what="concede")
+            ok, cls, frame = self._wait_semantic(
+                lambda c, _f: c.state in arrivals,
                 what="concede",
                 # {CONCEDE_MENU} | arrivals, exactly as `_wait_until_screen_leaves` scopes it
                 # (+ the interrupt floor); a re-classify here always scans that floor, so a
                 # reconnect/error co-drawn over the menu wins and stops the retry.
-                expected=frozenset({ScreenState.CONCEDE_MENU}) | frozenset(arrivals))
+                expected=frozenset({ScreenState.CONCEDE_MENU}) | frozenset(arrivals),
+                cooldown_s=self.cfg.timing.concede_resolve_cooldown_s,
+                attempts=1)
             if ok:
+                self._deferred_screen = (cls, frame)
                 return True
+            if cls.state == ScreenState.MULLIGAN:
+                # The fixed mulligan gear sequence did not leave its named source.
+                # Fall back to the separately bounded Confirm path rather than tapping
+                # anywhere unknown or spinning on the same control.
+                arrived = self._confirm_mulligan()
+                return self._concede(known_state=arrived.state)
             # The menu did not leave. Retry ONLY while it is POSITIVELY still the Game Menu --
             # a re-tap is safe there and nowhere else. UNKNOWN / anything else falls through
             # to the fail-closed halt below.
+            if cls.state == ScreenState.IN_GAME and attempt + 1 < attempts:
+                # A board immediately after Concede can be the dissolve, not proof
+                # that gear failed.  Give it one more complete resolve interval first.
+                _, cls, frame = self._wait_semantic(
+                    lambda c, _f: c.state in arrivals,
+                    what="concede_dissolve", cooldown_s=self.cfg.timing.concede_resolve_cooldown_s,
+                    attempts=1,
+                    expected=frozenset({ScreenState.IN_GAME}) | frozenset(arrivals))
+                if cls.state in arrivals:
+                    self._deferred_screen = (cls, frame)
+                    return True
+                if cls.state != ScreenState.IN_GAME:
+                    break
+                self._tap_fixed(self.layout.gear_button, committing=False, decision_type="commit",
+                                what="gear")
+                self._ui_open_delay(self.cfg.timing.gear_menu_cooldown_s,
+                                    "gear_menu_cooldown", retry=attempt + 1)
+                continue
             if cls.state != ScreenState.CONCEDE_MENU or attempt + 1 == attempts:
                 break
             if self.debug:
                 self.debug.record("concede_tap_ignored", attempt=attempt + 1, of=attempts)
-            self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
-                            "concede_retry", attempt=attempt + 1)
         if cls is not None and cls.state == ScreenState.UNKNOWN:
             self._record_unknown(frame, where="concede", confidence=round(cls.confidence, 3),
                                  waiting_to_leave=ScreenState.CONCEDE_MENU.value)
@@ -1877,59 +2351,27 @@ class Engine:
         a retry and fails closed.  ``max_attempts`` is already clipped to the enclosing stack's
         total-tap cap, so even a succession of dropped screens cannot create extra actions.
         """
-        attempts = max(1, min(self.cfg.vision.end_dismiss_tap_attempts, max_attempts))
-        taps_sent = 0
-        for attempt in range(attempts):
-            try:
-                self._tap(self.layout.end_dismiss, committing=False, decision_type="commit",
-                          expected_change="full_transition", allow_correction=False,
-                          what="end_dismiss")
-            except Halt as e:
-                # A changed-but-wrong screen, an incoherent gesture, a rotated display, etc.
-                # is NOT a dropped input.  Propagate it rather than turning it into another
-                # tap at a coordinate whose target we no longer know.
-                if e.kind != Halt.NO_CHANGE:
-                    raise
-                taps_sent += 1
-
-                # `_tap` has already spent its full motion-look budget.  Before considering a
-                # retap, take a fresh, scoped look: it is the proof that makes a retap safe.
-                cls, frame = self._classify_settled(end_scope)
-                if cls.state != state:
-                    if cls.state == ScreenState.UNKNOWN:
-                        self._record_unknown(frame, where="end_dismiss",
-                                             confidence=round(cls.confidence, 3),
-                                             waiting_to_leave=state.value)
-                        raise Halt(
-                            f"end-screen dismiss on {state.value!r} saw an unknown screen "
-                            "after no pixel change; refusing to blind-retap end_dismiss")
-                    if cls.state not in end_scope:
-                        raise Halt(
-                            f"unexpected screen {cls.state.value!r} after end_dismiss; "
-                            "refusing to blind-tap end_dismiss there")
-                    # A positive, different in-scope state is a late transition (or at least
-                    # a state we can safely route on the next outer-loop iteration), not proof
-                    # that the original end screen is still under this coordinate.
-                    return taps_sent
-
-                if attempt + 1 == attempts:
-                    break
-                if self.debug:
-                    self.debug.record("end_dismiss_tap_ignored", screen=state.value,
-                                      attempt=attempt + 1, of=attempts)
-                self._sleep_for(timing.human_delay(self.rng, 0.7, self.cfg.timing),
-                                "end_dismiss_retry", screen=state.value,
-                                attempt=attempt + 1)
-            else:
-                return taps_sent + 1
-
-        # We re-observed the exact same named end screen after every failed tap.  This is the
-        # same evidence as the bounded Play/Confirm retries, but scoped to a coordinate that is
-        # safe only on this screen -- make the diagnosis explicit for the run report.
-        raise Halt(
-            f"end-screen dismiss on {state.value!r} did not advance after {taps_sent} tap(s); "
-            "the screen is still up, so the tap is not registering (a dropped committing tap, "
-            "not a wrong coordinate). Only end_dismiss's own coordinate was ever tapped.")
+        key = f"end_dismiss:{state.value}"
+        # ``max_attempts`` is the *remaining* stack budget, whereas ``used`` is
+        # already charged to it.  Do not shrink the per-site retry ceiling on the
+        # next loop and accidentally reject a still-available final tap.
+        used = self._fixed_tap_attempts.get(key, 0)
+        attempts = max(1, min(self.cfg.vision.end_dismiss_tap_attempts,
+                              used + max_attempts))
+        attempt = self._fixed_attempt(key, attempts)
+        if attempt > 1 and self.debug:
+            self.debug.record("end_dismiss_tap_ignored", screen=state.value,
+                              attempt=attempt - 1, of=attempts,
+                              verification="semantic_source_persisted")
+        # The enclosing loop takes a fresh scoped classification before it ever calls
+        # us again.  Therefore a repeat is only possible while this same named end
+        # screen is still present; UNKNOWN and every other screen fail closed there.
+        self._tap_fixed(self.layout.end_dismiss, committing=False, decision_type="commit",
+                        what="end_dismiss")
+        self._semantic_cooldown(self.cfg.timing.end_dismiss_cooldown_s,
+                                "end_dismiss_cooldown", screen=state.value,
+                                attempt=attempt)
+        return 1
 
     def _clear_end_screens(self, max_taps: int = 8) -> None:
         """Tap through victory/defeat/rewards/quest popups until back at a home screen.
@@ -1962,9 +2404,21 @@ class Engine:
         # end_dismiss into the dissolving board. Any un-listed screen just full-scans.
         end_scope = (frozenset(self.END_SCREENS) | frozenset(self.HOME_SCREENS)
                      | {ScreenState.IN_GAME})
+        pending = self._deferred_screen
+        self._deferred_screen = None
         while True:
-            cls, frame = self._classify_settled(end_scope)
+            if pending is not None:
+                cls, frame = pending
+                pending = None
+            else:
+                cls, frame = self._classify_settled(end_scope)
             if cls.state in self.HOME_SCREENS:
+                for key in tuple(self._fixed_tap_attempts):
+                    if key.startswith("end_dismiss:"):
+                        self._clear_fixed_attempt(key)
+                # Main-loop dispatch can consume this named home observation rather
+                # than taking an identical screenshot after the post-game stack.
+                self._deferred_screen = (cls, frame)
                 return
             if cls.state == ScreenState.UNKNOWN:
                 self._record_unknown(frame, where="clear_end_screens",
@@ -1992,12 +2446,15 @@ class Engine:
                             "board never finished dissolving after the concede", frame, **context)
                     raise Halt("board never finished dissolving after the concede")
                 waits += 1
-                self._sleep_for(timing.human_delay(self.rng, 1.2, self.cfg.timing),
-                                "clear_end_wait", wait=waits)
+                self._semantic_cooldown(self.cfg.timing.concede_resolve_cooldown_s,
+                                        "clear_end_wait", wait=waits)
                 continue
             if cls.state not in self.END_SCREENS:
                 raise Halt(f"unexpected screen {cls.state.value!r} while clearing end "
                            f"screens; refusing to blind-tap end_dismiss there")
+            for key in tuple(self._fixed_tap_attempts):
+                if key.startswith("end_dismiss:") and key != f"end_dismiss:{cls.state.value}":
+                    self._clear_fixed_attempt(key)
             if taps >= max_taps:
                 raise Halt(f"end screens did not clear after {taps} dismiss taps")
             # Count physical gestures (including a dropped retry) against the post-game stack's
@@ -2010,12 +2467,15 @@ class Engine:
 
     def _alert_target(self, read: MulliganRead) -> None:
         name = DISPLAY_NAMES.get(read.opponent_class, "?")
-        second = "2nd" if read.we_go_second else "1st"
-        msg = f"Target matchup: {name} (going {second}) - your turn!"
+        turn_known = read.num_cards in (3, 4)
+        second = read.we_go_second if turn_known else None
+        turn = f"going {'2nd' if second else '1st'}" if turn_known else "turn unreadable"
+        msg = f"Target matchup: {name} ({turn}) - your turn!"
         if self.debug:
-            self.debug.record("target_found", opponent=name, second=read.we_go_second)
+            self.debug.record("target_found", opponent=name, second=second,
+                              turn_known=turn_known, cards=read.num_cards)
         if self.alerts:
-            self.alerts.target_found(name, read.we_go_second)
+            self.alerts.target_found(name, second)
         else:
             print(msg)
 

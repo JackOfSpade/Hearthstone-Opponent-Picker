@@ -95,6 +95,40 @@ think_commit_sigma = 0.35
 think_reject_shift = 0.75
 think_reject_mu = 0.65             # -> ~2.7 s median
 think_reject_sigma = 0.42
+# Pixel 7a Wi-Fi measured action -> first named destination means (six journals).
+# These are semantic cooldown floors, then randomized upward; one semantic check
+# follows each. The two UI-opening allowances below are the exception: they are
+# exact deliberate render waits, kept short so the app remains responsive.
+play_to_mulligan_cooldown_s = 43.2 # observed mean 43.197s (n=34), rounded upward
+mulligan_confirm_cooldown_s = 13.3
+# Give the Game Menu that contains Concede a fixed half-second to render.
+# This intentional UI delay is validated to remain at or below one second.
+gear_menu_cooldown_s = 0.5
+concede_resolve_cooldown_s = 14.1
+end_dismiss_cooldown_s = 5.5
+# The post-concede boundary is due this long after the FIRST Play-location tap,
+# not this long after its last one.  Its wait overlaps the bounded Play burst;
+# a sequential quiet wait could let a fast successor reach its mulligan unseen.
+post_concede_queue_cooldown_s = 18.2
+# Reject fast path: after Concede, give its confirmation popup a fixed half-second
+# to render, then tap Concede Now once at its fixed modal location (inert if the
+# Black Market warning is absent), then tap the known Play location through the
+# post-game stack. This intentional UI delay is validated to remain at or below one
+# second. Retained journals show Play->Mulligan n=34, with the measured hard floor below.
+# The burst has 20 taps and only 19 bounded 0.75--0.90 s gaps (<=17.1 s), plus
+# gesture-emission time after the earliest Play hit: a large observed margin,
+# not a claim about arbitrary device stalls. No screenshots occur inside it;
+# one semantic read follows as soon as the overlapping boundary wait is due.
+post_concede_start_cooldown_s = 0.5
+post_concede_click_interval_s = 0.75
+post_concede_click_interval_max_s = 0.90
+post_concede_click_count = 20
+# Hard limit on *starting* Play-location taps, measured from immediately before
+# the first one.  The semantic capture that follows still leaves a margin below
+# the 30.270 s observed mulligan floor.
+post_concede_burst_max_s = 20.0
+# Evidence only: this is never slept or randomized.
+play_to_mulligan_observed_min_s = 30.270
 
 [motor]
 # FFitts (Bi & Zhai), not vanilla Fitts. a,b in seconds; precision term in mm.
@@ -212,7 +246,7 @@ screen_wait_poll_s = 1.0           # nominal gap between polls (humanized per dr
 # Raise it if your Wi-Fi is flaky enough to want more patience. 1 = the old crash-on-first-stall.
 capture_retry_attempts = 3
 # How finely a wait is sliced so a Stop request interrupts it promptly. A running hunt
-# can be mid-wait (a 12 s requeue delay, a match-start poll); without slicing, Stop is
+# can be mid-wait (a calibrated semantic cooldown or recovery poll); without slicing, Stop is
 # not seen until that wait ends. 0.15 s is imperceptible next to a ~1.4 s screencap.
 stop_poll_s = 0.15
 # After a tap, "the screen has not moved" and "the screen has not moved YET" look
@@ -232,13 +266,9 @@ motion_wait_attempts = 3
 # in the top-right corner of every board, so the concede is not special to the mulligan.
 # hop only concedes a game IT started; a board it did not queue into is a Halt.
 in_game_wait_attempts = 6
-# Tapping while Hearthstone searches for an opponent CANCELS the queue, so the only
-# safe move there is to wait. That made QUEUE the loop's one reachable infinite spin: a
-# matchmaking soft-lock keeps the anchor matching a static screen forever, and because
-# every cap was only ever checked inside `_tap`, a loop that never taps never trips one.
-# Silent: no tap, no cap, no Halt, no alert. Bound it. At ~1.5 s a poll this is ~2 min,
-# far beyond any real queue.
-queue_wait_attempts = 60
+# Matchmaking is intentionally unbounded. Once QUEUE/VS is observed, the engine
+# takes one capture+scoped classify per outer iteration, with no extra sleep or tap,
+# until the current mulligan's opponent class is readable or the operator stops it.
 # hop lands on the deck LIST after dismissing an "error starting your game" (Hearthstone
 # kicks you out of matchmaking back to deck selection). hop can't reopen a deck itself --
 # it can't tell which one you were playing, and opening the wrong/incomplete one is worse
@@ -248,7 +278,7 @@ queue_wait_attempts = 60
 # walked-away session doesn't poll forever.
 deck_select_wait_attempts = 40
 # Hearthstone shuts down idle connections ("You are currently offline"), which the
-# hunt loop's own anti-barcode pacing provokes. Tapping Reconnect starts an
+# hunt loop's calibrated waits can make an idle timeout more likely. Tapping Reconnect starts an
 # ASYNCHRONOUS reconnect: the body becomes "Reconnecting..." and both buttons are
 # removed, so the loop must WAIT rather than re-tap. Poll this many times - never
 # tapping - for the attempt to resolve...
@@ -285,15 +315,10 @@ play_tap_attempts = 3
 # an unknown state (we are still on the mulligan), so halting the hunt over it would be
 # fail-closed applied where nothing is closed.
 mulligan_card_tap_attempts = 3
-# A Concede tap is a BUTTON tap, which this client normally honours every time -- but under a
-# DEGRADING wireless link even a button tap can be silently dropped (observed: a run whose
-# capture latency was climbing dropped the concede, and its own verify could not catch it
-# because the board animates behind the semi-transparent Game Menu, so the change-check passed
-# on ambient motion). The only positive proof the Concede took is the Game Menu LEAVING, so
-# retry the SAME Concede coordinate -- the TOP menu entry, never a point below it -- while the
-# menu is positively still up, exactly as mulligan cards are retried. Each attempt keeps the
-# full screen_wait budget first, so a slow-but-honoured concede never retaps. 1 = the old
-# single-tap-then-halt (which failed the whole hunt closed on one dropped committing tap).
+# A Concede button tap can be dropped on a degrading wireless link. The ordinary
+# rejected-mulligan fast path sends this many bounded, rapid repeats of the SAME
+# top-menu coordinate before its Play-location click-through; no Options/Quit point
+# is ever used. Exceptional recovery still uses a named-screen semantic check.
 concede_tap_attempts = 3
 # A post-game end screen's central dismiss button can be dropped too. Unlike the Game Menu,
 # these screens are static, so a drop produces literally zero pixel change and `_tap` raises
@@ -321,30 +346,9 @@ mulligan_resolve_attempts = 30     # poll bound (a frozen-clock test needs this;
 # Concede's, so this defaults to 2, not 3 -- enough to recover one dropped tap without tripling
 # an already-large worst-case wait. 1 = the old single-tap-then-halt.
 mulligan_confirm_tap_attempts = 2
-# Reading the OPPONENT's class off the mulligan can whiff even once the mulligan is up:
-# the nameplate is still drawing in, so the class region reads blank (class='') though our
-# cards count fine. (NOT the "Opponent Still Choosing..." banner above -- that is a POST-confirm
-# wait phenomenon, while this read happens BEFORE we confirm; a real still-choosing frame OCRs
-# the class fine, verified on disk.) That is a transient, not a lost screen -- so re-read a few
-# times before failing closed, the same patience the resolve wait above gives. LIVE-OBSERVED
-# 2026-07-10: a single re-read (the old behaviour, =2) halted a healthy hunt on one
-# slow-rendering nameplate. Each try costs ~0.8 s think + a wireless capture + OCR (~5 s),
-# so 4 keeps the added patience to ~15 s. (>=1; 1 = one read, no retry.)
-mulligan_read_attempts = 4
-# When a game's class NEVER reads (blank/garbled through all mulligan_read_attempts above),
-# halting the whole unattended hunt on that one nameplate is out of step with every other
-# transient hop recovers from (a dropped tap, a reconnect, a stray Collection screen). The
-# cards counted fine, so hop can concede + requeue that game -- exactly what a human hunting
-# specific classes does when they can't tell what they're facing -- and only fail closed when
-# it happens this many GAMES in a row. A single unreadable game (the LIVE-OBSERVED 2026-07-11
-# halt: class='', cards=4, going 2nd) now recovers; a *run* in a row means the reader is broken
-# RIGHT NOW (a shifted nameplate region, a UI change) and stops for a human. The streak resets
-# on any usable read, so this catches an ACUTE, class-independent break -- a failure correlated
-# to one class's word is surfaced by the report's "class NEVER read" line and the "?" games
-# instead (auto-halting on a scattered rate would false-stop a healthy hunt). Deliberate trade:
-# an unreadable game that happens to be a target is conceded, not halted on. (>=1; 1 = halt on
-# the first unreadable game.)
-mulligan_unreadable_halt_streak = 4
+# Reading the OPPONENT's class off the mulligan can whiff while its nameplate is
+# still drawing. A blank class is watched indefinitely rather than re-read in-place:
+# the next outer loop immediately captures again, with no sleep, statistics, or input.
 # Mulligan card counting. Every card is outlined by a saturated green "keep" glow.
 # The glow is UI chrome, so - unlike the mana gems or a brightness profile, both of
 # which this replaced - card artwork cannot fake it. A strip must span most of the

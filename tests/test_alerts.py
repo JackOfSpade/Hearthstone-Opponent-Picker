@@ -40,6 +40,12 @@ def test_target_found_is_silent_when_mac_sound_is_off():
     assert calls == []                          # no sound, and still no other channel
 
 
+def test_target_found_can_report_an_unreadable_turn(capsys):
+    a = Alerter(_cfg(mac_sound=False))
+    a.target_found("Priest", we_go_second=None)
+    assert "turn unreadable" in capsys.readouterr().out
+
+
 def test_no_looping_alarm_api_remains():
     """The looping alarm + silence step are gone; nothing may depend on them."""
     a = Alerter(_cfg())

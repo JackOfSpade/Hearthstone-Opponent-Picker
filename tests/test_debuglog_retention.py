@@ -9,6 +9,8 @@ The planners are pure so the policy is testable without a phone, a run, or Pillo
 """
 
 from pathlib import Path
+import json
+from datetime import datetime
 
 import pytest
 
@@ -128,6 +130,39 @@ def test_debuglog_journal_is_never_pruned(tmp_path):
     assert "gear" in (tmp_path / "journal.jsonl").read_text()
 
 
+def test_journal_entry_has_a_local_iso_timestamp_from_its_single_clock_sample(tmp_path):
+    class FrozenClock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return 1_791_002_909.123456
+
+    clock = FrozenClock()
+    log = DebugLog(tmp_path, clock=clock)
+    log.record("tap", what="gear")
+
+    entry = json.loads((tmp_path / "journal.jsonl").read_text())
+    assert clock.calls == 1
+    assert entry["t"] == 1_791_002_909.123456  # retained for existing readers
+    parsed = datetime.fromisoformat(entry["ts"])
+    assert parsed.tzinfo is not None and parsed.utcoffset() is not None
+    assert parsed.timestamp() == pytest.approx(entry["t"], abs=0.000001)
+
+
+def test_new_journal_timestamp_is_ignored_by_existing_bugreport_parser(tmp_path):
+    """`ts` is additive: readers of the old numeric-`t` schema still consume it."""
+    from hop.bugreport import summarize_journal
+
+    log = DebugLog(tmp_path, clock=lambda: 0.0)
+    log.record("mulligan_read", opponent="Mage", second=False)
+    journal = (tmp_path / "journal.jsonl").read_text()
+
+    assert "ts" in json.loads(journal)
+    assert "Mage" in summarize_journal(journal)
+
+
 def test_jsonable_preserves_nested_dicts_in_lists():
     """A journalled list of dicts (e.g. unknown-screen near_misses) must round-trip as
     dicts, not as Python-repr strings -- the summariser reads them as objects."""
@@ -228,6 +263,32 @@ def test_unknown_screen_writes_frame_and_sidecar(tmp_path):
 
     sidecar = path.with_suffix(".json")
     assert sidecar.exists() and "dispatch" in sidecar.read_text()
+
+
+def test_colour_anomaly_preserves_rgb_for_hue_dependent_diagnostics(tmp_path):
+    """The green mulligan glow is not recoverable from a normal grayscale anomaly."""
+    pytest.importorskip("PIL")
+    pytest.importorskip("numpy")
+    import numpy as np
+    from PIL import Image
+
+    from hop.perception.image import Frame
+
+    rgb = np.zeros((4, 6, 3), dtype="uint8")
+    rgb[..., 1] = 200
+    frame = Frame(6, 4, np.zeros((4, 6), dtype="uint8"), rgb=rgb)
+    log = DebugLog(tmp_path, clock=lambda: 0.0)
+
+    log.anomaly("mulligan card count unreadable", before=frame, colour=True)
+
+    saved = tmp_path / "anomaly_1_before.png"
+    assert saved.exists()
+    with Image.open(saved) as image:
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (0, 200, 0)
+    entry = json.loads((tmp_path / "journal.jsonl").read_text())
+    assert entry["kind"] == "anomaly"
+    assert entry["detail"]["reason"] == "mulligan card count unreadable"
 
 
 def test_unknown_store_is_empty_when_nothing_is_unknown(tmp_path):

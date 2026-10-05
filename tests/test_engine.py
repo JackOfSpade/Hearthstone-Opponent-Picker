@@ -14,7 +14,7 @@ def _engine(cfg, states, *, target_read=None, capturer=None, alerter=None):
     adb = FakeAdb()
     backend = FakeBackend()
     from hop.geometry import PanelGeometry
-    panel = PanelGeometry(800, 400, 400.0)
+    panel = PanelGeometry(80, 40, 400.0)
     classifier = FakeClassifier(states)
     eng = Engine(
         cfg, adb, backend, panel, classifier, reader=None,
@@ -57,10 +57,33 @@ def test_run_exits_with_user_stop_when_stopped(cfg):
 
 
 def test_evaluate_matchup_pure(cfg):
+    from dataclasses import replace
+
     keep = MulliganRead(HeroClass.MAGE, True, 4, 1.0, "MAGE", "tesseract")
     assert evaluate_matchup(keep, cfg) == "keep"  # no filter -> keep
     unusable = MulliganRead(None, False, 0, 0.0, "??", "tesseract")
     assert evaluate_matchup(unusable, cfg) == "unusable"
+
+    # A card count only decides the require-second criterion.  A known class is
+    # therefore actionable when that criterion does not apply, and a known
+    # non-target is deterministically rejectable even when it does.
+    class_only = replace(
+        cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,), require_second=False)
+    )
+    assert evaluate_matchup(
+        MulliganRead(HeroClass.PALADIN, False, 0, 1.0, "PALADIN", "tesseract"), class_only
+    ) == "keep"
+    assert evaluate_matchup(
+        MulliganRead(HeroClass.MAGE, False, 0, 1.0, "MAGE", "tesseract"), class_only
+    ) == "reject"
+
+    turn_required = replace(class_only, criteria=replace(class_only.criteria, require_second=True))
+    assert evaluate_matchup(
+        MulliganRead(HeroClass.PALADIN, False, 0, 1.0, "PALADIN", "tesseract"), turn_required
+    ) == "unusable"
+    assert evaluate_matchup(
+        MulliganRead(HeroClass.MAGE, False, 0, 1.0, "MAGE", "tesseract"), turn_required
+    ) == "reject"
 
 
 def test_target_found_alerts_and_stops(cfg):
@@ -114,14 +137,49 @@ def test_mulligan_read_accumulates_the_class_distribution(cfg):
     assert eng.stats.concedes_until_target is None   # no target yet
 
 
-def test_mulligan_reread_is_journalled_with_its_recovered_class(cfg):
-    """Report blind spot regression: when the first OCR whiffs (opponent None) and the
-    engine's single re-read resolves the class, that re-read must be journalled too --
-    else the report shows only the failed first read ('opponents seen: ?×1') while the
-    engine had correctly conceded the real matchup. Observability only: the second record
-    must not add an observe_confidence or otherwise perturb the run."""
-    from dataclasses import replace
-    from hop.geometry import PanelGeometry
+def test_pending_mulligan_reads_are_journalled_but_do_not_change_action_confidence(cfg):
+    """Blank nameplates are match-watch diagnostics, not weak matchup decisions.
+
+    Repeated blank frames must keep the eventual tap's humanization state intact;
+    the one resolved read then updates confidence exactly once and marks the journal
+    record as the one game decision.
+    """
+    class RecordingDebug:
+        def __init__(self):
+            self.events = []
+
+        def record(self, kind, /, **detail):
+            self.events.append((kind, detail))
+
+    eng, _ = _engine(cfg, [ScreenState.MULLIGAN])
+    debug = RecordingDebug()
+    eng.debug = debug
+    eng.state.confidence = 0.8
+    reads = iter([
+        MulliganRead(None, True, 4, 0.0, "", "test"),
+        MulliganRead(None, True, 4, 0.0, "", "test"),
+        MulliganRead(HeroClass.MAGE, False, 3, 0.6, "MAGE", "test"),
+    ])
+    eng._read_mulligan = lambda *_a, **_k: next(reads)
+    frame = gray_frame(80, 40)
+
+    eng._handle_mulligan(frame)
+    eng._handle_mulligan(frame)
+    assert eng.state.confidence == 0.8
+    assert eng._awaiting_match_class is True
+
+    eng._handle_mulligan(frame)
+    assert eng.state.confidence == 0.7
+    assert eng._awaiting_match_class is False
+    records = [d for kind, d in debug.events if kind == "mulligan_read"]
+    assert [d["pending"] for d in records] == [True, True, False]
+    assert [kind for kind, _ in debug.events if kind.startswith("match_watch_")] == [
+        "match_watch_start", "match_watch_resolved",
+    ]
+
+
+def test_named_interruption_closes_the_match_watch_before_its_own_action(cfg):
+    from hop.perception.screens import Classification
 
     class RecordingDebug:
         def __init__(self):
@@ -130,30 +188,14 @@ def test_mulligan_reread_is_journalled_with_its_recovered_class(cfg):
         def record(self, kind, /, **detail):
             self.events.append((kind, detail))
 
-    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
-    dbg = RecordingDebug()
-    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
-                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
-                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1),
-                 layout=GameLayout(),
-                 capturer=ScriptedCapturer([gray_frame(80, 40), gray_frame(80, 40)]),
-                 debug=dbg)
-    eng._execute_reject = lambda read: None    # skip the concede journey; we test the read
-    reads = iter([
-        MulliganRead(None, False, 0, 0.0, "??", "tesseract"),                 # first: unusable
-        MulliganRead(HeroClass.DRUID, False, 3, 0.61, "DRUID", "tesseract"),  # re-read: recovered
-    ])
-    eng._read_mulligan = lambda *a, **k: next(reads)
+    eng, _ = _engine(cfg, [ScreenState.ERROR_DIALOG])
+    debug = RecordingDebug()
+    eng.debug = debug
+    eng._begin_match_watch(source="queue")
+    eng._dispatch(Classification(ScreenState.ERROR_DIALOG, 1.0), gray_frame(80, 40))
 
-    eng._handle_mulligan(gray_frame(80, 40))
-
-    logged = [d for k, d in dbg.events if k == "mulligan_read"]
-    assert len(logged) == 2                                 # the whiff AND the recovery
-    assert logged[0]["opponent"] == "?" and not logged[0].get("reread")
-    assert logged[1]["reread"] is True and logged[1]["opponent"] == "Druid"
-    # the recovered read is what drove the stats (the run conceded the real matchup)
-    assert eng.stats.class_distribution == {"Druid": 1}
-    assert eng.stats.last_opponent == "Druid"
+    assert eng._awaiting_match_class is False
+    assert ("match_watch_interrupted", {"outcome": "interrupted", "state": "error_dialog"}) in debug.events
 
 
 def test_opponent_class_region_captures_the_longest_label_from_the_screen_edge(cfg):
@@ -239,109 +281,25 @@ def test_low_confidence_resolved_read_is_preserved_for_diagnosis(cfg):
     assert not dbg.anomalies
 
 
-def _mulligan_read_engine(cfg, reads, n_frames=6):
-    """An engine on the mulligan whose `_read_mulligan` yields a scripted sequence."""
-    from hop.geometry import PanelGeometry
-    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
-                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
-                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1), layout=GameLayout(),
-                 capturer=ScriptedCapturer([gray_frame(80, 40)] * n_frames))
-    eng._execute_reject = lambda read: None      # skip the concede journey; we test the read
-    it = iter(reads)
-    eng._read_mulligan = lambda *a, **k: next(it)
-    return eng
-
-
-def test_mulligan_class_recovers_on_a_later_reread_not_just_the_first(cfg):
-    """A blank opponent class on a *confirmed* mulligan is a transient -- the nameplate is
-    still drawing in, or an "Opponent Still Choosing..." banner is over it. The engine must
-    re-read a few times and recover, not halt after a single re-read as it used to."""
-    from dataclasses import replace
-    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
-    eng = _mulligan_read_engine(cfg, [
-        MulliganRead(None, False, 3, 0.0, "", "tesseract"),                  # first: blank
-        MulliganRead(None, False, 3, 0.0, "", "tesseract"),                  # re-read 1: still blank
-        MulliganRead(HeroClass.MAGE, False, 3, 0.8, "MAGE", "tesseract"),    # re-read 2: recovered
-    ])
-    eng._handle_mulligan(gray_frame(80, 40))     # must NOT raise Halt
-    assert eng.stats.class_distribution == {"Mage": 1}   # the recovered read drove the stats
-    assert eng.stats.last_opponent == "Mage"
-
-
-def test_a_single_unreadable_mulligan_recovers_not_halts(cfg):
-    """A single game whose class never reads is a transient, not a fatal halt: hop concedes +
-    requeues it (the reject journey, which needs only the card count -- present here) and keeps
-    hunting. This is the LIVE-OBSERVED 2026-07-11 halt (class='', cards=4, going 2nd), which
-    used to stop the whole unattended run on one nameplate."""
-    attempts = cfg.vision.mulligan_read_attempts
-    eng = _mulligan_read_engine(
-        cfg, [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts)
-    rejected = []
-    eng._execute_reject = lambda read: rejected.append(read)
-    eng._handle_mulligan(gray_frame(80, 40))          # must NOT raise Halt
-    assert len(rejected) == 1                          # conceded + requeued, hunt lives on
-    assert eng._unreadable_mulligans == 1              # but the streak is counting
-    assert eng.stats.class_distribution == {"?": 1}    # recorded honestly as an unread game
-
-
-def test_unreadable_streak_resets_on_a_good_read(cfg):
-    """The consecutive-failure streak is CONSECUTIVE: any usable read clears it, so an
-    occasional unreadable game interleaved with good ones never trips the halt."""
-    from dataclasses import replace
-    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
-    attempts = cfg.vision.mulligan_read_attempts
-    eng = _mulligan_read_engine(
-        cfg,
-        [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts    # game 1: unreadable
-        + [MulliganRead(HeroClass.MAGE, True, 4, 0.8, "MAGE", "tesseract")])  # game 2: reads fine
-    eng._handle_mulligan(gray_frame(80, 40))
-    assert eng._unreadable_mulligans == 1
-    eng._handle_mulligan(gray_frame(80, 40))
-    assert eng._unreadable_mulligans == 0             # a good read cleared the streak
-
-
-def test_a_persistently_unreadable_mulligan_halts_after_a_streak(cfg):
-    """Patience is bounded across GAMES: a class that never reads game after game is a
-    systematically broken reader (it would otherwise silently concede a real target forever),
-    so hop still fails closed -- just after `mulligan_unreadable_halt_streak` games, not one."""
-    from hop.verify import Halt
-    attempts = cfg.vision.mulligan_read_attempts
-    cap = cfg.vision.mulligan_unreadable_halt_streak
-    eng = _mulligan_read_engine(
-        cfg, [MulliganRead(None, True, 4, 0.0, "", "tesseract")] * (attempts * cap))
-    for _ in range(cap - 1):
-        eng._handle_mulligan(gray_frame(80, 40))       # each recovers, no raise
-    assert eng._unreadable_mulligans == cap - 1
-    with pytest.raises(Halt, match="in a row"):
-        eng._handle_mulligan(gray_frame(80, 40))       # the cap-th game fails closed
-
-
-def test_good_class_bad_card_count_still_halts_never_conceded(cfg):
-    """The recover-as-reject path is gated on the CLASS being unreadable. A game whose class
-    reads FINE (here a hunted target) but whose card count never resolves must NOT be conceded
-    -- we can't tell the hand and might throw away the target the hunt exists to catch -- so it
-    keeps the old fail-closed Halt, on the FIRST such game (no streak), and never rejects."""
+def test_good_possible_target_bad_card_count_still_halts_never_conceded(cfg):
+    """A card count remains mandatory only when a possible target needs its turn."""
     from hop.verify import Halt
     from dataclasses import replace
-    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
-    attempts = cfg.vision.mulligan_read_attempts
-    eng = _mulligan_read_engine(
-        cfg, [MulliganRead(HeroClass.PALADIN, False, 0, 0.9, "PALADIN", "tesseract")] * attempts)
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,),
+                                         require_second=True))
+    eng, _ = _engine(cfg, [ScreenState.MULLIGAN])
+    eng._read_mulligan = lambda *a, **k: MulliganRead(
+        HeroClass.PALADIN, False, 0, 0.9, "PALADIN", "tesseract")
     rejected = []
     eng._execute_reject = lambda read: rejected.append(read)
     with pytest.raises(Halt, match=r"could not read mulligan \(class='PALADIN', cards=0\)"):
         eng._handle_mulligan(gray_frame(80, 40))
     assert rejected == []                       # the target was NOT conceded
-    assert eng._unreadable_mulligans == 0       # a card-count miss is not a class-read streak
 
 
-def test_unreadable_mulligan_saves_the_frame_and_class_region_stats(cfg):
-    """Harness regression: a 'could not read mulligan' used to save NOTHING (the mulligan is a
-    NAMED screen, so the unknown-frame store never fired), leaving a report with only class=''
-    and no way to tell a blank region from a mis-aligned OCR. Now it journals the class-region
-    pixel stats -- the decisive datum -- and saves the frame."""
+def test_class_only_card_count_miss_rejects_and_preserves_colour_diagnostics(cfg):
+    """A known non-target does not need the coin, but its green-glow miss is retained."""
     from dataclasses import replace
-    from hop.geometry import PanelGeometry
 
     class RecordingDebug:
         def __init__(self):
@@ -354,57 +312,67 @@ def test_unreadable_mulligan_saves_the_frame_and_class_region_stats(cfg):
         def anomaly(self, reason, before=None, after=None, **context):
             self.anomalies.append((reason, before, context))
 
-    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PALADIN,)))
-    dbg = RecordingDebug()
-    attempts = cfg.vision.mulligan_read_attempts
-    eng = Engine(cfg, FakeAdb(), FakeBackend(), PanelGeometry(80, 40, 400.0),
-                 FakeClassifier([ScreenState.MULLIGAN]), reader=None,
-                 sleep=lambda s: None, clock=lambda: 0.0, rng=Random(1), layout=GameLayout(),
-                 capturer=ScriptedCapturer([gray_frame(80, 40)] * (attempts + 1)), debug=dbg)
-    eng._execute_reject = lambda read: None
-    reads = iter([MulliganRead(None, True, 4, 0.0, "", "tesseract")] * attempts)
-    eng._read_mulligan = lambda *a, **k: next(reads)
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PRIEST,),
+                                         require_second=False))
+    eng, _ = _engine(cfg, [ScreenState.MULLIGAN])
+    debug = RecordingDebug()
+    eng.debug = debug
+    eng._read_mulligan = lambda *a, **k: MulliganRead(
+        HeroClass.DEATHKNIGHT, False, 0, 1.0, "DEATHKNIGHT", "tesseract")
+    rejected = []
+    eng._execute_reject = lambda read: rejected.append(read)
 
     eng._handle_mulligan(gray_frame(80, 40))
 
-    unreadable = [d for k, d in dbg.events if k == "mulligan_unreadable"]
-    assert len(unreadable) == 1
-    d = unreadable[0]
-    assert d["recovering"] is True and d["streak"] == 1 and d["cap"] == cfg.vision.mulligan_unreadable_halt_streak
-    assert set(d["region_gray"]) == {"mean", "min", "max", "std"}   # the decisive datum is present
-    assert len(dbg.anomalies) == 1                                   # the frame was saved for diagnosis
+    assert rejected and rejected[0].opponent_class is HeroClass.DEATHKNIGHT
+    assert eng.stats.class_distribution == {"Death Knight": 1}
+    assert eng.stats.going_first == eng.stats.going_second == 0
+    read = next(detail for kind, detail in debug.events if kind == "mulligan_read")
+    assert read["decision"] == "reject"
+    assert read["turn_known"] is False and read["second"] is None
+    evidence = next(detail for kind, detail in debug.events
+                    if kind == "mulligan_card_count_unreadable")
+    assert evidence["decision"] == "reject"
+    assert evidence["mulligan_card_count"]["rejection"] == "no_rgb"
+    assert debug.anomalies[0][0] == "mulligan card count unreadable"
+    assert debug.anomalies[0][2]["colour"] is True
+    assert debug.anomalies[0][2]["terminal"] is False
 
 
-def test_mulligan_read_attempts_one_restores_single_read_no_retry(cfg):
-    """`mulligan_read_attempts = 1` is the escape hatch back to one read, no re-read. Paired
-    with `mulligan_unreadable_halt_streak = 1` it restores the old halt-on-first behaviour."""
+def test_class_only_target_with_an_unreadable_turn_alerts_without_claiming_first(cfg):
+    """A class-only target is safe to leave untouched, and its alert says turn unknown."""
     from dataclasses import replace
-    from hop.verify import Halt
 
-    cfg = replace(cfg, vision=replace(cfg.vision, mulligan_read_attempts=1,
-                                      mulligan_unreadable_halt_streak=1))
-    reads = []
+    class RecordingAlerter:
+        found = None
 
-    def read(*a, **k):
-        r = MulliganRead(None, False, 3, 0.0, "", "tesseract")
-        reads.append(r)
-        return r
+        def target_found(self, name, second):
+            self.found = (name, second)
 
-    eng = _mulligan_read_engine(cfg, [])
-    eng._read_mulligan = read
-    with pytest.raises(Halt):
-        eng._handle_mulligan(gray_frame(80, 40))
-    assert len(reads) == 1        # one read, no re-read
+        def info(self, _message):
+            pass
 
+        def halt(self, _message):
+            pass
 
-def test_queue_dispatch_sets_the_scoped_prior_for_the_next_look(cfg):
-    """The dominant heartbeat: after a QUEUE poll the next top-loop look is scoped to
-    {queue, mulligan} (still-queueing or matched-in) -- the interrupt floor still catches a
-    disconnect. A wrong guess only costs the full scan back (classify_expected)."""
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.PRIEST,),
+                                         require_second=False))
+    alerter = RecordingAlerter()
+    eng, backend = _engine(cfg, [ScreenState.MULLIGAN], alerter=alerter)
+    eng._read_mulligan = lambda *a, **k: MulliganRead(
+        HeroClass.PRIEST, False, 0, 1.0, "PRIEST", "tesseract")
+
+    eng._handle_mulligan(gray_frame(80, 40))
+
+    assert eng.stats.target_found is True
+    assert eng.stats.going_first == eng.stats.going_second == 0
+    assert alerter.found == ("Priest", None)
+    assert backend.gestures == []
+def test_queue_dispatch_starts_the_hands_off_match_watch(cfg):
     from hop.perception.screens import Classification
     eng, _ = _engine(cfg, [ScreenState.QUEUE])
     eng._dispatch(Classification(ScreenState.QUEUE, 0.9), gray_frame(80, 40))
-    assert eng._expected_next == {ScreenState.QUEUE, ScreenState.MULLIGAN}
+    assert eng._awaiting_match_class is True
 
 
 def test_in_game_poll_sets_the_scoped_prior(cfg):
@@ -490,7 +458,11 @@ def test_tap_emits_and_registers(cfg):
 
 
 def test_queue_screen_never_taps(cfg):
-    """Tapping while Hearthstone searches for an opponent CANCELS the queue."""
+    """The normal queue loop stays hands-off: queue controls can cancel a search.
+
+    This does not describe the calibrated post-concede Play-location burst, whose
+    fixed-point clicks are inert once search has begun.
+    """
     eng, backend = _engine(cfg, [ScreenState.QUEUE])
     frame = gray_frame(80, 40)
     eng._dispatch(eng.classifier.classify(frame), frame)
@@ -512,37 +484,66 @@ def _dispatch_once(cfg, state):
     return eng, backend
 
 
-def test_a_soft_locked_queue_halts_instead_of_spinning_forever(cfg):
-    """Tapping the queue cancels it, so the only safe move is to wait -- which made
-    this the loop's one reachable infinite spin. No tap, so no cap; no cap, so no stop.
+def test_match_watch_is_unbounded_capture_paced_and_reuses_the_resolved_frame(cfg):
+    """QUEUE/VS/UNKNOWN/blank class are all hands-off observations, not timeouts.
 
-    (The attempt count, not the frozen test clock, is what terminates this.)
+    The final named mulligan proves that the read passed to the decision is from
+    that exact capture, rather than a duplicate OCR or follow-up screenshot.
     """
-    from hop.verify import Halt
+    from dataclasses import replace
+    from hop.geometry import PanelGeometry
 
-    eng, backend = _engine(cfg, [ScreenState.QUEUE])
+    cfg = replace(cfg, criteria=replace(cfg.criteria, target_classes=(HeroClass.MAGE,)))
+    frames = [gray_frame(80, 40, n) for n in range(10, 16)]
+    backend = FakeBackend()
+    sleeps = []
+    eng = Engine(cfg, FakeAdb(), backend, PanelGeometry(80, 40, 400.0),
+                 FakeClassifier([
+                     ScreenState.QUEUE, ScreenState.VS_SPLASH, ScreenState.UNKNOWN,
+                     ScreenState.MULLIGAN, ScreenState.MULLIGAN,
+                 ]), reader=None, sleep=sleeps.append, clock=lambda: 0.0,
+                 rng=Random(1), layout=GameLayout(), capturer=ScriptedCapturer(frames))
+    reads = iter([
+        MulliganRead(None, False, 3, 0.0, "", "test"),
+        MulliganRead(HeroClass.MAGE, False, 3, 1.0, "MAGE", "test"),
+    ])
+    read_frames = []
+
+    def read(frame, *_args):
+        read_frames.append(frame)
+        return next(reads)
+
+    eng._read_mulligan = read
+    stats = eng.run(max_iterations=20)
+
+    assert stats.target_found is True
+    assert stats.class_distribution == {"Mage": 1}
+    assert len(read_frames) == 2
+    assert read_frames[0] is frames[3] and read_frames[1] is frames[4]
+    assert sleeps == []
+    assert backend.gestures == []
+
+
+def test_direct_mulligan_blank_class_starts_the_same_watch_without_counting(cfg):
+    from hop.perception.screens import Classification
+
+    eng, backend = _engine(cfg, [ScreenState.MULLIGAN])
+    eng._read_mulligan = lambda *_a: MulliganRead(None, True, 4, 0.0, "", "test")
+    eng.stats.last_opponent = "Prior opponent"
     frame = gray_frame(80, 40)
-    for _ in range(cfg.vision.queue_wait_attempts):
-        eng._dispatch(eng.classifier.classify(frame), frame)
-    with pytest.raises(Halt) as e:
-        eng._dispatch(eng.classifier.classify(frame), frame)
-    assert "matchmaking never matched" in str(e.value)
-    assert backend.gestures == []          # never, ever tap the queue
+    eng._dispatch(Classification(ScreenState.MULLIGAN, 1.0), frame)
 
-
-def test_finding_a_match_resets_the_queue_patience(cfg):
-    eng, _backend = _engine(cfg, [ScreenState.QUEUE, ScreenState.VS_SPLASH])
-    frame = gray_frame(80, 40)
-    eng._dispatch(eng.classifier.classify(frame), frame)
-    assert eng._queue_polls == 1
-    eng._dispatch(eng.classifier.classify(frame), frame)
-    assert eng._queue_polls == 0
+    assert eng._awaiting_match_class is True
+    assert eng.stats.class_distribution == {}
+    assert eng.stats.concedes == 0
+    assert eng.stats.last_opponent == "Prior opponent"
+    assert backend.gestures == []
 
 
 def test_session_time_is_accrued_as_wall_clock(cfg):
     """Session time is wall clock, accrued once per loop iteration (not only inside
     `_tap`). It is informational now - no cap - so a tapless loop like a stuck queue
-    just keeps polling until the queue-poll cap Halts it, never a session cap."""
+    keeps polling until the operator stops it, never a session cap."""
     eng, backend = _engine(cfg, [ScreenState.QUEUE])
     ticks = iter([float(i) for i in range(200)])
     eng.clock = lambda: next(ticks)
@@ -575,7 +576,7 @@ def test_collection_is_backed_out_of_not_halted(cfg):
     assert eng.limiter.commits_this_run == 0   # backing out is not a committing action
 
 
-def test_a_dropped_error_ok_tap_retries_then_succeeds(cfg):
+def test_error_ok_defers_verification_to_the_next_named_state(cfg):
     """error_ok and collection_back share one generic dispatch-button retry
     (`_tap_dispatch_button`, `vision.dispatch_tap_attempts`) -- exercised here via
     error_ok; collection_back's own smoke test below confirms the wiring."""
@@ -585,13 +586,13 @@ def test_a_dropped_error_ok_tap_retries_then_succeeds(cfg):
                  FakeClassifier([ScreenState.ERROR_DIALOG]), reader=None,
                  sleep=lambda s: None, rng=Random(2),
                  capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.dispatch_tap_attempts))
-    assert cfg.vision.dispatch_tap_attempts >= 2
     eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
                              what="error_ok", label="the error dialog's OK button")
-    assert len(backend.gestures) == cfg.vision.dispatch_tap_attempts
+    assert len(backend.gestures) == 1
+    assert eng._fixed_tap_attempts["error_ok"] == 1
 
 
-def test_error_ok_exhausts_its_retry_budget_then_fails_closed(cfg):
+def test_error_ok_persistent_named_source_bounds_semantic_retries(cfg):
     from hop.verify import Halt
 
     from hop.geometry import PanelGeometry
@@ -600,16 +601,18 @@ def test_error_ok_exhausts_its_retry_budget_then_fails_closed(cfg):
                  FakeClassifier([ScreenState.ERROR_DIALOG]),
                  reader=None, debug=debug, sleep=lambda s: None, rng=Random(2),
                  capturer=_StuckCardCapturer())
-    with pytest.raises(Halt) as e:
+    for _ in range(cfg.vision.dispatch_tap_attempts):
         eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
                                  what="error_ok", label="the error dialog's OK button")
-    assert "not registering (a dropped committing tap" in str(e.value)
+    with pytest.raises(Halt):
+        eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
+                                 what="error_ok", label="the error dialog's OK button")
     assert len(eng.backend.gestures) == cfg.vision.dispatch_tap_attempts
     ignored = [d for k, d in debug.events if k == "error_ok_tap_ignored"]
     assert len(ignored) == cfg.vision.dispatch_tap_attempts - 1
 
 
-def test_only_a_no_change_halt_is_retried_by_the_dispatch_button_helper(cfg):
+def test_dispatch_button_does_not_run_pixel_verification(cfg):
     """A coherence/non-repetition failure means the automation is wrong, not the
     client -- it must not be retried or folded into the dropped-tap message."""
     from hop.geometry import PanelGeometry
@@ -623,14 +626,12 @@ def test_only_a_no_change_halt_is_retried_by_the_dispatch_button_helper(cfg):
         raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
 
     eng.verifier.verify = wrong_change
-    with pytest.raises(Halt) as e:
-        eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
-                                 what="error_ok", label="the error dialog's OK button")
-    assert e.value.kind == Halt.WRONG_CHANGE
-    assert len(eng.backend.gestures) == 1   # not retried three times
+    eng._tap_dispatch_button(eng.layout.error_ok, expected_change="full_transition",
+                             what="error_ok", label="the error dialog's OK button")
+    assert len(eng.backend.gestures) == 1
 
 
-def test_a_dropped_collection_back_tap_retries_via_the_shared_helper(cfg):
+def test_collection_back_defers_to_next_named_state(cfg):
     """Smoke test that COLLECTION dispatch actually routes through the shared retrying
     helper (not a bare `_tap`) -- the regression `_tap_play` was added for."""
     backend = FakeBackend()
@@ -641,7 +642,7 @@ def test_a_dropped_collection_back_tap_retries_via_the_shared_helper(cfg):
                  capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.dispatch_tap_attempts))
     cls = eng.classifier.classify(gray_frame(80, 40))
     eng._dispatch(cls, gray_frame(80, 40))   # must not raise
-    assert len(backend.gestures) == cfg.vision.dispatch_tap_attempts
+    assert len(backend.gestures) == 1
 
 
 def test_collection_back_tap_stays_on_the_button_not_off_the_bottom():
@@ -979,6 +980,26 @@ def test_transport_lifecycle_is_journalled_before_a_stale_writer_breaks(cfg):
     assert "stream closed" in failure["transport"]["stderr_tail"]
 
 
+def test_transport_snapshot_keeps_cached_coordinate_transform_evidence():
+    from hop.engine import _transport_snapshot
+
+    class Backend:
+        def transport_status(self):
+            return {
+                "kind": "uhid", "rotation": 3, "panel_width_px": 1080,
+                "panel_height_px": 2400, "axis_touch_major_max": 2399,
+                "axis_pressure_max": 255, "last_display_x": 1206.4,
+                "last_display_y": 211.7, "last_native_x": 212,
+                "last_native_y": 1193, "unbounded_object": object(),
+            }
+
+    snapshot = _transport_snapshot(Backend())
+    assert snapshot["rotation"] == 3
+    assert snapshot["axis_touch_major_max"] == 2399
+    assert (snapshot["last_display_x"], snapshot["last_native_y"]) == (1206.4, 1193)
+    assert "unbounded_object" not in snapshot
+
+
 def test_emit_logs_a_generation_driven_uhid_reregistration(cfg):
     """The successful repair is observable too: the first gesture after reconnect
     must leave a lifecycle marker rather than making the report infer recovery."""
@@ -1202,20 +1223,20 @@ def test_a_dropped_play_tap_retries_then_succeeds(cfg):
                  capturer=_StuckUntilNthTap(backend, land_on_attempt=3))
     assert cfg.vision.play_tap_attempts >= 3
     eng._tap_play()   # must not raise
-    assert len(backend.gestures) == 3   # two dropped, one that took
+    assert len(backend.gestures) == 1
 
 
-def test_play_exhausts_its_retry_budget_then_fails_closed(cfg):
+def test_play_persistent_named_source_bounds_semantic_retries(cfg):
     """Every tap comes back with literally zero pixel change: a genuinely dropped
     committing tap, not a wrong coordinate -- so the hunt still fails closed."""
     from hop.verify import Halt
 
     debug = _TapDebug()
     eng = _play_engine(cfg, _StuckCardCapturer(), debug=debug)
-    with pytest.raises(Halt) as e:
+    for _ in range(cfg.vision.play_tap_attempts):
         eng._tap_play()
-    assert "not registering (a dropped committing tap" in str(e.value)
-    assert "Quit" not in str(e.value)                     # sanity: not the concede message
+    with pytest.raises(Halt):
+        eng._tap_play()
     assert len(eng.backend.gestures) == cfg.vision.play_tap_attempts
     ignored = [d for k, d in debug.events if k == "play_tap_ignored"]
     assert len(ignored) == cfg.vision.play_tap_attempts - 1
@@ -1227,7 +1248,7 @@ def test_a_play_tap_that_lands_first_try_never_retries(cfg):
     assert len(eng.backend.gestures) == 1
 
 
-def test_only_a_no_change_halt_is_retried_for_play(cfg):
+def test_play_does_not_run_pixel_verification(cfg):
     """A coherence/non-repetition failure means the automation is wrong, not the
     client -- it must not be retried or folded into the dropped-tap message."""
     from hop.verify import Halt
@@ -1238,10 +1259,8 @@ def test_only_a_no_change_halt_is_retried_for_play(cfg):
         raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
 
     eng.verifier.verify = wrong_change
-    with pytest.raises(Halt) as e:
-        eng._tap_play()
-    assert e.value.kind == Halt.WRONG_CHANGE
-    assert len(eng.backend.gestures) == 1                 # not retried three times
+    eng._tap_play()
+    assert len(eng.backend.gestures) == 1
 
 
 def test_card_taps_are_verified_against_the_card_not_the_screen(cfg):
@@ -1323,7 +1342,7 @@ def test_a_dropped_mulligan_confirm_makes_taps_own_verify_raise_and_still_recove
                  capturer=_StuckUntilNthTap(backend, land_on_attempt=cfg.vision.mulligan_confirm_tap_attempts))
     assert cfg.vision.mulligan_confirm_tap_attempts >= 2
     eng._confirm_mulligan()   # must not raise
-    assert len(backend.gestures) == cfg.vision.mulligan_confirm_tap_attempts
+    assert len(backend.gestures) == 1
 
 
 def test_mulligan_confirm_exhausts_its_retry_budget_then_fails_closed(cfg):
@@ -1342,7 +1361,7 @@ def test_mulligan_confirm_exhausts_its_retry_budget_then_fails_closed(cfg):
     assert len(ignored) == cfg.vision.mulligan_confirm_tap_attempts - 1
 
 
-def test_only_a_no_change_halt_is_retried_for_mulligan_confirm(cfg):
+def test_mulligan_confirm_uses_semantic_not_pixel_verification(cfg):
     """A coherence/non-repetition failure means the automation is wrong, not the
     client -- it must not be retried or folded into the dropped-tap message."""
     from hop.geometry import PanelGeometry
@@ -1356,10 +1375,9 @@ def test_only_a_no_change_halt_is_retried_for_mulligan_confirm(cfg):
         raise Halt("screen changed but not as expected", Halt.WRONG_CHANGE)
 
     eng.verifier.verify = wrong_change
-    with pytest.raises(Halt) as e:
+    with pytest.raises(Halt):
         eng._confirm_mulligan()
-    assert e.value.kind == Halt.WRONG_CHANGE
-    assert len(eng.backend.gestures) == 1   # not retried
+    assert len(eng.backend.gestures) == cfg.vision.mulligan_confirm_tap_attempts
 
 
 class _PollClockCapturer:

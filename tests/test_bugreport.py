@@ -404,12 +404,7 @@ def test_summarize_empty_journal_is_empty():
     assert br.summarize_journal("not json\n{bad") == ""
 
 
-def test_could_not_read_mulligan_halt_is_self_diagnosed():
-    """The 'class=\'\' cards=3' halt (the one this feature was built for) must name its own
-    cause -- class blank but cards fine -> point at the `region_gray` datum that decides blank
-    vs mis-aligned OCR, and at the recover-not-halt streak knob -- so the next such report is
-    actionable without decoding the raw message. (The still-choosing banner is NOT the cause:
-    a real still-choosing frame OCRs the class fine, so the diagnosis must not claim it is.)"""
+def test_blank_class_halt_is_identified_as_an_obsolete_path():
     import json
     events = [
         {"kind": "mulligan_read", "detail": {"opponent": "?", "cards": 3, "conf": 0.0}},
@@ -419,13 +414,12 @@ def test_could_not_read_mulligan_halt_is_self_diagnosed():
     ]
     summary = br.summarize_journal("\n".join(json.dumps(e) for e in events))
     assert "likely cause:" in summary
-    assert "BLANK" in summary and "region_gray" in summary
-    assert "mulligan_unreadable_halt_streak" in summary   # points at the recover-not-halt knob
+    assert "blank" in summary.lower() and "hands-off match watch" in summary
 
 
 def test_mulligan_read_halt_diagnosis_distinguishes_the_three_failure_modes():
     d = br._diagnose_mulligan_read_halt
-    assert "BLANK" in d("could not read mulligan (class='', cards=3)")          # class missing
+    assert "hands-off match watch" in d("could not read mulligan (class='', cards=3)")
     assert "GARBLED" in d("could not read mulligan (class='WARRIQR', cards=4)")  # class present, unresolved
     assert "CARD count" in d("could not read mulligan (class='MAGE', cards=1)")  # card miscount
     assert d("some other halt entirely") == ""                                   # not our halt
@@ -495,6 +489,130 @@ def test_summarize_journal_accounts_for_screencap_latency():
     assert "time: 10s wall = 2s humanized waits + 3s screencap I/O + 5s classify/OCR/logic" in s
     assert "captures: 2 screencaps, 3.0s total" in s
     assert "mean 1500ms" in s and "max 1600ms" in s
+
+
+def test_summarize_journal_explains_legacy_post_concede_menu_boundary():
+    """Old journals have only raw taps plus the legacy halt event, but that is enough
+    to distinguish the 2ms confirmation/render race from a slow matchmaking queue."""
+    import json
+
+    events = [
+        {"t": 10.0, "kind": "tap", "detail": {"what": "gear", "point": [2244, 40]}},
+        {"t": 11.0, "kind": "tap", "detail": {"what": "concede", "point": [1206, 212]}},
+        {"t": 11.8, "kind": "tap", "detail": {"what": "concede", "point": [1206, 212]}},
+        {"t": 12.6, "kind": "tap", "detail": {"what": "concede", "point": [1206, 212]}},
+        {"t": 12.602, "kind": "tap", "detail": {"what": "concede_now", "point": [1000, 725]}},
+        {"kind": "sleep", "detail": {"reason": "post_concede_start_cooldown", "seconds": 6.89}},
+        {"t": 20.0, "kind": "tap", "detail": {"what": "post_concede_play", "point": [1747, 918]}},
+        {"t": 20.8, "kind": "tap", "detail": {"what": "post_concede_play", "point": [1747, 918]}},
+        {"kind": "sleep", "detail": {"reason": "post_concede_click_cadence", "seconds": 15.62}},
+        {"kind": "post_concede_burst_complete", "detail": {
+            "emitted": 20, "configured": 20, "elapsed_s": 16.09, "max_s": 20.0}},
+        {"kind": "sleep", "detail": {"reason": "post_concede_queue_cooldown", "seconds": 18.37}},
+        {"kind": "post_concede_unexpected_boundary", "detail": {
+            "state": "concede_menu", "confidence": 0.875}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "source mulligan -> concede_menu (confidence 0.875)" in s
+    assert "Concede 3 at (1206,212)" in s
+    assert "Concede Now 1 at (1000,725)" in s
+    assert "Play 20/20 in 16.09s (limit 20.00s)" in s
+    assert "start wait 6.89s" in s and "quiet wait 18.37s" in s
+    assert "after 2ms" in s and "confirmation/render race" in s
+    assert "successor mulligan may have been missed" not in s  # old journals lack the sealed invariant
+
+
+def test_post_concede_recovery_uses_boundary_counts_and_transport_endpoint_schema():
+    """The bounded recovery has two bursts. Its counters and the UHID flat endpoint
+    fields are the authoritative diagnostic evidence, not just normal-path tap names."""
+    import json
+
+    events = [
+        {"t": 1.0, "kind": "tap", "detail": {"what": "gear"}},
+        {"t": 2.0, "kind": "tap", "detail": {"what": "concede", "point": [1206, 212]}},
+        {"t": 3.0, "kind": "tap", "detail": {"what": "concede_now", "point": [1000, 725]}},
+        {"t": 4.0, "kind": "tap", "detail": {"what": "post_concede_play", "point": [1747, 918],
+                                                     "nominal_point": [1747, 918], "actual_endpoint": [1744, 916]}},
+        {"kind": "post_concede_burst_complete", "detail": {
+            "attempt": 0, "recovery": "normal", "emitted": 20, "configured": 20,
+            "elapsed_s": 16.0, "max_s": 20.0}},
+        {"t": 25.0, "kind": "tap", "detail": {"what": "concede_recovery", "point": [1206, 212]}},
+        {"t": 26.0, "kind": "tap", "detail": {"what": "concede_now_recovery", "point": [1000, 725]}},
+        {"t": 27.0, "kind": "tap", "detail": {"what": "post_concede_play", "point": [1747, 918],
+                                                      "nominal_point": [1747, 918], "actual_endpoint": [1745, 919]}},
+        {"kind": "post_concede_burst_complete", "detail": {
+            "attempt": 1, "recovery": "menu", "emitted": 19, "configured": 20,
+            "elapsed_s": 16.1, "max_s": 20.0}},
+        {"kind": "post_concede_unexpected_boundary", "detail": {
+            "state": "concede_menu", "confidence": 0.91, "attempt": 1, "recovery": "menu",
+            "initial_state": "concede_menu", "concede_taps": 3, "concede_now_taps": 2,
+            "elapsed_s": 53.274,
+            "mulligan_floor_s": 30.270, "mulligan_deadline_exceeded": True,
+            "classification_scan": "full_fallback", "anchor_at": [1187, 214],
+            "transport": {"kind": "uhid", "opened": True, "pid": 77,
+                          "stream_generation": 4, "connection_generation": 4,
+                          "last_command": "report", "last_display_x": 1745,
+                          "last_display_y": 919, "last_native_x": 922, "last_native_y": 657,
+                          "last_write_at": 1730000000.125, "rotation": 1,
+                          "panel_width_px": 2400, "panel_height_px": 1080,
+                          "axis_touch_major_max": 255, "axis_pressure_max": 127}}},
+        {"kind": "anomaly", "detail": {"terminal": True, "index": 9,
+                                           "reason": "unexpected post-concede boundary"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "attempt 1 (menu) after initial concede_menu" in s
+    assert "Concede 3 at (1206,212) (1 recovery)" in s  # boundary counter wins over raw samples
+    assert "Concede Now 2 at (1000,725) (1 recovery)" in s
+    assert "Play 20/20 in 16.00s (limit 20.00s) [attempt 0, normal]" in s
+    assert "Play 19/20 in 16.10s (limit 20.00s) [attempt 1, menu]" in s
+    assert ("post-concede successor timing: boundary 53.27s after first Play; calibrated earliest "
+            "Play->Mulligan arrival 30.27s (exceeded floor).") in s
+    assert "successor mulligan may have been missed" in s
+    assert "synthesized display endpoint (1745,919)" in s
+    assert ("post-concede classifier evidence: full fallback scan (the boundary scope did not accept the result); "
+            "winning concede_menu anchor at (1187,214).") in s
+    assert "uhid; open; pid 77" in s
+    assert "cached display endpoint (1745,919); cached native endpoint (922,657)" in s
+    assert "host/stream write acceptance only, not Hearthstone/app acknowledgment" in s
+    assert "rotation 1; panel 2400x1080; axes major=255, pressure=127" in s
+    assert "anomaly_9_before.png" in s
+
+
+def test_successful_post_concede_boundary_stays_quiet_in_the_report():
+    import json
+
+    events = [
+        {"kind": "post_concede_boundary", "detail": {
+            "state": "queue", "confidence": 0.9,
+            "accepted_states": ["queue", "mulligan"]}},
+    ]
+    assert "post-concede boundary:" not in br.summarize_journal(
+        "\n".join(json.dumps(e) for e in events))
+
+
+def test_recoverable_warning_boundary_never_steals_a_later_terminal_anomaly():
+    """The first boundary is expected to be a warning/menu sometimes; its recovery
+    must stay report-silent even if an unrelated terminal anomaly occurs later."""
+    import json
+
+    events = [
+        {"kind": "tap", "detail": {"what": "gear"}},
+        {"kind": "post_concede_boundary", "detail": {
+            "state": "concede_warning", "confidence": 0.91, "attempt": 0,
+            "recovery": "normal", "accepted_states": ["queue", "mulligan"]}},
+        {"kind": "tap", "detail": {"what": "concede_now_recovery", "point": [1000, 725]}},
+        {"kind": "tap", "detail": {"what": "post_concede_play", "point": [1747, 918]}},
+        {"kind": "post_concede_burst_complete", "detail": {
+            "attempt": 1, "recovery": "warning", "emitted": 20, "configured": 20}},
+        {"kind": "post_concede_boundary", "detail": {
+            "state": "queue", "confidence": 0.91, "attempt": 1,
+            "recovery": "warning", "accepted_states": ["queue", "mulligan"]}},
+        {"kind": "anomaly", "detail": {"terminal": True, "index": 12,
+                                           "reason": "unrelated deck selection failure"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "post-concede boundary:" not in s
+    assert "post-concede terminal evidence:" not in s
 
 
 def test_summarize_journal_splits_classification_out_of_the_residual():
@@ -699,11 +817,7 @@ def test_summarize_journal_surfaces_the_unknown_screen_near_miss():
     assert "in_game 0.539 (thr 0.72)" in s
 
 
-def test_summarize_journal_credits_a_reread_that_recovered_the_class():
-    """The whiff-then-recover case: the first OCR reads opponent '?' (conf 0.0), the
-    engine's single re-read resolves the real class and the run concedes correctly.
-    The report must show the resolved class and say the miss was recovered -- NOT count
-    '?' as an opponent, which made a healthy run read like class detection had died."""
+def test_summarize_journal_ignores_pending_class_reads_until_a_class_resolves():
     import json
     events = [
         {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0}},
@@ -712,40 +826,48 @@ def test_summarize_journal_credits_a_reread_that_recovered_the_class():
     s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
     assert "opponents seen: Druid×1" in s   # the resolved class, not "?×1"
     assert "?×" not in s                      # the failed first read is not an opponent
-    assert "recovered by a re-read" in s      # the story is told, framed as not-a-fault
+    assert "re-read" not in s.lower()
 
 
-def test_summarize_journal_flags_a_reread_that_stayed_unreadable():
-    """A re-read that itself comes back '?' is the line that precedes a
-    'could not read mulligan' halt -- the summary must call it out, not swallow it."""
+def test_pending_watch_reads_do_not_reset_coin_or_count_before_one_resolution():
+    """An unbounded blank-class watch may journal many mulligan reads per game.
+
+    Those records are timing diagnostics only: even when their card geometry looks
+    valid, exactly the one resolved record supplies the opponent, coin, and reject
+    pairing. This is intentionally distinct from legacy ``reread`` recovery below.
+    """
     import json
     events = [
-        {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0}},
-        {"kind": "mulligan_read", "detail": {"opponent": "?", "conf": 0.0, "reread": True}},
-        {"kind": "halt", "detail": {"message": "could not read mulligan (class='', cards=0)"}},
+        {"kind": "run_criteria", "detail": {"target_classes": ["PALADIN"],
+                                            "avoid_classes": [], "require_second": False}},
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "second": True,
+                                                 "cards": 4, "pending": True, "ms": 2100}},
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "second": True,
+                                                 "cards": 4, "pending": True, "ms": 2200}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": False,
+                                                 "cards": 3, "pending": False, "ms": 2000}},
+        {"kind": "reject_plan", "detail": {"concede_point": "mulligan"}},
     ]
     s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
-    assert "still unreadable after the re-read" in s
-    assert "opponents seen" not in s          # no class was ever resolved
+    assert "opponents seen: Mage×1" in s
+    assert "coin: 0 went 2nd / 1 went 1st" in s
+    assert "1× opponent class not in the target list" in s
+    assert "mulligan_read=3" in s             # pending timing remains visible
 
 
-def test_summarize_journal_reads_out_unreadable_mulligan_region_stats():
-    """The `mulligan_unreadable` events carry the class-region pixel stats -- the datum a
-    'could not read mulligan' report never had. The summary must read them out (recovered vs
-    halted, and the last region_gray with a blank-vs-mis-aligned interpretation) so the cause
-    is IN the report, not left to saved-frame archaeology."""
+def test_recent_outcome_does_not_pair_a_pending_read_with_a_reject():
+    """The explicit flag wins even if a malformed diagnostic includes a class."""
     import json
     events = [
-        {"kind": "mulligan_unreadable", "detail": {"class_raw": "", "cards": 4, "streak": 1,
-            "cap": 4, "recovering": True, "region_gray": {"mean": 12.0, "min": 12, "max": 12, "std": 0.0}}},
-        {"kind": "mulligan_unreadable", "detail": {"class_raw": "", "cards": 4, "streak": 2,
-            "cap": 4, "recovering": True, "region_gray": {"mean": 44.0, "min": 0, "max": 255, "std": 61.8}}},
+        {"kind": "run_criteria", "detail": {"target_classes": ["PALADIN"],
+                                            "avoid_classes": [], "require_second": False}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "second": False,
+                                                 "cards": 3, "pending": True}},
+        {"kind": "reject_plan", "detail": {"concede_point": "mulligan"}},
     ]
-    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
-    assert "class NEVER read" in s
-    assert "2 recovered" in s                 # both conceded + requeued, hunt kept running
-    assert "std=61.8" in s                     # the last one's region stats are read out
-    assert "high std" in s                     # ...with the "text was present -> OCR/region" reading
+    outcome = br._recent_run_outcome("\n".join(json.dumps(e) for e in events))
+    assert "no resolved matchup decision" in outcome
+    assert "REJECTED Mage" not in outcome
 
 
 def test_summarize_journal_reports_think_absorbed_into_latency():
@@ -1178,6 +1300,59 @@ def test_summarize_journal_breaks_down_per_tap_think_vs_perception():
     assert "concede 6.7s = 0.8s think + 5.9s screencap/classify" in s
 
 
+def test_match_watch_perception_is_not_charged_to_the_eventual_gear_tap():
+    """A long hands-off queue is observation latency, not gear reaction time."""
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "play"}},
+        # First QUEUE capture/classify happens before its dispatch starts the watch.
+        {"kind": "capture", "detail": {"ms": 2100}},
+        {"kind": "classify", "detail": {"ms": 300}},
+        {"kind": "match_watch_start", "detail": {"source": "queue"}},
+        {"kind": "capture", "detail": {"ms": 2200}},
+        {"kind": "classify", "detail": {"ms": 400, "state": "vs_splash"}},
+        {"kind": "capture", "detail": {"ms": 2000}},
+        {"kind": "classify", "detail": {"ms": 500, "state": "mulligan"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "?", "cards": 4,
+                                                 "second": True, "pending": True}},
+        {"kind": "capture", "detail": {"ms": 2300}},
+        {"kind": "classify", "detail": {"ms": 200, "state": "mulligan"}},
+        {"kind": "mulligan_read", "detail": {"opponent": "Mage", "cards": 3,
+                                                 "second": False, "pending": False}},
+        {"kind": "match_watch_resolved", "detail": {"opponent": "Mage"}},
+        {"kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.5}},
+        {"kind": "tap", "detail": {"what": "gear"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "match-search observation: 10.0s screencap/classify across 1 watch(es), 1 resolved" in s
+    assert "gear 0.5s = 0.5s think + 0.0s screencap/classify" in s
+    assert "gear 10.5s" not in s
+
+
+def test_interrupted_match_watch_is_not_charged_to_the_error_dialog_tap():
+    import json
+    events = [
+        {"kind": "tap", "detail": {"what": "play"}},
+        {"kind": "capture", "detail": {"ms": 2000}},
+        {"kind": "classify", "detail": {"ms": 300, "state": "queue"}},
+        {"kind": "match_watch_start", "detail": {"source": "queue"}},
+        {"kind": "capture", "detail": {"ms": 2100}},
+        {"kind": "classify", "detail": {"ms": 400, "state": "error_dialog"}},
+        {"kind": "match_watch_interrupted", "detail": {"outcome": "interrupted",
+                                                           "state": "error_dialog"}},
+        # This is ordinary post-interruption perception and belongs to error_ok,
+        # proving the lifecycle drains only the earlier queue/watch interval.
+        {"kind": "capture", "detail": {"ms": 1200}},
+        {"kind": "classify", "detail": {"ms": 200, "state": "error_dialog"}},
+        {"kind": "sleep", "detail": {"reason": "tap_think", "seconds": 0.4}},
+        {"kind": "tap", "detail": {"what": "error_ok"}},
+    ]
+    s = br.summarize_journal("\n".join(json.dumps(e) for e in events))
+    assert "match-search observation: 4.8s screencap/classify across 1 watch(es), 1 interrupted" in s
+    assert "error_ok 1.8s = 0.4s think + 1.4s screencap/classify" in s
+    assert "still observing at run end" not in s
+
+
 def test_summarize_journal_shows_any_when_no_target_classes():
     import json
     text = json.dumps({"kind": "run_criteria",
@@ -1398,6 +1573,93 @@ def test_collect_includes_the_terminal_named_screen_evidence(tmp_path):
     assert "Terminal screen evidence" in md
     assert "anomaly_6_before.png" in md
     assert "Gold 3" in md
+
+
+def test_collect_includes_structured_mulligan_card_count_evidence(tmp_path):
+    """A cards=0 report used to say only "check the glow threshold" while retaining neither
+    the RGB frame nor the detector's measurements.  The exceptional anomaly now carries both,
+    and must not be mis-described as a generic named-screen transition failure."""
+    import json
+
+    paths = _paths(tmp_path)
+    run = paths.runs_root / "20261004-191641"
+    run.mkdir(parents=True)
+    diagnostic = {
+        "frame": {"width": 2400, "height": 1080, "has_rgb": True},
+        "card_row": {"x": 120, "y": 340, "width": 2160, "height": 520},
+        "thresholds": {
+            "glow_green_bias": 30, "glow_min_green": 90,
+            "glow_column_min_rows": 260, "glow_min_strip_width_px": 8,
+            "expected_width_px": 360.0, "width_tolerance_px": 45.0,
+            "min_mean_rgb": 75.0, "min_frame_width": 400,
+        },
+        "glow_run_count": 3,
+        "glow_runs": [[40, 54], [420, 435], [810, 824]],
+        "candidates": [{"start": 174, "end": 540, "width_px": 366,
+                        "width_ok": True, "mean_rgb": 44.2,
+                        "brightness_ok": False, "selected": False}],
+        "candidate_interiors": [],
+        "coherent": None,
+        "count": 0,
+        "rejection": "no_candidate_interiors",
+    }
+    events = [
+        {"kind": "mulligan_read", "detail": {
+            "opponent": "Death Knight", "class_raw": "DEATHKNIGHT", "cards": 0,
+            "second": None, "turn_known": False, "decision": "reject",
+        }},
+        # This standalone record is useful even if saving the following anomaly fails.
+        {"kind": "mulligan_card_count_unreadable", "detail": {
+            "mulligan_card_count": diagnostic, "decision": "reject", "require_second": False,
+        }},
+        {"kind": "anomaly", "detail": {
+            "index": 7, "terminal": True, "reason": "mulligan card count unreadable",
+            "mulligan_card_count": diagnostic, "decision": "reject", "require_second": False,
+        }},
+    ]
+    run.joinpath("journal.jsonl").write_text("\n".join(map(json.dumps, events)))
+    run.joinpath("anomaly_7_before.png").write_bytes(b"colour-png-placeholder")
+
+    md = br.collect("stopped at mulligan", paths, version="1", clock=lambda: 0.0)
+
+    assert "## Mulligan card-count evidence" in md
+    assert "anomaly_7_before.png" in md
+    assert "RGB present" in md
+    assert "no span passed both the card-width and brightness gates" in md
+    assert "40–54" in md and "mean RGB 44.2" in md
+    assert "G > R/B + 30" in md
+    assert "turn unreadable" in md
+    assert "engine decision: reject; require_second=false (class-only; no turn was invented)" in md
+    assert "## Terminal screen evidence" not in md  # the colour/card section is the right one
+
+
+def test_card_count_class_only_reject_preserves_unknown_turn_and_favorable_coin_reason():
+    """When only Priest is wanted with require_second, Death Knight remains safely rejectable
+    even though cards=0 cannot establish the coin.  Do not rewrite `second=None` as going 1st.
+    The summary and retained-run outcome must pair the class-only reject with its decision."""
+    import json
+
+    events = [
+        {"kind": "run_criteria", "detail": {
+            "target_classes": ["PRIEST"], "avoid_classes": [], "require_second": True,
+            "mode": "casual",
+        }},
+        {"kind": "mulligan_read", "detail": {
+            "opponent": "Death Knight", "class_raw": "DEATHKNIGHT", "cards": 0,
+            "second": None, "turn_known": False, "decision": "reject",
+        }},
+        {"kind": "reject_plan", "detail": {"concede_point": "mulligan"}},
+    ]
+    journal = "\n".join(map(json.dumps, events))
+
+    summary = br.summarize_journal(journal)
+    outcome = br._recent_run_outcome(journal)
+
+    assert "Death Knight×1" in summary
+    assert "1 turn unreadable" in summary
+    assert "1× opponent class not in the target list" in summary
+    assert "going 1st" not in summary
+    assert "REJECTED Death Knight (turn unreadable) correctly: opponent class not in the target list" in outcome
 
 
 def test_a_failing_ocr_probe_never_breaks_the_report(tmp_path):
@@ -1824,7 +2086,7 @@ def test_classify_halt_recognizes_the_deliberate_family_and_rejects_faults():
     assert "Re-select your deck" in c("dropped back to the deck list; Re-select your deck")
     assert "main menu" in c("at the Hearthstone main menu; open Play first").lower()
     assert "did not queue" in c("a game is in progress that this hunt did not start")
-    assert "soft-lock" in c("still queueing after 60 polls; matchmaking never matched")
+    assert c("still queueing after 60 polls; matchmaking never matched") == ""
     assert "reconnect" in c("stuck on 'Reconnecting...'; Hearthstone never came back online").lower()
     assert c("could not draw a non-repeating gesture in 8 attempts") == ""   # a real fault
     assert c("") == ""

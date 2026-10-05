@@ -32,7 +32,12 @@ from pathlib import Path
 
 import pytest
 
-from hop.hearthstone import GameLayout, count_mulligan_cards, glow_strip_runs
+from hop.hearthstone import (
+    GameLayout,
+    count_mulligan_cards,
+    glow_strip_runs,
+    mulligan_card_count_diagnostics,
+)
 from hop.perception.image import Frame
 
 FRAMES = Path(__file__).parent / "data" / "frames"
@@ -85,6 +90,53 @@ def test_grayscale_frame_is_unreadable(layout, cfg):
     gray = Frame.from_gray_bytes(60, 27, bytes([40]) * (60 * 27))
     assert glow_strip_runs(gray, layout, cfg.vision) is None
     assert count_mulligan_cards(gray, layout, cfg.vision) == 0
+
+
+@pytest.mark.parametrize("name,expected", HANDS)
+def test_card_count_diagnostics_matches_a_valid_real_hand(name, expected, layout, cfg):
+    """Exceptional-path evidence uses the exact same count as the hot path."""
+    frame = _frame(name)
+    diag = mulligan_card_count_diagnostics(frame, layout, cfg.vision)
+
+    assert diag["frame"] == {"width": frame.width, "height": frame.height, "has_rgb": True}
+    assert diag["count"] == count_mulligan_cards(frame, layout, cfg.vision) == expected
+    assert diag["rejection"] == "ok"
+    assert diag["coherent"] is True
+    assert len(diag["candidate_interiors"]) == expected
+    assert diag["thresholds"]["glow_green_bias"] == cfg.vision.glow_green_bias
+    assert diag["thresholds"]["glow_min_green"] == cfg.vision.glow_min_green
+    assert diag["thresholds"]["glow_column_min_rows"] == int(
+        cfg.vision.glow_col_min_frac * diag["card_row"]["height"]
+    )
+    assert diag["thresholds"]["glow_min_strip_width_px"] == max(
+        4, int(cfg.vision.glow_min_strip_frac * frame.width)
+    )
+    assert all(candidate["selected"] for candidate in diag["candidates"]
+               if candidate["width_ok"] and candidate["brightness_ok"])
+
+
+def test_card_count_diagnostics_explains_a_marked_card(layout, cfg):
+    """A report can distinguish a missing glow from an arbitrary zero count."""
+    diag = mulligan_card_count_diagnostics(_frame("mulligan_3card_marked"), layout, cfg.vision)
+
+    assert diag["count"] == 0
+    assert diag["rejection"] == "incoherent_hand"
+    assert diag["coherent"] is False
+    assert diag["glow_run_count"] == 4
+    assert len(diag["candidate_interiors"]) == 2
+    assert {"width_px", "mean_rgb", "width_ok", "brightness_ok", "selected"} <= set(
+        diag["candidates"][0]
+    )
+
+
+def test_card_count_diagnostics_explains_a_grayscale_frame(layout, cfg):
+    gray = Frame.from_gray_bytes(60, 27, bytes([40]) * (60 * 27))
+    diag = mulligan_card_count_diagnostics(gray, layout, cfg.vision)
+
+    assert diag["frame"]["has_rgb"] is False
+    assert diag["count"] == 0
+    assert diag["rejection"] == "no_rgb"
+    assert diag["glow_runs"] == [] and diag["candidates"] == []
 
 
 def _rescaled(name: str, width: int) -> Frame:

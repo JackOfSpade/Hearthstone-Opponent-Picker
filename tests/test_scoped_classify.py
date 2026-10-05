@@ -54,6 +54,7 @@ def _assert_identical(clf, frame, expected):
 def test_floor_is_a_frozenset_of_the_overlay_states():
     # the fixed set that closes the fatal blind-tap; membership is load-bearing
     assert ScreenState.RECONNECT_DIALOG in INTERRUPT_FLOOR
+    assert ScreenState.CONCEDE_WARNING in INTERRUPT_FLOOR
     assert ScreenState.CONCEDE_MENU in INTERRUPT_FLOOR
     assert ScreenState.RANK_PROGRESS in INTERRUPT_FLOOR
     assert ScreenState.QUEUE not in INTERRUPT_FLOOR      # base screens are not overlays

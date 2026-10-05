@@ -32,9 +32,10 @@ class Alerter:
 
     # ── public API used by the engine ────────────────────────────────────────
 
-    def target_found(self, class_name: str, we_go_second: bool) -> None:
+    def target_found(self, class_name: str, we_go_second: bool | None) -> None:
         """The whole target alert: one Mac sound. Nothing else, by design."""
-        second = "going 2nd" if we_go_second else "going 1st"
+        second = ("going 2nd" if we_go_second else "going 1st") \
+            if we_go_second is not None else "turn unreadable"
         if self.cfg.mac_sound:
             self._mac_play_sound_once()
         print(f"*** target found: {class_name} ({second}) - your turn! ***")

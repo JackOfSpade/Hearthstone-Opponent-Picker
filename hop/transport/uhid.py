@@ -27,6 +27,10 @@ On-device findings (Pixel 7a, Android 17 / SDK 37) that shaped this design:
   JSON objects* (``{...}\n{...}\n...``); handing it a ``[ ..., ... ]`` array
   fails with ``Expected BEGIN_OBJECT but was BEGIN_ARRAY``. We therefore emit
   one object per line with no enclosing brackets or commas.
+* **Fixed-session orientation.** Display-to-panel rotation is sampled when the
+  backend session opens and retained for that session, so gestures do not each
+  issue a costly ``dumpsys input`` ADB request. Stream recovery is not a new
+  orientation lifecycle and preserves the captured transform.
 
 Confirmed working: the descriptor enumerates as a 1080x2400 ``TOUCHSCREEN``
 (``InputReader: Device added ... sources=TOUCHSCREEN``) and reports carry
@@ -74,9 +78,20 @@ class UhidBackend(TouchBackend):
         self.adb = adb
         self.cfg = cfg
         self._panel: PanelGeometry | None = None
+        # The display orientation is a session property for the fixed phone this
+        # backend drives.  Reading it uses `dumpsys input`, so retain the value
+        # obtained at open rather than adding an ADB round trip to every tap.
+        self._rotation: int | None = None
+        # Kept after close solely for the terminal bug report. `_rotation` itself
+        # is cleared on close so a later open samples a fresh display orientation.
+        self._last_session_rotation: int | None = None
         self._proc = None        # long-lived `hid -` process; holds the device
         self._opened = False
         self._axes = hd.DEFAULT_AXES
+        # Last successfully emitted contact endpoint in both coordinate spaces.
+        # This is diagnostic metadata only; it never changes the input stream.
+        self._last_display_endpoint: tuple[float, float] | None = None
+        self._last_native_endpoint: tuple[int, int] | None = None
         # `adb disconnect` can kill this resident shell while one-shot ADB calls
         # later recover.  We remember the ADB epoch at registration and renew the
         # stream *before* the next gesture when it changes.
@@ -140,9 +155,24 @@ class UhidBackend(TouchBackend):
     def open(self, panel: PanelGeometry) -> None:
         if self._opened:
             return
+        # A true close->open starts a new coordinate session.  Do not clear the
+        # prior endpoint/failure facts until the replacement stream has actually
+        # registered: a failed reopen must remain diagnosable as the old session.
+        prior = (self._panel, self._rotation, self._last_session_rotation, self._axes)
         self._panel = panel
+        self._rotation = self._read_rotation()
         self._axes = self._detect_axes()
-        self._start_stream()
+        try:
+            self._start_stream()
+        except Exception:
+            self._panel, self._rotation, self._last_session_rotation, self._axes = prior
+            raise
+        self._last_session_rotation = self._rotation
+        self._last_display_endpoint = None
+        self._last_native_endpoint = None
+        self._last_failure = None
+        self._last_proc = None
+        self._last_proc_status = {"pid": None, "returncode": None, "stderr_tail": ""}
 
     def _start_stream(self) -> None:
         """Start and register one resident stream using the retained panel/axes.
@@ -201,10 +231,13 @@ class UhidBackend(TouchBackend):
         self._renew_stream_before_gesture()
         panel = self._panel
         assert panel is not None
-        # Gestures are synthesized in DISPLAY space; the panel is native. Rotate
-        # each sample to native here, keyed on the live rotation (re-read per
-        # gesture so a landscape flip mid-run is handled).
-        rotation = self._current_rotation()
+        # Gestures are synthesized in DISPLAY space; the panel is native.  The
+        # orientation was captured with the session at open(), which avoids a
+        # costly `dumpsys input` ADB request for every gesture.  A resident-HID
+        # stream recovery stays within this same fixed-phone session, so it
+        # intentionally retains that coordinate transform too.
+        rotation = self._rotation
+        assert rotation is not None
         active: dict[int, hd.ContactReport] = {}
         prev_t = gesture.samples[0].t if gesture.samples else 0.0
 
@@ -225,9 +258,23 @@ class UhidBackend(TouchBackend):
             })
             if not s.tip:
                 active.pop(s.pointer_id, None)
+        # Only publish this after every report of the gesture has written.  A
+        # mid-gesture transport error is deliberately ambiguous and must not be
+        # represented as a delivered endpoint in a later bug report.
+        dx, dy = gesture.endpoint()
+        nx, ny = display_to_native(dx, dy, rotation, panel.width_px, panel.height_px)
+        self._last_display_endpoint = (dx, dy)
+        self._last_native_endpoint = (
+            max(0, min(panel.width_px - 1, int(round(nx)))),
+            max(0, min(panel.height_px - 1, int(round(ny)))),
+        )
 
     def close(self) -> None:
         self._discard_stream()
+        # A later open() is a new fixed-phone session and will sample rotation
+        # again.  `_discard_stream()` itself is also used by stream recovery,
+        # where the current session's cached transform must survive.
+        self._rotation = None
 
     # ── persistent-stream lifecycle / diagnostics ─────────────────────────
 
@@ -314,6 +361,25 @@ class UhidBackend(TouchBackend):
             "reopen_count": self._reopen_count,
             "last_reopen_reason": self._last_reopen_reason,
             "last_reopen_ok": self._last_reopen_ok,
+            # These values are captured once at backend open and describe the exact
+            # display->native transform used by every later report.  They do not
+            # trigger a device query when a dashboard or bug report asks for status.
+            "rotation": (self._rotation if self._rotation is not None
+                         else self._last_session_rotation),
+            "panel_width_px": self._panel.width_px if self._panel else None,
+            "panel_height_px": self._panel.height_px if self._panel else None,
+            "axis_touch_major_max": self._axes.touch_major_max,
+            "axis_touch_minor_max": self._axes.touch_minor_max,
+            "axis_pressure_max": self._axes.pressure_max,
+            "axis_orientation_max": self._axes.orientation_max,
+            "last_display_x": (round(self._last_display_endpoint[0], 3)
+                               if self._last_display_endpoint else None),
+            "last_display_y": (round(self._last_display_endpoint[1], 3)
+                               if self._last_display_endpoint else None),
+            "last_native_x": (self._last_native_endpoint[0]
+                              if self._last_native_endpoint else None),
+            "last_native_y": (self._last_native_endpoint[1]
+                              if self._last_native_endpoint else None),
         }
 
     def _record_failure(self, context: str, exc: Exception | None = None) -> None:
@@ -379,9 +445,14 @@ class UhidBackend(TouchBackend):
 
     # ── encoding ─────────────────────────────────────────────────────────────
 
-    def _current_rotation(self) -> int:
-        """Live display rotation (0..3); falls back to 0 if the adb handle can't
-        report it (e.g. the transport unit tests' fake)."""
+    def _read_rotation(self) -> int:
+        """Session display rotation (0..3), with a test-friendly zero fallback.
+
+        This is called once by :meth:`open`, rather than from :meth:`emit`.
+        Reopening the HID process after a transport reconnect deliberately keeps
+        the same cached transform: it is recovery within the same fixed-phone
+        session, not a new display/orientation lifecycle.
+        """
         try:
             return int(self.adb.get_rotation())
         except Exception:

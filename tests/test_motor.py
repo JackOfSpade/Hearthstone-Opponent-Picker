@@ -20,6 +20,27 @@ def test_tap_endpoint_within_hit_area(cfg, panel):
         assert math.hypot(ex - 1200, ey - 540) <= 40  # lands inside the control
 
 
+def test_tap_endpoint_has_a_hard_micro_slip_envelope(cfg, panel):
+    """The final in-contact point can add almost 1.5x configured micro-slip."""
+    class WorstSlipRng:
+        def gauss(self, *_args):
+            return 0.0                 # endpoint lands at the target-disc centre
+
+        def random(self):
+            return 1.0 - 1e-12          # supremum of the open random interval
+
+        def uniform(self, _low, high):
+            return high                 # 2π, so slip points along +x
+
+    radius = 40.0
+    g = synth_tap(WorstSlipRng(), (1200, 540), radius, panel, cfg.motor,
+                  ContactModel(cfg.contact), HumanState())
+    ex, ey = g.endpoint()
+    distance = math.hypot(ex - 1200, ey - 540)
+    assert distance <= radius * 0.9 + 1.5 * cfg.motor.tap_micro_slip_px
+    assert distance > 1.49 * cfg.motor.tap_micro_slip_px
+
+
 def test_tap_pressure_never_zero_in_contact(cfg, panel):
     cm = ContactModel(cfg.contact)
     g = synth_tap(Random(0), (1200, 540), 40, panel, cfg.motor, cm, HumanState())
