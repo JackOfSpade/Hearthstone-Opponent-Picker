@@ -35,3 +35,57 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest -q
+
+  package-macos:
+    name: macOS package and launcher
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build and lint distributable
+        run: |
+          python -m pip install build ruff
+          python -m ruff check --select E9,F63,F7,F82 hop tests
+          python -m build
+      - name: Install wheel with native app dependencies outside source tree
+        run: |
+          python -m venv "$RUNNER_TEMP/hop-installed"
+          "$RUNNER_TEMP/hop-installed/bin/python" -m pip install dist/*.whl 'pyobjc-framework-Cocoa>=12.2.2' 'pyobjc-framework-WebKit>=12.2.2'
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/hop-installed/bin/python" -c 'import hop, hop.macapp, AppKit, WebKit; from importlib.resources import files; assert files("hop").joinpath("config.default.toml").is_file()'
+          "$RUNNER_TEMP/hop-installed/bin/hop" --help
+      - name: Validate native launcher and app bundle
+        run: |
+          zsh -n "Hearthstone Opponent Picker.app/Contents/MacOS/hop-launch"
+          plutil -lint "Hearthstone Opponent Picker.app/Contents/Info.plist"
+
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs: ["test", "package-macos", "merge-policy"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every prerequisite to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
+          PY
+  merge-policy:
+    name: Validate merge policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 -m unittest discover -s .github/tests -p 'test_merge_validated_pr.py'
