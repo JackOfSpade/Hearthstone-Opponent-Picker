@@ -21,12 +21,12 @@ hotkeys = ["pynput>=1.8.2"]
 # the web dashboard work without it; the NSStatusItem UI needs the Cocoa bridge, and the
 # in-window dashboard (a native WKWebView, not a browser) needs the WebKit bridge.
 mac = ["pyobjc-framework-Cocoa>=12.2.2", "pyobjc-framework-WebKit>=12.2.2"]
-dev = ["pytest>=9.1.1"]
+dev = ["pytest>=9.2.0"]
 all = [
     "numpy>=2.4.6", "Pillow>=12.3.0", "pytesseract>=0.3.13",
     "fastapi>=0.143.0", "uvicorn>=0.54.0", "websockets>=17.1",
     "pynput>=1.8.2", "pyobjc-framework-Cocoa>=12.2.2", "pyobjc-framework-WebKit>=12.2.2",
-    "pytest>=9.1.1",
+    "pytest>=9.2.0",
 ]
 
 [project.scripts]
